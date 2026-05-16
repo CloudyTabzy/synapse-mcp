@@ -20,17 +20,39 @@ The binaries and prompt for the video are available in the [mcp-reversing-datase
 Both engines are **optional** — install them only when you need them. The plugin loads and runs
 without them; every Triton/Miasm tool reports a clear install hint when the dependency is absent.
 
+### API design: AI-agent-first
+
+Every tool in this fork returns a **structured `dict`** with a consistent `"ok"` field, never raw strings or untyped lists. This makes outputs predictable for LLM parsing and downstream tool chaining:
+
+```python
+# Triton status
+{"ok": True, "available": True, "architecture": "x86_64", ...}
+
+# Miasm CFG summary
+{"ok": True, "block_count": 12, "edges": 18, "cyclomatic_complexity": 7, ...}
+
+# Error shape (always the same)
+{"ok": False, "error": "Triton is not installed. Run: ida-pro-mcp --install-deps triton"}
+```
+
+All address parameters accept a **`str`** (hex `"0x401000"` or a symbol name `"main"`) and are normalized automatically via `parse_address()`. You never need to convert names to integers yourself.
+
 ### Installing the analysis engines
 
 After installing the plugin, add the engines through the MCP server's own installer:
 
 ```sh
-# Install both engines at once
+# Install both engines at once (default when --install-deps is used without a value)
+ida-pro-mcp --install-deps
+# or explicitly
 ida-pro-mcp --install-deps all
 
 # Or individually
 ida-pro-mcp --install-deps triton
 ida-pro-mcp --install-deps miasm
+
+# Comma-separated also works
+ida-pro-mcp --install-deps triton,miasm
 
 # Specify IDA's Python explicitly if auto-detection fails
 ida-pro-mcp --install-deps all --python "C:\Program Files\IDA Professional 9.3\python3\python.exe"
@@ -43,15 +65,26 @@ Or install manually into IDA's Python environment:
 pip install triton-library
 
 # Miasm IR analysis framework
-pip install miasm future
+pip install "miasm>=0.1.5" future
 
 # Both at once via package extras
 pip install "ida-pro-triton-miasm-mcp[all]"
 ```
 
+**Verify everything is working:**
+
+After connecting your MCP client, call the probe tools:
+
+```
+triton_status   # → {"ok": true, "available": true, ...}
+miasm_status    # → {"ok": true, "available": true, ...}
+```
+
+If a dependency is missing, the probe reports `"available": false` and the engine-specific tools are hidden. The rest of the IDA MCP tools work normally.
+
 > **Forked from** [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) — upstream core IDA tools, zeromcp transport, and idalib support are from that project.
 
-### Triton tools (34 tools)
+### Triton tools (36 tools)
 
 All tools require `pip install triton-library`. Architecture is auto-detected from the loaded binary.
 
@@ -84,8 +117,10 @@ All tools require `pip install triton-library`. Architecture is auto-detected fr
 | `triton_snapshot_save` / `_restore` / `_list` / `_delete` | Context snapshots for branch exploration |
 | `triton_analyze_function` | **Compound:** init → symbolize args → process function → Z3 solve, all in one call |
 | `triton_find_input_for_branch` | **Compound:** CFG-guided Z3 search — find inputs that drive execution to a specific address |
+| `triton_annotate_function` | Write IDA comments at branch points with path conditions |
+| `triton_highlight_tainted_instructions` | Color instructions that operate on tainted data |
 
-### Miasm tools (18 tools)
+### Miasm tools (21 tools)
 
 All tools require `pip install miasm future`. Architecture is auto-detected from the loaded binary.
 
@@ -109,6 +144,59 @@ All tools require `pip install miasm future`. Architecture is auto-detected from
 | `miasm_trace_data_flow` | Trace data-flow origins of a register at an address |
 | `miasm_assemble` | Assemble an instruction, return all encodings |
 | `miasm_patch_instruction` | Assemble + patch bytes directly into the IDA database |
+| `miasm_get_cfg_summary` | CFG structural summary: blocks, edges, cyclomatic complexity, loops, topological order |
+| `miasm_solve_path_constraints` | Enumerate paths to a target and solve for concrete inputs with Z3 |
+| `miasm_annotate_data_flow` | Write IDA comments showing data-flow origins of a register |
+
+### Phase 3.5 refinements (v1.0.0)
+
+- **Uniform address parameters** — all 59 Triton/Miasm tools now accept `str` addresses (hex or symbol name), matching upstream conventions.
+- **Structured returns everywhere** — all status and context tools return `dict` instead of raw strings.
+- **Bug fixes** — `triton_solve_path_constraints(negate_last=True)` no longer corrupts the context; `miasm_patch_instruction` is now properly `@unsafe`; nested `@idasync` deadlock eliminated in `miasm_annotate_data_flow`; Triton snapshot restore no longer crashes on GC'd AST nodes.
+- **Relaxed Miasm constraint** — `miasm>=0.1.5` (was `>=0.1.17`, which was unsatisfiable in many environments).
+
+### Phase 3.6 — Async Tasks + Skills (v1.0.0)
+
+- **Async task system** — `task_submit`, `task_poll`, `task_list`, `task_cancel` for long-running operations
+- **7 workflow skills** — `binary-survey`, `stripped-binary-recovery`, `function-deep-dive`, `triton-symbolic-exec`, `miasm-ir-analysis`, `hybrid-deobfuscate`, `vuln-hunter-static`
+
+### Hybrid tools (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `hybrid_analyze_function` | **Cross-engine:** Miasm deobfuscation → Triton symbolic execution → Z3 solving, unified report |
+| `hybrid_deobfuscate_and_patch` | **Cross-engine:** Miasm dead-code elimination → identify empty blocks → optionally NOP them out in IDA |
+
+### Async Task System (4 tools)
+
+Submit heavy operations as background tasks to avoid MCP client timeouts. The worker thread replays the submitter's extension/unsafe context so gating behaves identically to synchronous calls.
+
+| Tool | Description |
+|------|-------------|
+| `task_submit` | Submit any tool as a background task → returns `task_id` immediately |
+| `task_poll` | Poll a task every 2-3 s → returns `status` (`pending`/`running`/`done`/`error`/`cancelled`) + result when done |
+| `task_list` | List all active/recent tasks with auto-detected category (`triton` / `miasm` / `hybrid` / `core`) |
+| `task_cancel` | Cancel a pending task; flag running tasks (IDA main thread ops are not interruptible) |
+
+Tasks are especially useful for:
+- `triton_process_function` on large functions
+- `miasm_lift_function` / `miasm_get_ssa` on complex CFGs
+- `callgraph` with deep recursion
+- `analyze_funcs` batch operations
+
+### MCP Resources
+
+In addition to `ida://` resources, the fork exposes Triton and Miasm session state as browsable resources:
+
+**Triton session resources:**
+- `triton://session/context` — Full context dump (architecture, modes, symbolic vars, taint state)
+- `triton://session/constraints` — Accumulated path predicate in SMT-LIB 2 format
+- `triton://session/symbolic-vars` — All symbolic variables with origins
+
+**Miasm function resources:**
+- `miasm://function/{address}/ir` — IRCFG as JSON blocks and edges
+- `miasm://function/{address}/ssa` — SSA-transformed IRCFG as JSON
+- `miasm://function/{address}/cfg-dot` — Graphviz DOT string for the assembly CFG
 
 ## Prerequisites
 
@@ -141,22 +229,33 @@ All tools require `pip install miasm future`. Architecture is auto-detected from
   - [Zed](https://zed.dev/)
   - [Other MCP Clients](https://modelcontextprotocol.io/clients#example-clients): Run `ida-pro-mcp --config` to get the JSON config for your client.
 
-## Installation (Claude Code)
+## Installation
 
-To install the headless IDA Pro MCP in Claude Code:
+### Via MCP Client (Claude Code)
+
+The upstream plugin is available in the Claude Code marketplace:
 
 ```bash
 claude plugin marketplace add mrexodia/claude-marketplace
 claude plugin install ida-pro-mcp@mrexodia
 ```
 
-To update to the latest version:
+To use **this fork** instead, install from source into your project:
 
 ```bash
-claude plugin update ida-pro-mcp@mrexodia
+# Clone or download this repository, then
+pip install .
+# or directly from GitHub
+pip install "https://github.com/your-org/ida-pro-triton-miasm-mcp/archive/refs/heads/main.zip"
 ```
 
-**Note**: This requires having idalib activated globally and [uv](https://astral.sh/uv) installed:
+Then install the IDA plugin:
+
+```bash
+ida-pro-mcp --install
+```
+
+**Note**: Headless `idalib-mcp` requires having idalib activated globally and [uv](https://astral.sh/uv) installed:
 
 ```bash
 # windows
@@ -165,15 +264,43 @@ uv run "C:\Program Files\IDA Professional 9.3\idalib\python\py-activate-idalib.p
 uv run "/Applications/IDA Professional 9.3.app/Contents/MacOS/idalib/python/py-activate-idalib.py"
 ```
 
-## Installation (GUI)
+### Manual MCP Configuration
 
-**Note**: the MCP plugin is no longer recommended and will eventually be deprecated. Use `idalib-mcp` instead.
+If your MCP client does not support plugins, add the server manually to your client's MCP config:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-triton-miasm": {
+      "command": "uv",
+      "args": ["run", "ida-pro-mcp", "--transport", "http://127.0.0.1:8744/sse"]
+    }
+  }
+}
+```
+
+For stdio transport (most clients):
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-triton-miasm": {
+      "command": "uv",
+      "args": ["run", "ida-pro-mcp"]
+    }
+  }
+}
+```
+
+### Installing from the IDA GUI
+
+**Note**: the MCP plugin approach is no longer recommended and will eventually be deprecated. Use `idalib-mcp` instead.
 
 If you want to configure the MCP server manually from the IDA GUI:
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/your-org/ida-pro-triton-miasm-mcp/archive/refs/heads/main.zip
 ```
 
 Configure the MCP servers and install the IDA Plugin:
@@ -253,6 +380,11 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 - Control flow flattening
 - Code encryption
 - Anti-decompilation tricks
+
+**For obfuscated binaries, use the hybrid workflow:**
+1. Run `hybrid_analyze_function` to let Miasm fold constants and eliminate dead code before Triton symbolically executes the simplified path.
+2. Use `miasm_solve_path_constraints` to find concrete inputs that reach a specific block.
+3. Apply `hybrid_deobfuscate_and_patch` (dry_run first) to NOP out dead blocks verified by Miasm.
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
 

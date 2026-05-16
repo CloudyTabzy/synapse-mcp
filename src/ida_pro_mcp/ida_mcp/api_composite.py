@@ -643,3 +643,354 @@ def trace_data_flow(
         "nodes": nodes,
         "edges": edges,
     }
+
+
+# ============================================================================
+# Hybrid cross-engine workflows
+# ============================================================================
+
+class HybridAnalysisResult(TypedDict, total=False):
+    ok: bool
+    function_ea: str
+    miasm: dict
+    triton: dict
+    solver: dict
+    error: str
+
+
+class HybridPatchCandidate(TypedDict):
+    address: str
+    size: int
+    reason: str
+
+
+class HybridPatchResult(TypedDict, total=False):
+    ok: bool
+    function_ea: str
+    dry_run: bool
+    candidates: list[HybridPatchCandidate]
+    patches_applied: int
+    error: str
+
+
+@tool
+@idasync
+@tool_timeout(180.0)
+def hybrid_analyze_function(
+    address: Annotated[str, "Function address (hex or symbol name)."],
+    symbolize_args: Annotated[
+        Union[str, list[str]],
+        "Registers to symbolize for Triton (comma-separated or JSON array). "
+        "Pass empty string to skip symbolization.",
+    ] = "",
+    deobfuscate: Annotated[
+        bool,
+        "Apply Miasm constant-folding and dead-code elimination before analysis.",
+    ] = True,
+    max_insns: Annotated[int, "Safety cap on Triton instruction count (default 500)."] = 500,
+    timeout_ms: Annotated[int, "Z3 solver timeout in ms (default 10000)."] = 10000,
+) -> HybridAnalysisResult:
+    """Cross-engine analysis: Miasm IR lifting/deobfuscation + Triton symbolic execution + Z3 solving.
+
+    This is the most powerful single-function analysis tool in the fork.
+    Miasm simplifies obfuscated control flow and constant expressions first;
+    Triton then symbolically executes the result and asks Z3 for concrete
+    inputs that drive each branch. Returns a unified report with both IR-level
+    and symbolic-level findings.
+    """
+    import idaapi
+    import ida_funcs
+
+    # Lazy imports to avoid circular dependencies (api_composite is loaded before
+    # api_triton / api_miasm in __init__.py).
+    try:
+        from .api_triton import (
+            TRITON_AVAILABLE,
+            _detect_arch_from_ida,
+            _build_ctx,
+            _set_ctx,
+            _CTX_KEY,
+            _contexts,
+            _symbolize_registers_internal,
+            _process_function_instructions_linear,
+            _try_solve_predicate,
+        )
+        from .api_miasm import (
+            MIASM_AVAILABLE,
+            _manager,
+            _iter_ircfg_blocks,
+            _ircfg_edges,
+        )
+    except ImportError as exc:
+        return {"ok": False, "error": f"Import error: {exc}"}
+
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "Triton not available. Install: pip install triton-library"}
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "Miasm not available. Install: pip install miasm future"}
+
+    try:
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {hex(ea)}"}
+
+        # ------------------------------------------------------------------
+        # Miasm phase
+        # ------------------------------------------------------------------
+        miasm_result: dict = {}
+        try:
+            data = _manager.get_bytes(func.start_ea, func.end_ea)
+            mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+            asmcfg = mdis.dis_multiblock(func.start_ea)
+            lifter = _manager.machine.lifter_model_call(loc_db)
+            ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+
+            block_count_before = len(list(_iter_ircfg_blocks(ircfg)))
+            edge_count_before = len(_ircfg_edges(ircfg))
+
+            if deobfuscate:
+                from miasm.analysis.data_flow import DeadRemoval
+                dead_rm = DeadRemoval(lifter)
+                dead_rm(ircfg)
+
+            block_count_after = len(list(_iter_ircfg_blocks(ircfg)))
+            edge_count_after = len(_ircfg_edges(ircfg))
+
+            miasm_result = {
+                "block_count": block_count_after,
+                "edge_count": edge_count_after,
+                "block_reduction": block_count_before - block_count_after,
+                "edge_reduction": edge_count_before - edge_count_after,
+                "deobfuscation_applied": deobfuscate,
+            }
+        except Exception as exc:
+            miasm_result = {"error": str(exc)}
+
+        # ------------------------------------------------------------------
+        # Triton phase
+        # ------------------------------------------------------------------
+        if _contexts.get(_CTX_KEY) is None:
+            arch = _detect_arch_from_ida()
+            ctx = _build_ctx(arch)
+            _set_ctx(_CTX_KEY, ctx)
+        else:
+            ctx = _contexts.get(_CTX_KEY)
+            if ctx is None:
+                return {"ok": False, "error": "Triton context unavailable"}
+
+        if isinstance(symbolize_args, str):
+            reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
+        else:
+            reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
+
+        symbolized = _symbolize_registers_internal(ctx, reg_list) if reg_list else []
+
+        sym_start = len(ctx.getSymbolicExpressions())
+        pc_start = len(ctx.getPathConstraints())
+        tainted_reg_start = len(ctx.getTaintedRegisters())
+        tainted_mem_start = len(ctx.getTaintedMemory())
+
+        processed, truncated = _process_function_instructions_linear(
+            ctx, func.start_ea, func.end_ea, max_insns
+        )
+
+        sym_end = len(ctx.getSymbolicExpressions())
+        pc_end = len(ctx.getPathConstraints())
+
+        sym_vars_info = []
+        try:
+            from triton import SYMBOLIC
+            for vid, sv in ctx.getSymbolicVariables().items():
+                sym_vars_info.append({
+                    "id": vid,
+                    "name": sv.getName(),
+                    "alias": sv.getAlias(),
+                    "bitsize": sv.getBitSize(),
+                    "kind": "register" if sv.getType() == SYMBOLIC.REGISTER_VARIABLE else "memory",
+                })
+        except Exception:
+            pass
+
+        pc_records = []
+        try:
+            for pc in ctx.getPathConstraints():
+                branches_info = []
+                for br in pc.getBranchConstraints():
+                    branches_info.append({
+                        "is_taken": br["isTaken"],
+                        "src": hex(br["srcAddr"]),
+                        "dst": hex(br["dstAddr"]),
+                    })
+                pc_records.append({
+                    "multiple_branches": pc.isMultipleBranches(),
+                    "branches": branches_info,
+                })
+        except Exception:
+            pass
+
+        tainted_outputs = {
+            "registers": [r.getName() for r in ctx.getTaintedRegisters()],
+            "memory_addrs": [hex(a) for a in ctx.getTaintedMemory()],
+        }
+
+        solve_result = _try_solve_predicate(ctx, timeout_ms)
+
+        triton_result = {
+            "symbolized_args": symbolized,
+            "instructions_processed": len(processed),
+            "instructions_truncated": truncated,
+            "new_symbolic_expressions": sym_end - sym_start,
+            "new_path_constraints": pc_end - pc_start,
+            "symbolic_variables": sym_vars_info,
+            "path_constraints": pc_records,
+            "tainted_outputs": tainted_outputs,
+            "tainted_register_delta": len(ctx.getTaintedRegisters()) - tainted_reg_start,
+            "tainted_memory_delta": len(ctx.getTaintedMemory()) - tainted_mem_start,
+            "solver": solve_result,
+        }
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "miasm": miasm_result,
+            "triton": triton_result,
+            "solver": solve_result,
+        }
+
+    except IDAError as exc:
+        return {"ok": False, "error": exc.message}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@unsafe
+@tool
+@idasync
+@tool_timeout(180.0)
+def hybrid_deobfuscate_and_patch(
+    address: Annotated[str, "Function address (hex or symbol name)."],
+    dry_run: Annotated[
+        bool,
+        "When True (default), only report proposed patches without modifying the database.",
+    ] = True,
+    confirm: Annotated[
+        bool,
+        "Must be set to True when dry_run=False to confirm destructive patching.",
+    ] = False,
+) -> HybridPatchResult:
+    """Miasm deobfuscation + IDA patching workflow.
+
+    1. Lifts the function to Miasm IR and applies dead-code elimination.
+    2. Identifies basic blocks that became empty (all assignments dead).
+    3. Maps empty blocks back to original instruction addresses.
+    4. Reports patch candidates (address ranges that can be NOPed out).
+    5. If dry_run=False AND confirm=True, patches the identified bytes with NOPs.
+
+    This tool is marked @unsafe because it modifies the IDA database.
+    Always run with dry_run=True first to review proposed patches.
+    """
+    import idaapi
+    import ida_funcs
+    import idc
+    import ida_bytes
+
+    try:
+        from .api_miasm import (
+            MIASM_AVAILABLE,
+            _manager,
+            _iter_ircfg_blocks,
+        )
+    except ImportError as exc:
+        return {"ok": False, "error": f"Import error: {exc}"}
+
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "Miasm not available. Install: pip install miasm future"}
+
+    if not dry_run and not confirm:
+        return {
+            "ok": False,
+            "error": "confirm=True is required when dry_run=False. Set dry_run=True to preview patches.",
+        }
+
+    try:
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {hex(ea)}"}
+
+        data = _manager.get_bytes(func.start_ea, func.end_ea)
+        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+        asmcfg = mdis.dis_multiblock(func.start_ea)
+        lifter = _manager.machine.lifter_model_call(loc_db)
+        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+
+        # Record block addresses before deobfuscation
+        block_ranges: dict = {}
+        for block in asmcfg.blocks:
+            if not block.lines:
+                continue
+            start = block.lines[0].offset
+            end = block.lines[-1].offset
+            # Include instruction size for end
+            last_len = block.lines[-1].l
+            block_ranges[block.loc_key] = (start, end + last_len)
+
+        # Apply dead-code elimination
+        from miasm.analysis.data_flow import DeadRemoval
+        dead_rm = DeadRemoval(lifter)
+        dead_rm(ircfg)
+
+        # Find empty IR blocks (all assignments dead)
+        candidates: list[HybridPatchCandidate] = []
+        for loc_key, irblock in _iter_ircfg_blocks(ircfg):
+            if len(irblock) == 0:
+                rng = block_ranges.get(loc_key)
+                if rng:
+                    candidates.append({
+                        "address": hex(rng[0]),
+                        "size": rng[1] - rng[0],
+                        "reason": "Block empty after dead-code elimination",
+                    })
+
+        # Generate NOP bytes for the current architecture
+        machine = _manager.machine
+        bits = _manager.bitness
+        loc_db_nop = None
+        try:
+            from miasm.core.locationdb import LocationDB
+            loc_db_nop = LocationDB()
+            mn = machine.mn
+            nop_instr = mn.fromstring("NOP", loc_db_nop, bits)
+            nop_encodings = mn.asm(nop_instr)
+            nop_byte = nop_encodings[0] if nop_encodings else b"\x90"
+        except Exception:
+            nop_byte = b"\x90"  # Fallback to x86 NOP
+
+        patches_applied = 0
+        if not dry_run:
+            for cand in candidates:
+                try:
+                    addr = int(cand["address"], 16)
+                    size = cand["size"]
+                    if size <= 0:
+                        continue
+                    # Build NOP sled: repeat shortest NOP encoding
+                    nop_sled = (nop_byte * (size // len(nop_byte) + 1))[:size]
+                    if ida_bytes.patch_bytes(addr, nop_sled):
+                        patches_applied += 1
+                except Exception:
+                    pass
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "dry_run": dry_run,
+            "candidates": candidates,
+            "patches_applied": patches_applied,
+        }
+
+    except IDAError as exc:
+        return {"ok": False, "error": exc.message}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

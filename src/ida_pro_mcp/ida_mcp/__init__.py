@@ -41,6 +41,7 @@ from . import api_composite
 from . import api_discovery
 from . import trace as trace
 from . import api_sigmaker
+from . import api_tasks
 
 # Optional analysis engine modules — load only when dependencies are present.
 # ImportError / AttributeError from missing packages is silently swallowed so

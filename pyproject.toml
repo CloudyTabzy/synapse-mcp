@@ -1,6 +1,6 @@
 [project]
 name = "ida-pro-triton-miasm-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "IDA Pro MCP server with built-in Triton symbolic execution and Miasm IR analysis"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,8 +25,8 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = ["triton-library>=0.10.0"]
-miasm  = ["miasm>=0.1.17", "future>=0.18.0"]
-all    = ["triton-library>=0.10.0", "miasm>=0.1.17", "future>=0.18.0"]
+miasm  = ["miasm>=0.1.5", "future>=0.18.0"]
+all    = ["triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0"]
 
 [dependency-groups]
 dev = [

@@ -24,8 +24,19 @@ Core API modules (upstream):
 - `api_resources.py`: `ida://` MCP resources
 
 Optional analysis engine modules (this fork):
-- `api_triton.py`: Triton symbolic execution — 32 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, and snapshots. Requires `pip install triton-library`.
-- `api_miasm.py`: Miasm IR analysis — 14 tools covering IR lifting, SSA, CFG analysis, dead-code elimination, symbolic emulation, data-flow tracing, and cross-arch assembly/patching. Requires `pip install miasm future`.
+- `api_triton.py`: Triton symbolic execution — 36 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, snapshots, IDA annotation, and taint highlighting. Requires `pip install triton-library`.
+- `api_miasm.py`: Miasm IR analysis — 21 tools covering IR lifting, SSA, CFG analysis, dead-code elimination, symbolic emulation, data-flow tracing, cross-arch assembly/patching, CFG summary, path constraint solving, and IDA annotation. Requires `pip install miasm future`.
+- `api_composite.py`: Hybrid cross-engine workflows — `hybrid_analyze_function` (Miasm deobfuscation + Triton symbolic execution) and `hybrid_deobfuscate_and_patch` (dead-code detection + safe patching).
+- `api_tasks.py`: Async task queue — `task_submit`, `task_poll`, `task_list`, `task_cancel`. Submit heavy tools (decompile, Triton/Miasm analysis, callgraph) as background tasks to avoid MCP client timeouts. Worker threads replay the submitter's extension/unsafe context.
+
+Workflow skills (`skills/`):
+- `binary-survey`: Initial reconnaissance — metadata, segments, imports, strings, function triage
+- `stripped-binary-recovery`: Recover semantics from stripped binaries — FLIRT signatures, code gaps, string xrefs, constant matching, call-graph hub analysis, structural similarity
+- `function-deep-dive`: Thorough single-function analysis — decompile, disasm, xrefs, control flow, stack frame, rename, type, comment
+- `triton-symbolic-exec`: Symbolic execution workflows — one-shot, instruction-by-instruction, taint analysis, branch-target solving
+- `miasm-ir-analysis`: IR analysis workflows — CFG metrics, SSA, deobfuscation, data-flow tracing, path solving
+- `hybrid-deobfuscate`: Cross-engine deobfuscation — Miasm simplification → Triton analysis → optional patching
+- `vuln-hunter-static`: Static vulnerability hunting — dangerous API enumeration, xref analysis, input validation checks
 
 ## Optional-import pattern
 
@@ -39,9 +50,10 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 # One status probe tool is always registered (outside the guard)
+# It returns a dict so AI agents can check availability programmatically
 @tool
 @idasync
-def triton_status() -> str: ...
+def triton_status() -> dict: ...
 
 # All other tools are inside the guard
 if TRITON_AVAILABLE:
@@ -115,10 +127,27 @@ uv run ida-pro-mcp --unsafe
 uv run mcp dev src/ida_pro_mcp/server.py
 ```
 
-### Install / uninstall
+### Install / uninstall plugin
 ```bash
 uv run ida-pro-mcp --install
 uv run ida-pro-mcp --uninstall
+```
+
+### Install optional analysis engines
+```bash
+# Triton symbolic execution
+uv run ida-pro-mcp --install-deps triton
+# Miasm IR analysis
+uv run ida-pro-mcp --install-deps miasm
+# Both at once
+uv run ida-pro-mcp --install-deps all
+```
+
+### Verify installation
+After connecting your MCP client, call the probe tools:
+```
+triton_status   # → {"ok": true, "available": true, ...}
+miasm_status    # → {"ok": true, "available": true, ...}
 ```
 
 ## Testing and coverage
@@ -175,6 +204,7 @@ High priority:
 - `api_resources.py`
 - `api_triton.py`
 - `api_miasm.py`
+- `api_composite.py` (hybrid tools)
 - `utils.py`
 - `framework.py`
 
@@ -189,3 +219,16 @@ Lower priority:
 - IDA Pro 8.3+; 9.0 recommended
 - IDA Free is not supported
 - If IDA uses the wrong Python, use `idapyswitch`
+
+### Dependency notes
+- `triton-library`: Prebuilt wheels available on Windows. On Linux/macOS you may need to build from source or use Conda.
+- `miasm>=0.1.5`: Pure-Python core. The `future` package is an additional dependency (bundled with `--install-deps miasm`). JIT compilation is optional and disabled by default on Windows.
+- Both engines are optional. The plugin loads cleanly without them; only the `*_status` probe tools report `"available": false`.
+
+### Return-type design principle
+Every tool in this fork returns a **structured `dict` / `TypedDict`**, never raw strings or untyped lists. This is intentional:
+- AI agents parse fields programmatically without regex.
+- Consistent error shape: `{"ok": false, "error": "..."}` across all modules.
+- Downstream tools can chain outputs directly.
+
+If you find a tool that returns a plain string, that's a bug — fix it.

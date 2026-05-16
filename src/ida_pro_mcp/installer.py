@@ -440,7 +440,7 @@ OPTIONAL_PACKAGES = {
         "pip_name": "miasm",
         "import_name": "miasm",
         "display": "Miasm   — IR lifting, SSA, deobfuscation, cross-arch assembly",
-        "min_version": "0.1.17",
+        "min_version": "0.1.5",
         "extras": ["future>=0.18.0"],
     },
 }

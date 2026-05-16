@@ -45,6 +45,8 @@ try:
             triton_snapshot_restore,
             triton_snapshot_list,
             triton_snapshot_delete,
+            triton_annotate_function,
+            triton_highlight_tainted_instructions,
         )
 except ImportError:
     TRITON_AVAILABLE = False
@@ -59,7 +61,8 @@ def _init_context():
     """Initialise the default Triton context; skip if not possible."""
     _require_triton()
     result = triton_init()
-    assert isinstance(result, str), f"triton_init should return str, got {type(result)}"
+    assert isinstance(result, dict), f"triton_init should return dict, got {type(result)}"
+    assert result.get("ok") is True, f"triton_init failed: {result}"
     return result
 
 
@@ -69,21 +72,19 @@ def _init_context():
 
 
 @test()
-def test_triton_status_always_returns_string():
-    """triton_status should always succeed whether or not triton-library is installed."""
+def test_triton_status_always_returns_dict():
+    """triton_status should always return a dict whether or not triton-library is installed."""
     result = triton_status()
-    assert isinstance(result, str), f"expected str, got {type(result)}"
-    assert_non_empty(result)
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert "available" in result, f'missing "available" key in {result}'
 
 
 @test()
 def test_triton_status_reports_availability():
-    """triton_status string indicates whether Triton is available or not."""
+    """triton_status dict indicates whether Triton is available or not."""
     result = triton_status()
-    # Should contain either "NOT installed" (unavailable) or "version" (available)
-    has_not = "NOT" in result or "not" in result
-    has_version = "version" in result.lower() or "available" in result.lower()
-    assert has_not or has_version, f"Unexpected status string: {result!r}"
+    assert isinstance(result, dict)
+    assert "available" in result, f'missing "available" key in {result}'
 
 
 # ============================================================================
@@ -96,9 +97,9 @@ def test_triton_init_auto_detects_arch():
     """triton_init auto-detects architecture from the loaded binary."""
     _require_triton()
     result = triton_init()
-    assert "architecture" in result.lower() or "init" in result.lower(), (
-        f"Expected arch in init message, got: {result!r}"
-    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True, f"triton_init failed: {result}"
+    assert "architecture" in result, f"Expected arch in init result, got: {result!r}"
 
 
 @test()
@@ -106,8 +107,9 @@ def test_triton_init_explicit_x86_64():
     """triton_init accepts explicit architecture override."""
     _require_triton()
     result = triton_init("x86_64")
-    assert isinstance(result, str)
-    assert_non_empty(result)
+    assert isinstance(result, dict)
+    assert result.get("ok") is True, f"triton_init failed: {result}"
+    assert result.get("architecture") == "x86_64", f"Expected x86_64 arch: {result}"
 
 
 @test()
@@ -124,8 +126,8 @@ def test_triton_reset_clears_state():
     """triton_reset returns success and leaves the context ready for reuse."""
     _init_context()
     result = triton_reset()
-    assert isinstance(result, str)
-    assert_non_empty(result)
+    assert isinstance(result, dict)
+    assert result.get("ok") is True, f"triton_reset failed: {result}"
     # Should still be usable after reset
     info = triton_get_context_info()
     assert isinstance(info, dict)
@@ -160,10 +162,9 @@ def test_triton_batch_symbolize_registers():
     """triton_batch_symbolize_registers processes a comma-separated register list."""
     _init_context()
     result = triton_batch_symbolize_registers("rax, rbx, rcx")
-    assert isinstance(result, dict), f"expected dict, got {type(result)}"
-    assert "symbolized" in result or "results" in result or "count" in result, (
-        f"Missing expected key in {result}"
-    )
+    assert isinstance(result, list), f"expected list, got {type(result)}"
+    assert len(result) == 3, f"Expected 3 results, got {len(result)}: {result}"
+    assert all(isinstance(r, dict) for r in result), f"Expected list of dicts: {result}"
 
 
 # ============================================================================
@@ -243,8 +244,9 @@ def test_triton_get_symbolic_variables_after_symbolize():
     _init_context()
     triton_symbolize_register("rax", "query_test")
     result = triton_get_symbolic_variables()
-    assert isinstance(result, list), f"expected list, got {type(result)}"
-    assert len(result) >= 1, "Expected at least one symbolic variable"
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert result.get("ok") is True, f"get_symbolic_variables failed: {result}"
+    assert result.get("count", 0) >= 1, "Expected at least one symbolic variable"
 
 
 @test()
@@ -252,7 +254,8 @@ def test_triton_get_symbolic_expressions():
     """triton_get_symbolic_expressions returns an empty list on a fresh context."""
     _init_context()
     result = triton_get_symbolic_expressions()
-    assert isinstance(result, list), f"expected list, got {type(result)}"
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert result.get("ok") is True, f"get_symbolic_expressions failed: {result}"
 
 
 @test()
@@ -260,7 +263,8 @@ def test_triton_get_path_constraints():
     """triton_get_path_constraints returns a list (empty on a fresh context)."""
     _init_context()
     result = triton_get_path_constraints()
-    assert isinstance(result, list), f"expected list, got {type(result)}"
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert result.get("ok") is True, f"get_path_constraints failed: {result}"
 
 
 # ============================================================================
@@ -315,7 +319,7 @@ def test_triton_solve_path_constraints_no_constraints():
     _init_context()
     result = triton_solve_path_constraints()
     assert isinstance(result, dict), f"expected dict, got {type(result)}"
-    assert "satisfiable" in result or "model" in result or "status" in result, (
+    assert "sat" in result or "model" in result, (
         f"Missing solve status in {result}"
     )
 
@@ -337,12 +341,14 @@ def test_triton_snapshot_save_list_delete():
     assert snap_id is not None, f"Expected snapshot id in {save_result}"
 
     listing = triton_snapshot_list()
-    assert isinstance(listing, list), f"expected list, got {type(listing)}"
-    ids = [s.get("id") for s in listing]
+    assert isinstance(listing, dict), f"expected dict, got {type(listing)}"
+    snaps = listing.get("snapshots", [])
+    ids = [s.get("id") for s in snaps]
     assert snap_id in ids, f"Snapshot {snap_id} not found in list: {ids}"
 
     del_result = triton_snapshot_delete(snap_id)
-    assert isinstance(del_result, str), f"expected str from delete, got {type(del_result)}"
+    assert isinstance(del_result, dict), f"expected dict from delete, got {type(del_result)}"
+    assert del_result.get("ok") is True, f"delete failed: {del_result}"
 
 
 @test()
@@ -359,10 +365,68 @@ def test_triton_snapshot_restore():
 
     restore_result = triton_snapshot_restore(snap_id)
     assert isinstance(restore_result, dict), f"expected dict, got {type(restore_result)}"
-    assert restore_result.get("success") is True or "restored" in str(restore_result), (
-        f"Unexpected restore result: {restore_result}"
-    )
+    assert restore_result.get("ok") is True, f"Unexpected restore result: {restore_result}"
 
     vars_after = triton_get_symbolic_variables()
     assert isinstance(vars_after, list)
     assert len(vars_after) >= 1, "Expected at least one symbolic variable after restore"
+
+
+# ============================================================================
+# Annotation tools
+# ============================================================================
+
+
+@test()
+def test_triton_annotate_function():
+    """triton_annotate_function runs and reports annotation count."""
+    _init_context()
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = triton_annotate_function(int(fn_addr, 16), max_insns=20)
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert "annotations_written" in result, f"Missing annotations_written: {result}"
+
+
+@test()
+def test_triton_highlight_tainted_instructions():
+    """triton_highlight_tainted_instructions scans and reports highlights."""
+    _init_context()
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    # Taint a register first so something is highlighted
+    triton_taint_register("rax")
+    result = triton_highlight_tainted_instructions(int(fn_addr, 16), max_insns=20)
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert "highlighted_count" in result, f"Missing highlighted_count: {result}"
+
+@test()
+def test_triton_analyze_function():
+    """triton_analyze_function runs the full pipeline and returns a structured report."""
+    _require_triton()
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = triton_analyze_function(fn_addr, max_insns=20)
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert result.get("ok") is True, f"Expected ok=True: {result}"
+    assert "instructions_processed" in result, f"Missing instructions_processed: {result}"
+    assert "solver" in result, f"Missing solver: {result}"
+
+
+@test()
+def test_triton_find_input_for_branch():
+    """triton_find_input_for_branch returns a block path and solver result."""
+    _require_triton()
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    # Use the function start as target (trivial path)
+    result = triton_find_input_for_branch(fn_addr, fn_addr, max_insns=20)
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert result.get("ok") is True, f"Expected ok=True: {result}"
+    assert "block_path" in result, f"Missing block_path: {result}"
+    assert "solver" in result, f"Missing solver: {result}"
+
