@@ -292,6 +292,15 @@ wheels = [
 ]
 
 [[package]]
+name = "future"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/b2/4140c69c6a66432916b26158687e821ba631a4c9273c474343badf84d3ba/future-1.0.0.tar.gz", hash = "sha256:bd2968309307861edae1458a4f8a4f3598c03be43b97521076aebf5d94c07b05", size = 1228490, upload-time = "2024-02-21T11:52:38.461Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/71/ae30dadffc90b9006d77af76b393cb9dfbfc9629f339fc1574a1c52e6806/future-1.0.0-py3-none-any.whl", hash = "sha256:929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216", size = 491326, upload-time = "2024-02-21T11:52:35.956Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -338,12 +347,26 @@ wheels = [
 ]
 
 [[package]]
-name = "ida-pro-mcp"
-version = "2.0.0"
+name = "ida-pro-triton-miasm-mcp"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "idapro" },
     { name = "tomli-w" },
+]
+
+[package.optional-dependencies]
+all = [
+    { name = "future" },
+    { name = "miasm" },
+    { name = "triton-library" },
+]
+miasm = [
+    { name = "future" },
+    { name = "miasm" },
+]
+triton = [
+    { name = "triton-library" },
 ]
 
 [package.dev-dependencies]
@@ -355,9 +378,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "future", marker = "extra == 'all'", specifier = ">=0.18.0" },
+    { name = "future", marker = "extra == 'miasm'", specifier = ">=0.18.0" },
     { name = "idapro", specifier = ">=0.0.9" },
+    { name = "miasm", marker = "extra == 'all'", specifier = ">=0.1.5" },
+    { name = "miasm", marker = "extra == 'miasm'", specifier = ">=0.1.5" },
     { name = "tomli-w", specifier = ">=1.0.0" },
+    { name = "triton-library", marker = "extra == 'all'", specifier = ">=0.10.0" },
+    { name = "triton-library", marker = "extra == 'triton'", specifier = ">=0.10.0" },
 ]
+provides-extras = ["triton", "miasm", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -435,6 +465,16 @@ sdist = { url = "https://files.pythonhosted.org/packages/8b/eb/c0cfc62075dc6e1ec
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9c/46/f6b4ad632c67ef35209a66127e4bddc95759649dd595f71f13fba11bdf9a/mcp-1.27.0-py3-none-any.whl", hash = "sha256:5ce1fa81614958e267b21fb2aa34e0aea8e2c6ede60d52aba45fd47246b4d741", size = 215967, upload-time = "2026-04-02T14:48:07.24Z" },
 ]
+
+[[package]]
+name = "miasm"
+version = "0.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "future" },
+    { name = "pyparsing" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9d/53/706e9d24936f53dace112f01130c6e46773551dd19cfd6118c1b35fbb836/miasm-0.1.5.tar.gz", hash = "sha256:e90d5886cdff7601747e8c6ae0e874356436d848e5be2a44642de9d29762dc75", size = 618342, upload-time = "2023-04-18T21:29:15.47Z" }
 
 [[package]]
 name = "pycparser"
@@ -588,6 +628,15 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography" },
+]
+
+[[package]]
+name = "pyparsing"
+version = "2.4.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/47/dfc9c342c9842bbe0036c7f763d2d6686bcf5eb1808ba3e170afdb282210/pyparsing-2.4.7.tar.gz", hash = "sha256:c203ec8783bf771a155b207279b9bccb8dea02d8f0c9e5f8ead507bc3246ecc1", size = 649718, upload-time = "2020-04-05T22:21:25.349Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/bb/488841f56197b13700afd5658fc279a2025a39e22449b7cf29864669b15d/pyparsing-2.4.7-py2.py3-none-any.whl", hash = "sha256:ef9d7589ef3c200abe66653d3f1ab1033c3c419ae9b9bdb1240a85b024efc88b", size = 67842, upload-time = "2020-04-05T22:21:22.897Z" },
 ]
 
 [[package]]
@@ -782,6 +831,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/19/75/241269d1da26b624c0d5e110e8149093c759b7a286138f4efd61a60e75fe/tomli_w-1.2.0.tar.gz", hash = "sha256:2dd14fac5a47c27be9cd4c976af5a12d87fb1f0b4512f81d69cce3b35ae25021", size = 7184, upload-time = "2025-01-15T12:07:24.262Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/18/c86eb8e0202e32dd3df50d43d7ff9854f8e0603945ff398974c1d91ac1ef/tomli_w-1.2.0-py3-none-any.whl", hash = "sha256:188306098d013b691fcadc011abd66727d3c414c571bb01b1a174ba8c983cf90", size = 6675, upload-time = "2025-01-15T12:07:22.074Z" },
+]
+
+[[package]]
+name = "triton-library"
+version = "1.0.0rc4"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/57/a8f42bd1f6223aa2fc65bc26a5ecf0b11e397cfe9fd747063d19ac183f31/triton_library-1.0.0rc4-cp311-cp311-manylinux_2_31_x86_64.whl", hash = "sha256:f4f650cb5492e5986df547317b81fa08af283fbc768db94df0b2e367755bff80", size = 55902700, upload-time = "2024-05-22T20:05:01.15Z" },
+    { url = "https://files.pythonhosted.org/packages/72/b1/b6c6aa91b869b60f83c22106cb4a1398a5bef2d9001ab9aa07be2a1783ef/triton_library-1.0.0rc4-cp311-cp311-win_amd64.whl", hash = "sha256:f1bdfb91116afa83e0a2a24618797117f691bf7ae5b1e117193dc05815fcf905", size = 22128594, upload-time = "2024-05-22T20:08:59.594Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/5c/f2d2ddc0456ffa0f102012de2ba1808d6912b5636f0d78a740289ed18d2f/triton_library-1.0.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:e0f828c8c1c037ccf8881d1b9e2a8565791e31d1594bd548b168bbfddcc653a5", size = 56119154, upload-time = "2025-02-14T18:30:44.912Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/69/0e631bccd1d046c1923a9f641a5faf612b253b4ccbc967f090e4849b1cf1/triton_library-1.0.0rc4-cp312-cp312-win_amd64.whl", hash = "sha256:fad5f5727a560ce5cffa59e0a8bbae2bcfbe63e81caec20a36bc11a72599d3fc", size = 24229103, upload-time = "2025-02-14T17:49:14.881Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/94/5276205bccbccd2740bdcb2ec7687cad5cbd243d305a01792530259a66aa/triton_library-1.0.0rc4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:f3599dd7ec00d2f782a26b32d4e08cde32014958a437ad96ad812f8b75cf1906", size = 56119161, upload-time = "2025-02-14T18:31:07.516Z" },
+    { url = "https://files.pythonhosted.org/packages/34/e9/1fce4e9d153ac97bc3d7d957b31475a2789f27e971b90216b6b32a8d3b45/triton_library-1.0.0rc4-cp313-cp313-win_amd64.whl", hash = "sha256:0ebca4aa755b9bf3080e99fc594797c7ddd9c72b751b11e2b2c0068ae199ee15", size = 24229300, upload-time = "2025-02-14T17:49:27.505Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/ce/869d3e33e3d895980d4e85a6ddecaa0365f7fd1e631b5a0a7a6babac47e3/triton_library-1.0.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "sha256:59b007854dd231cec804c12c5345790710eff2adba76d7a0673b177551f507bf", size = 57558356, upload-time = "2026-02-23T18:21:27.625Z" },
+    { url = "https://files.pythonhosted.org/packages/11/7b/4120bd2e6faa06c2825f7e141ede3f6217bb2395e8763d6b3a75a36db316/triton_library-1.0.0rc4-cp314-cp314-win_amd64.whl", hash = "sha256:f2725de2292691ab88161f3260b1d4a4368088917b9d592aa085e54b1db5da05", size = 27501290, upload-time = "2026-02-23T18:30:31.293Z" },
 ]
 
 [[package]]

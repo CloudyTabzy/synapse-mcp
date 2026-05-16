@@ -294,12 +294,36 @@ ida-pro-mcp --install-deps miasm     # Miasm only
 
 ### MCP Client Configuration
 
-Add the server to your MCP client config:
+The installer can write configs **directly to your IDE** (auto-detected paths) or **export JSON files** to the project folder for manual copy-paste. The export option is recommended if you prefer full control over your IDE settings.
+
+#### Option A: Export JSON configs (recommended)
+
+Choose **"Export JSON configs to project folder"** during interactive install, or run:
+
+```bash
+ida-pro-mcp --install roo --scope export
+ida-pro-mcp --install cursor,claude --scope export --transport streamable-http
+```
+
+This creates a `mcp-client-configs/` folder with one JSON per client. Open the relevant file and paste its contents into your IDE's MCP settings.
+
+#### Option B: Direct IDE install
+
+The installer writes directly to known IDE config locations:
+
+```bash
+ida-pro-mcp --install roo          # Project-level (default)
+ida-pro-mcp --install claude --scope global
+```
+
+#### Manual config
+
+If you prefer to set it up manually, use this JSON structure:
 
 ```json
 {
   "mcpServers": {
-    "ida-pro-triton-miasm": {
+    "ida-pro-mcp": {
       "command": "ida-pro-mcp"
     }
   }
@@ -310,7 +334,7 @@ For SSE transport:
 ```json
 {
   "mcpServers": {
-    "ida-pro-triton-miasm": {
+    "ida-pro-mcp": {
       "command": "ida-pro-mcp",
       "args": ["--transport", "http://127.0.0.1:8744/sse"]
     }

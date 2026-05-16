@@ -532,9 +532,9 @@ def main():
     parser.add_argument(
         "--scope",
         type=str,
-        choices=["global", "project"],
+        choices=["global", "project", "export"],
         default=None,
-        help="Installation scope: 'project' (current directory, default) or 'global' (user-level)",
+        help="Installation scope: 'project' (current directory, default), 'global' (user-level), or 'export' (write JSON configs to project folder for manual copy)",
     )
     parser.add_argument(
         "--ida-rpc",

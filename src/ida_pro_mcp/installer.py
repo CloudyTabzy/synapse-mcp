@@ -37,6 +37,7 @@ IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+EXPORT_CONFIG_DIR = "mcp-client-configs"
 
 # NOTE: This is in the global scope on purpose
 if not os.path.exists(IDA_PLUGIN_PKG):
@@ -330,6 +331,7 @@ def list_available_clients():
     print("  ida-pro-mcp --install claude,cursor                       # Specific client targets")
     print("  ida-pro-mcp --install vscode --scope project              # Project-level config")
     print("  ida-pro-mcp --install cursor --transport streamable-http  # Streamable HTTP config")
+    print("  ida-pro-mcp --install roo --scope export                  # Export JSONs for manual copy")
     print("  ida-pro-mcp --uninstall cursor                            # Uninstall specific target")
 
 
@@ -417,6 +419,80 @@ def install_mcp_servers(
             "No MCP servers installed. For unsupported MCP clients, use the following config:\n"
         )
         print_mcp_config()
+
+
+def _build_client_export_config(client_name: str, transport: str) -> dict:
+    """Build a complete config dict for a specific client in the format it expects."""
+    special = {}
+    if client_name in GLOBAL_SPECIAL_JSON_STRUCTURES:
+        special = {client_name: GLOBAL_SPECIAL_JSON_STRUCTURES[client_name]}
+    elif client_name in PROJECT_SPECIAL_JSON_STRUCTURES:
+        special = {client_name: PROJECT_SPECIAL_JSON_STRUCTURES[client_name]}
+
+    config = {}
+    mcp_servers = _get_mcp_servers_view(
+        config,
+        client_name=client_name,
+        is_toml=False,
+        special_json_structures=special,
+    )
+    mcp_servers[MCP_SERVER_NAME] = generate_mcp_config(
+        client_name=client_name, transport=transport
+    )
+    return config
+
+
+def _get_all_export_clients() -> dict[str, str]:
+    """Return a mapping of all known client names -> friendly filename slug."""
+    global_clients = get_global_configs()
+    project_clients = get_project_configs(os.getcwd())
+    all_names = sorted(set(global_clients.keys()) | set(project_clients.keys()))
+    result: dict[str, str] = {}
+    for name in all_names:
+        slug = name.lower().replace(" ", "-").replace(".", "").replace("(", "").replace(")", "")
+        result[name] = f"{slug}.json"
+    return result
+
+
+def export_mcp_configs(
+    *,
+    transport: str = "stdio",
+    only: list[str] | None = None,
+    project_dir: str | None = None,
+) -> None:
+    """Export MCP config JSON files to the project folder for manual IDE setup."""
+    clients = _get_all_export_clients()
+    if not clients:
+        print("No supported MCP clients found for export.")
+        return
+
+    if only:
+        filtered = {}
+        for target in only:
+            resolved = resolve_client_name(target, list(clients.keys()))
+            if resolved and resolved in clients:
+                filtered[resolved] = clients[resolved]
+            else:
+                print(f"  Warning: Unknown client '{target}' — skipping")
+        clients = filtered
+
+    out_dir = os.path.join(project_dir or os.getcwd(), EXPORT_CONFIG_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+
+    written = 0
+    for name, filename in clients.items():
+        config = _build_client_export_config(name, transport)
+        out_path = os.path.join(out_dir, filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+        written += 1
+
+    print(f"\nExported {written} MCP client config(s) to: {out_dir}")
+    print("Copy the contents of the relevant JSON file into your IDE's MCP settings.")
+    if "stdio" in transport or transport == "stdio":
+        print("  Tip: For stdio transport, the 'command' path uses the current Python.")
+    print()
 
 
 def _get_ida_user_dir() -> str:
@@ -724,17 +800,28 @@ def _get_install_scope(args, *, interactive: bool) -> str | None:
         return "project"
 
     choice = interactive_choose(
-        ["Project (current directory)", "Global (user-level)"],
+        [
+            "Export JSON configs to project folder (manual copy)",
+            "Project (current directory)",
+            "Global (user-level)",
+        ],
         "Select installation scope:",
     )
     if choice is None:
         return None
+    if choice.startswith("Export"):
+        return "export"
     if choice.startswith("Project"):
         return "project"
     return "global"
 
 
-def _get_scope_selection_items(*, project: bool) -> list[tuple[str, bool]]:
+def _get_scope_selection_items(*, scope: str) -> list[tuple[str, bool]]:
+    if scope == "export":
+        clients = _get_all_export_clients()
+        return [(name, False) for name in clients.keys()]
+
+    project = scope == "project"
     configs, _ = _get_scope_config_spec(project=project)
     return [
         (
@@ -752,13 +839,23 @@ def _apply_client_install(
     uninstall: bool,
     client_targets: list[str],
 ) -> None:
-    if client_targets:
-        install_mcp_servers(
-            transport=transport,
-            uninstall=uninstall,
-            only=client_targets,
-            project=(scope == "project"),
-        )
+    if not client_targets:
+        return
+    if scope == "export":
+        if uninstall:
+            out_dir = os.path.join(os.getcwd(), EXPORT_CONFIG_DIR)
+            if os.path.isdir(out_dir):
+                shutil.rmtree(out_dir)
+                print(f"Removed exported configs: {out_dir}")
+            return
+        export_mcp_configs(transport=transport, only=client_targets)
+        return
+    install_mcp_servers(
+        transport=transport,
+        uninstall=uninstall,
+        only=client_targets,
+        project=(scope == "project"),
+    )
 
 
 def _parse_client_targets(targets_str: str) -> list[str]:
@@ -781,7 +878,7 @@ def _interactive_install(*, uninstall: bool, args):
         print("Cancelled.")
         return
 
-    items = _get_scope_selection_items(project=(scope == "project"))
+    items = _get_scope_selection_items(scope=scope)
     if not items:
         print(f"Unsupported platform: {sys.platform}")
         return
