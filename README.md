@@ -39,10 +39,12 @@ All address parameters accept a **`str`** (hex `"0x401000"` or a symbol name `"m
 
 ### Installing the analysis engines
 
-After installing the plugin, add the engines through the MCP server's own installer:
+If you used the **one-click installer** (`install.bat` or `install.sh`), you were already prompted to install optional engines interactively. No further action is needed.
+
+For headless or non-interactive installs, use the `--install-deps` flag:
 
 ```sh
-# Install both engines at once (default when --install-deps is used without a value)
+# Install both engines at once (default when flag is used without a value)
 ida-pro-mcp --install-deps
 # or explicitly
 ida-pro-mcp --install-deps all
@@ -257,8 +259,17 @@ chmod +x install.sh
 This script will:
 1. Remove conflicting upstream packages (`ida-pro-mcp`, `ida-pro-mcp-xjoker`)
 2. Install this fork from source in editable mode
-3. Install the IDA Pro plugin
-4. Prompt you to install optional analysis engines (Triton / Miasm / Both)
+3. Launch the interactive IDA plugin installer
+
+The installer uses an elegant Python TUI (arrow keys + space to toggle, Enter to confirm). It will ask you to select optional analysis engines to install:
+
+```
+Install optional analysis engines? (space=toggle, enter=confirm):
+[ ] Triton  — symbolic execution & SMT constraint solving
+[ ] Miasm   — IR lifting, SSA, deobfuscation, cross-arch assembly
+```
+
+Use **Space** to toggle each engine, then **Enter** to confirm. Press Enter with nothing selected to skip optional engines.
 
 ### Manual Install
 
