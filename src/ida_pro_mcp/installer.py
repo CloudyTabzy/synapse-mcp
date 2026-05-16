@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -105,6 +106,17 @@ def copy_python_env(env: dict[str, str]):
     return result
 
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Strip C-style comments from JSONC while preserving string literals."""
+
+    def _replacer(match: re.Match) -> str:
+        s = match.group(0)
+        return s if s[0] == '"' else ''
+
+    pattern = r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\r\n]*'
+    return re.sub(pattern, _replacer, text, flags=re.DOTALL)
+
+
 def normalize_transport_url(transport: str) -> str:
     url = urlparse(transport)
     if url.hostname is None or url.port is None:
@@ -135,6 +147,15 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
                     SERVER_SCRIPT,
                 ],
             }
+        elif client_name == "Kilo Code":
+            mcp_config = {
+                "type": "local",
+                "command": [
+                    get_python_executable(),
+                    SERVER_SCRIPT,
+                ],
+                "enabled": True,
+            }
         else:
             mcp_config = {
                 "command": get_python_executable(),
@@ -156,6 +177,8 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
     transport_url = normalize_transport_url(transport)
     if client_name == "Opencode":
         return {"type": "remote", "url": transport_url}
+    if client_name == "Kilo Code":
+        return {"type": "remote", "url": transport_url, "enabled": True}
     if client_name == "Codex":
         return {"url": force_mcp_path(transport_url)}
     if client_name in ("Claude", "Claude Code"):
@@ -228,6 +251,8 @@ def _read_config_file(config_path: str, *, is_toml: bool) -> dict | None:
                 return tomllib.loads(data.decode("utf-8")) if data else {}
         with open(config_path, "r", encoding="utf-8") as f:
             data = f.read().strip()
+            if config_path.endswith(".jsonc"):
+                data = _strip_jsonc_comments(data)
             return json.loads(data) if data else {}
     except (json.JSONDecodeError, tomllib.TOMLDecodeError, OSError):
         return None
