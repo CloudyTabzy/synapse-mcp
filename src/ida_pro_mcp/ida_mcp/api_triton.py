@@ -11,7 +11,7 @@ import logging
 import time
 import threading
 from collections import OrderedDict
-from typing import Annotated, NotRequired, TypedDict, Union
+from typing import Annotated, NotRequired, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -499,7 +499,7 @@ def triton_symbolize_memory(
 @idasync
 def triton_batch_symbolize_registers(
     registers: Annotated[
-        Union[str, list[str]],
+        str | list[str],
         "Register names — comma-separated string or JSON array. E.g. 'rdi,rsi,rdx'.",
     ],
 ) -> list[dict]:
@@ -979,7 +979,7 @@ def triton_untaint_memory(
 @idasync
 def triton_batch_taint_registers(
     registers: Annotated[
-        Union[str, list[str]],
+        str | list[str],
         "Register names — comma-separated string or JSON array.",
     ],
 ) -> list[TaintResult]:
@@ -1525,7 +1525,7 @@ if TRITON_AVAILABLE:
     def triton_analyze_function(
         address: Annotated[str, "Function start address (hex or symbol name)."],
         symbolize_args: Annotated[
-            Union[str, list[str]],
+            str | list[str],
             "Registers to mark symbolic before execution — typical argument "
             "registers for the binary's ABI (e.g. 'rdi,rsi,rdx' for x86-64 SysV, "
             "'rcx,rdx,r8,r9' for Windows x64, 'r0,r1,r2,r3' for AArch32). "
@@ -1724,7 +1724,7 @@ if TRITON_AVAILABLE:
             "Address of the instruction (or block) we want execution to reach.",
         ],
         symbolize_args: Annotated[
-            Union[str, list[str]],
+            str | list[str],
             "Registers to mark symbolic — usually the function's ABI argument "
             "registers. Accepts JSON array or comma-separated string.",
         ] = "",
@@ -1920,7 +1920,7 @@ if TRITON_AVAILABLE:
     def triton_annotate_function(
         address: Annotated[str, "Function address (hex or symbol name)."],
         symbolize_args: Annotated[
-            Union[str, list[str]],
+            str | list[str],
             "Registers to symbolize before execution (comma-separated or JSON array). "
             "Pass empty string to skip symbolization.",
         ] = "",

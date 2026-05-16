@@ -10,7 +10,7 @@ from the open IDA database — no file path or manual byte feeding required.
 import json
 import logging
 import threading
-from typing import Annotated, Union
+from typing import Annotated
 
 logger = logging.getLogger(__name__)
 
@@ -891,7 +891,7 @@ if MIASM_AVAILABLE:
     def miasm_search_instruction_pattern(
         address: Annotated[str, "Any address inside the function to search (hex or symbol name)"],
         mnemonics: Annotated[
-            Union[str, list[str]],
+            str | list[str],
             "Sequence of mnemonics to match consecutively (case-insensitive). "
             "Accept either a JSON list like ['MOV','PUSH','CALL'] or a "
             "comma-separated string 'MOV,PUSH,CALL'.",

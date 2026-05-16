@@ -679,7 +679,7 @@ class HybridPatchResult(TypedDict, total=False):
 def hybrid_analyze_function(
     address: Annotated[str, "Function address (hex or symbol name)."],
     symbolize_args: Annotated[
-        Union[str, list[str]],
+        str | list[str],
         "Registers to symbolize for Triton (comma-separated or JSON array). "
         "Pass empty string to skip symbolization.",
     ] = "",
