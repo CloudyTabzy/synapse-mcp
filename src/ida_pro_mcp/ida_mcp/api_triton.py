@@ -1419,53 +1419,635 @@ def triton_snapshot_delete(
 # Compound workflow tools (function-level)
 # ============================================================================
 
-if TRITON_AVAILABLE:
 
-    def _symbolize_registers_internal(ctx: "TritonContext", names: list[str]) -> list[dict]:
-        """Helper: symbolize a list of register names. Returns per-register results."""
-        out: list[dict] = []
-        for raw in names:
-            name = raw.strip()
-            if not name:
-                continue
-            try:
-                reg = ctx.getRegister(name.lower())
-                sv = ctx.symbolizeRegister(reg, name)
-                out.append({
-                    "ok": True,
-                    "register": name,
-                    "sym_var_id": sv.getId(),
-                    "sym_var_name": sv.getName(),
+def _symbolize_registers_internal(ctx: "TritonContext", names: list[str]) -> list[dict]:
+    """Helper: symbolize a list of register names. Returns per-register results."""
+    out: list[dict] = []
+    for raw in names:
+        name = raw.strip()
+        if not name:
+            continue
+        try:
+            reg = ctx.getRegister(name.lower())
+            sv = ctx.symbolizeRegister(reg, name)
+            out.append({
+                "ok": True,
+                "register": name,
+                "sym_var_id": sv.getId(),
+                "sym_var_name": sv.getName(),
+                "alias": sv.getAlias(),
+                "bitsize": sv.getBitSize(),
+            })
+        except Exception as e:
+            out.append({"ok": False, "register": name, "error": str(e)})
+    return out
+
+def _process_function_instructions_linear(
+    ctx: "TritonContext",
+    func_start: int,
+    func_end: int,
+    max_insns: int,
+) -> tuple[list[dict], bool]:
+    """Linearly process every instruction in [func_start, func_end).
+
+    Returns (processed_records, truncated_flag). Bytes are preloaded once.
+    """
+    import idaapi
+    import idc
+    import ida_lines
+
+    raw_func = idc.get_bytes(func_start, func_end - func_start)
+    if raw_func:
+        ctx.setConcreteMemoryAreaValue(func_start, raw_func)
+
+    processed: list[dict] = []
+    curr = func_start
+    count = 0
+
+    while curr < func_end and count < max_insns:
+        insn_ida = idaapi.insn_t()
+        length = idaapi.decode_insn(insn_ida, curr)
+        if length == 0:
+            break
+
+        raw = idc.get_bytes(curr, length)
+        if not raw:
+            curr += 1
+            continue
+
+        insn = TritonInstruction()
+        insn.setAddress(curr)
+        insn.setOpcode(raw)
+        ctx.processing(insn)
+
+        disasm_raw = ida_lines.generate_disasm_line(curr, 0)
+        disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
+
+        processed.append({
+            "address": hex(curr),
+            "disasm": disasm,
+            "size": length,
+            "is_branch": insn.isBranch(),
+            "is_symbolised": insn.isSymbolized(),
+            "is_tainted": insn.isTainted(),
+        })
+
+        curr += length
+        count += 1
+
+    truncated = count >= max_insns and curr < func_end
+    return processed, truncated
+
+def _try_solve_predicate(ctx: "TritonContext", timeout_ms: int) -> dict:
+    """Attempt Z3 solve of the current path predicate.
+
+    Returns a structured dict — never raises. Used by the compound tools so
+    that a missing or failed solver doesn't lose the rest of the analysis.
+    """
+    try:
+        predicate = ctx.getPathPredicate()
+        model = ctx.getModel(predicate, timeout=timeout_ms)
+        if not model:
+            return {"sat": False, "model": {}, "solver_used": "z3"}
+
+        result: dict[str, str] = {}
+        for _, sm in model.items():
+            sv = sm.getVariable()
+            alias = sv.getAlias() or sv.getName()
+            result[alias] = hex(sm.getValue())
+        return {"sat": True, "model": result, "solver_used": "z3"}
+    except Exception as e:
+        return {"sat": False, "model": {}, "error": str(e)}
+
+@tool
+@idasync
+def triton_analyze_function(
+    address: Annotated[str, "Function start address (hex or symbol name)."],
+    symbolize_args: Annotated[
+        str | list[str],
+        "Registers to mark symbolic before execution — typical argument "
+        "registers for the binary's ABI (e.g. 'rdi,rsi,rdx' for x86-64 SysV, "
+        "'rcx,rdx,r8,r9' for Windows x64, 'r0,r1,r2,r3' for AArch32). "
+        "Accepts a JSON array or comma-separated string. Pass empty string "
+        "to skip symbolization.",
+    ] = "",
+    max_insns: Annotated[int, "Safety cap on instruction count (default 500)."] = 500,
+    reinit: Annotated[
+        bool,
+        "When true, re-initialize the Triton context before analysis (fresh slate).",
+    ] = True,
+    timeout_ms: Annotated[int, "Z3 solver timeout in ms (0 = no limit)."] = 10000,
+) -> dict:
+    """One-shot symbolic execution analysis of a whole function.
+
+    Runs the full pipeline in a single call:
+      1. (re-)initialize the Triton context, auto-detecting architecture from IDA
+      2. mark the listed argument registers as symbolic
+      3. linearly process every instruction inside the function (capped by max_insns)
+      4. ask Z3 to find a concrete input satisfying the accumulated path predicate
+      5. return symbolic variables, path constraints, taint state, and the model
+
+    This is a convenience tool — for fine-grained control use triton_init,
+    triton_symbolize_register, triton_process_function, and triton_solve_path_constraints
+    individually.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import idaapi
+    import ida_funcs
+
+    try:
+        from .utils import parse_address
+        ea = parse_address(address)
+
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "address": address, "error": f"No function at {hex(ea)}"}
+
+        # Step 1: (re-)init context, auto-detecting architecture
+        if reinit or _contexts.get(_CTX_KEY) is None:
+            arch = _detect_arch_from_ida()
+            ctx = _build_ctx(arch)
+            _set_ctx(_CTX_KEY, ctx)
+        else:
+            ctx = _get_ctx()
+
+        # Step 2: parse and symbolize argument registers
+        if isinstance(symbolize_args, str):
+            reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
+        else:
+            reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
+
+        symbolized = _symbolize_registers_internal(ctx, reg_list) if reg_list else []
+
+        # Step 3: linearly process the function
+        sym_start = len(ctx.getSymbolicExpressions())
+        pc_start = len(ctx.getPathConstraints())
+        tainted_reg_start = len(ctx.getTaintedRegisters())
+        tainted_mem_start = len(ctx.getTaintedMemory())
+
+        processed, truncated = _process_function_instructions_linear(
+            ctx, func.start_ea, func.end_ea, max_insns
+        )
+
+        sym_end = len(ctx.getSymbolicExpressions())
+        pc_end = len(ctx.getPathConstraints())
+
+        # Step 4: capture state summaries
+        sym_vars_info = []
+        try:
+            from triton import SYMBOLIC
+            for vid, sv in ctx.getSymbolicVariables().items():
+                sym_vars_info.append({
+                    "id": vid,
+                    "name": sv.getName(),
                     "alias": sv.getAlias(),
                     "bitsize": sv.getBitSize(),
+                    "kind": "register" if sv.getType() == SYMBOLIC.REGISTER_VARIABLE else "memory",
                 })
-            except Exception as e:
-                out.append({"ok": False, "register": name, "error": str(e)})
-        return out
+        except Exception:
+            pass
 
-    def _process_function_instructions_linear(
-        ctx: "TritonContext",
-        func_start: int,
-        func_end: int,
-        max_insns: int,
-    ) -> tuple[list[dict], bool]:
-        """Linearly process every instruction in [func_start, func_end).
+        pc_records = []
+        try:
+            for pc in ctx.getPathConstraints():
+                branches_info = []
+                for br in pc.getBranchConstraints():
+                    branches_info.append({
+                        "is_taken": br["isTaken"],
+                        "src": hex(br["srcAddr"]),
+                        "dst": hex(br["dstAddr"]),
+                    })
+                pc_records.append({
+                    "multiple_branches": pc.isMultipleBranches(),
+                    "branches": branches_info,
+                })
+        except Exception:
+            pass
 
-        Returns (processed_records, truncated_flag). Bytes are preloaded once.
-        """
-        import idaapi
-        import idc
-        import ida_lines
+        tainted_outputs = {
+            "registers": [r.getName() for r in ctx.getTaintedRegisters()],
+            "memory_addrs": [hex(a) for a in ctx.getTaintedMemory()],
+        }
 
-        raw_func = idc.get_bytes(func_start, func_end - func_start)
+        # Step 5: solve
+        solve_result = _try_solve_predicate(ctx, timeout_ms)
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "function_end": hex(func.end_ea),
+            "function_name": ida_funcs.get_func_name(func.start_ea) or "",
+            "architecture": _arch_to_str(ctx.getArchitecture()),
+            "reinitialised": reinit,
+            "symbolized_args": symbolized,
+            "instructions_processed": len(processed),
+            "instructions_truncated": truncated,
+            "new_symbolic_expressions": sym_end - sym_start,
+            "new_path_constraints": pc_end - pc_start,
+            "symbolic_variables": sym_vars_info,
+            "path_constraints": pc_records,
+            "tainted_outputs": tainted_outputs,
+            "tainted_register_delta": len(ctx.getTaintedRegisters()) - tainted_reg_start,
+            "tainted_memory_delta": len(ctx.getTaintedMemory()) - tainted_mem_start,
+            "solver": solve_result,
+            "instructions": processed,
+        }
+
+    except IDAError as e:
+        return {"ok": False, "address": address, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_analyze_function failed at %s", address)
+        return {"ok": False, "address": address, "error": str(e)}
+
+def _build_block_path_to_target(
+    flowchart, target_ea: int, max_path_len: int = 256
+) -> tuple[list, int | None]:
+    """BFS over IDA basic blocks from the function entry to the block containing target_ea.
+
+    Returns (path_of_blocks, target_block_id) or ([], None) if unreachable.
+    The path is a list of basic-block objects, ordered entry → … → target.
+    """
+    from collections import deque
+
+    blocks_by_id = {bb.id: bb for bb in flowchart}
+    if not blocks_by_id:
+        return [], None
+
+    # Find target block
+    target_id = None
+    for bb_id, bb in blocks_by_id.items():
+        if bb.start_ea <= target_ea < bb.end_ea:
+            target_id = bb_id
+            break
+    if target_id is None:
+        return [], None
+
+    # Entry is conventionally the block at id 0, but verify with start_ea match
+    entry = blocks_by_id.get(0)
+    if entry is None:
+        # Fallback: lowest id, lowest start_ea
+        entry = min(blocks_by_id.values(), key=lambda b: (b.start_ea, b.id))
+
+    # BFS with parent tracking
+    parents: dict[int, int | None] = {entry.id: None}
+    queue = deque([entry.id])
+    found = False
+    while queue:
+        cur_id = queue.popleft()
+        if cur_id == target_id:
+            found = True
+            break
+        cur_bb = blocks_by_id[cur_id]
+        for succ in cur_bb.succs():
+            if succ.id not in parents:
+                parents[succ.id] = cur_id
+                queue.append(succ.id)
+
+    if not found:
+        return [], target_id
+
+    # Reconstruct path
+    path_ids: list[int] = []
+    cur: int | None = target_id
+    while cur is not None and len(path_ids) < max_path_len:
+        path_ids.append(cur)
+        cur = parents.get(cur)
+    path_ids.reverse()
+    return [blocks_by_id[i] for i in path_ids], target_id
+
+@tool
+@idasync
+def triton_find_input_for_branch(
+    function_address: Annotated[str, "Function start address (hex or symbol)."],
+    target_address: Annotated[
+        str,
+        "Address of the instruction (or block) we want execution to reach.",
+    ],
+    symbolize_args: Annotated[
+        str | list[str],
+        "Registers to mark symbolic — usually the function's ABI argument "
+        "registers. Accepts JSON array or comma-separated string.",
+    ] = "",
+    max_insns: Annotated[
+        int, "Per-instruction cap inside the CFG path (default 500)."
+    ] = 500,
+    reinit: Annotated[
+        bool,
+        "Re-initialize the Triton context before exploration (default true).",
+    ] = True,
+    timeout_ms: Annotated[int, "Z3 solver timeout in ms (default 10000)."] = 10000,
+) -> dict:
+    """CFG-guided branch reachability: find concrete inputs that reach a target address.
+
+    Algorithm:
+      1. Init Triton + symbolize the listed argument registers.
+      2. Use IDA's basic-block CFG to BFS the shortest sequence of blocks
+         from the function entry to the block containing target_address.
+      3. Execute Triton symbolically over **only those blocks**, in order
+         (side branches and dead paths are not visited).
+      4. Ask Z3 for an input satisfying the accumulated path predicate —
+         that is, an input that makes the program take exactly that path.
+
+    Returns the chosen block path, the per-instruction trace, accumulated
+    path constraints, and a Z3 model (or 'unsatisfiable' / solver error).
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import idaapi
+    import ida_funcs
+    import ida_gdl
+    import idc
+    import ida_lines
+
+    try:
+        from .utils import parse_address
+        func_ea = parse_address(function_address)
+        target_ea = parse_address(target_address)
+
+        func = ida_funcs.get_func(func_ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {hex(func_ea)}"}
+        if not (func.start_ea <= target_ea < func.end_ea):
+            return {
+                "ok": False,
+                "error": f"target_address {hex(target_ea)} is outside function "
+                         f"{hex(func.start_ea)}-{hex(func.end_ea)}",
+            }
+
+        flowchart = ida_gdl.FlowChart(func)
+        block_path, target_block_id = _build_block_path_to_target(flowchart, target_ea)
+        if not block_path:
+            return {
+                "ok": False,
+                "error": (
+                    f"No reachable path from entry to {hex(target_ea)} "
+                    f"(target_block_id={target_block_id})"
+                ),
+            }
+
+        # Init / reset context
+        if reinit or _contexts.get(_CTX_KEY) is None:
+            arch = _detect_arch_from_ida()
+            ctx = _build_ctx(arch)
+            _set_ctx(_CTX_KEY, ctx)
+        else:
+            ctx = _get_ctx()
+
+        # Symbolize the listed registers
+        if isinstance(symbolize_args, str):
+            reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
+        else:
+            reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
+        symbolized = _symbolize_registers_internal(ctx, reg_list) if reg_list else []
+
+        # Preload the whole function's bytes once
+        raw_func = idc.get_bytes(func.start_ea, func.end_ea - func.start_ea)
         if raw_func:
-            ctx.setConcreteMemoryAreaValue(func_start, raw_func)
+            ctx.setConcreteMemoryAreaValue(func.start_ea, raw_func)
 
-        processed: list[dict] = []
-        curr = func_start
+        # Walk each block in the chosen path, instruction-by-instruction
+        pc_before = len(ctx.getPathConstraints())
+        trace: list[dict] = []
+        insn_count = 0
+        stop_after_target = False
+
+        for bb in block_path:
+            if insn_count >= max_insns:
+                break
+
+            # If this is the target block, stop AT the target instruction (inclusive)
+            bb_end = bb.end_ea
+            if bb.id == target_block_id:
+                bb_end = min(bb.end_ea, target_ea + 1)
+                # We still need to process up to and including target_ea
+                stop_after_target = True
+
+            curr = bb.start_ea
+            while curr < bb_end and insn_count < max_insns:
+                insn_ida = idaapi.insn_t()
+                length = idaapi.decode_insn(insn_ida, curr)
+                if length == 0:
+                    break
+
+                # If processing one more instruction would jump us past the target inside
+                # the target block, stop after this instruction.
+                raw = idc.get_bytes(curr, length)
+                if not raw:
+                    curr += 1
+                    continue
+
+                insn = TritonInstruction()
+                insn.setAddress(curr)
+                insn.setOpcode(raw)
+                ctx.processing(insn)
+
+                disasm_raw = ida_lines.generate_disasm_line(curr, 0)
+                disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
+
+                trace.append({
+                    "address": hex(curr),
+                    "block_id": bb.id,
+                    "disasm": disasm,
+                    "size": length,
+                    "is_branch": insn.isBranch(),
+                    "is_symbolised": insn.isSymbolized(),
+                })
+
+                if stop_after_target and curr <= target_ea < curr + length:
+                    insn_count += 1
+                    curr += length
+                    break
+
+                curr += length
+                insn_count += 1
+
+            if stop_after_target:
+                break
+
+        pc_after = len(ctx.getPathConstraints())
+        new_pcs = pc_after - pc_before
+
+        # Collect the path constraints we accumulated
+        pc_records = []
+        try:
+            for pc in ctx.getPathConstraints():
+                branches_info = []
+                for br in pc.getBranchConstraints():
+                    branches_info.append({
+                        "is_taken": br["isTaken"],
+                        "src": hex(br["srcAddr"]),
+                        "dst": hex(br["dstAddr"]),
+                    })
+                pc_records.append({
+                    "multiple_branches": pc.isMultipleBranches(),
+                    "branches": branches_info,
+                })
+        except Exception:
+            pass
+
+        # Solve
+        solve_result = _try_solve_predicate(ctx, timeout_ms)
+        reached = any(int(t["address"], 16) == target_ea for t in trace)
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "target_ea": hex(target_ea),
+            "target_reached_in_trace": reached,
+            "block_path": [
+                {"id": bb.id, "start_ea": hex(bb.start_ea), "end_ea": hex(bb.end_ea)}
+                for bb in block_path
+            ],
+            "symbolized_args": symbolized,
+            "instructions_executed": len(trace),
+            "instructions_truncated": insn_count >= max_insns,
+            "path_constraints_collected": new_pcs,
+            "path_constraints": pc_records,
+            "solver": solve_result,
+            "trace": trace,
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_find_input_for_branch failed")
+        return {"ok": False, "error": str(e)}
+
+# ============================================================================
+# IDA annotation tools
+# ============================================================================
+
+@tool
+@idasync
+def triton_annotate_function(
+    address: Annotated[str, "Function address (hex or symbol name)."],
+    symbolize_args: Annotated[
+        str | list[str],
+        "Registers to symbolize before execution (comma-separated or JSON array). "
+        "Pass empty string to skip symbolization.",
+    ] = "",
+    max_insns: Annotated[int, "Safety cap on instruction count (default 500)."] = 500,
+    overwrite: Annotated[bool, "Overwrite existing comments at branch points."] = False,
+) -> dict:
+    """Run symbolic execution on a function and write IDA comments at branch points.
+
+    Each comment contains the path condition (constraint) that determines
+    which branch is taken. This makes the symbolic analysis results visible
+    directly in the IDA disassembly view.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import ida_funcs
+    import idc
+    import idaapi
+    import ida_lines
+
+    try:
+        from .utils import parse_address
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {hex(ea)}"}
+
+        # Re-use the compound analysis logic but keep it internal
+        if _contexts.get(_CTX_KEY) is None:
+            arch = _detect_arch_from_ida()
+            ctx = _build_ctx(arch)
+            _set_ctx(_CTX_KEY, ctx)
+        else:
+            ctx = _get_ctx()
+
+        # Parse and symbolize argument registers
+        if isinstance(symbolize_args, str):
+            reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
+        else:
+            reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
+
+        if reg_list:
+            _symbolize_registers_internal(ctx, reg_list)
+
+        # Linearly process the function and collect branch info
+        processed, _ = _process_function_instructions_linear(
+            ctx, func.start_ea, func.end_ea, max_insns
+        )
+
+        # Get path constraints with readable AST strings
+        pcs = ctx.getPathConstraints()
+        annotations = 0
+        annotated_addrs: set[int] = set()
+
+        for pc in pcs:
+            for br in pc.getBranchConstraints():
+                if not br["isTaken"]:
+                    continue
+                src_ea = br["srcAddr"]
+                if src_ea in annotated_addrs and not overwrite:
+                    continue
+                cond_str = str(br["constraint"])
+                # Truncate very long constraints
+                if len(cond_str) > 240:
+                    cond_str = cond_str[:237] + "..."
+                new_comment = f"[Triton] {cond_str}"
+                try:
+                    existing = idc.get_cmt(src_ea, 0) or ""
+                    if overwrite or not existing:
+                        idc.set_cmt(src_ea, new_comment, 0)
+                        annotations += 1
+                        annotated_addrs.add(src_ea)
+                except Exception:
+                    pass
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "annotations_written": annotations,
+            "path_constraints_found": len(pcs),
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_annotate_function failed")
+        return {"ok": False, "error": str(e)}
+
+@tool
+@idasync
+def triton_highlight_tainted_instructions(
+    function_address: Annotated[str, "Function address (hex or symbol name)."],
+    color: Annotated[str, "Hex color value (default 0x00ff00 for green)."] = "0x00ff00",
+    max_insns: Annotated[int, "Maximum instructions to scan (default 500)."] = 500,
+) -> dict:
+    """Scan a function and highlight instructions that operate on tainted data.
+
+    Processes each instruction through Triton and uses `insn.isTainted()`
+    to determine whether the instruction touches tainted registers or memory.
+    Highlighted instructions are colored in IDA's disassembly view.
+
+    Note: this modifies the current Triton context state (registers, memory).
+    Use triton_snapshot_save first if you need to preserve state.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import ida_funcs
+    import idc
+    import idaapi
+
+    try:
+        from .utils import parse_address
+        ea = parse_address(function_address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {hex(ea)}"}
+
+        ctx = _get_ctx()
+        color_val = int(color, 16) if isinstance(color, str) and color.startswith("0x") else int(color, 0)
+
+        highlighted = 0
+        curr = func.start_ea
         count = 0
 
-        while curr < func_end and count < max_insns:
+        while curr < func.end_ea and count < max_insns:
             insn_ida = idaapi.insn_t()
             length = idaapi.decode_insn(insn_ida, curr)
             if length == 0:
@@ -1481,598 +2063,23 @@ if TRITON_AVAILABLE:
             insn.setOpcode(raw)
             ctx.processing(insn)
 
-            disasm_raw = ida_lines.generate_disasm_line(curr, 0)
-            disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
-
-            processed.append({
-                "address": hex(curr),
-                "disasm": disasm,
-                "size": length,
-                "is_branch": insn.isBranch(),
-                "is_symbolised": insn.isSymbolized(),
-                "is_tainted": insn.isTainted(),
-            })
+            if insn.isTainted():
+                idc.set_color(curr, idc.CIC_ITEM, color_val)
+                highlighted += 1
 
             curr += length
             count += 1
 
-        truncated = count >= max_insns and curr < func_end
-        return processed, truncated
-
-    def _try_solve_predicate(ctx: "TritonContext", timeout_ms: int) -> dict:
-        """Attempt Z3 solve of the current path predicate.
-
-        Returns a structured dict — never raises. Used by the compound tools so
-        that a missing or failed solver doesn't lose the rest of the analysis.
-        """
-        try:
-            predicate = ctx.getPathPredicate()
-            model = ctx.getModel(predicate, timeout=timeout_ms)
-            if not model:
-                return {"sat": False, "model": {}, "solver_used": "z3"}
-
-            result: dict[str, str] = {}
-            for _, sm in model.items():
-                sv = sm.getVariable()
-                alias = sv.getAlias() or sv.getName()
-                result[alias] = hex(sm.getValue())
-            return {"sat": True, "model": result, "solver_used": "z3"}
-        except Exception as e:
-            return {"sat": False, "model": {}, "error": str(e)}
-
-    @tool
-    @idasync
-    def triton_analyze_function(
-        address: Annotated[str, "Function start address (hex or symbol name)."],
-        symbolize_args: Annotated[
-            str | list[str],
-            "Registers to mark symbolic before execution — typical argument "
-            "registers for the binary's ABI (e.g. 'rdi,rsi,rdx' for x86-64 SysV, "
-            "'rcx,rdx,r8,r9' for Windows x64, 'r0,r1,r2,r3' for AArch32). "
-            "Accepts a JSON array or comma-separated string. Pass empty string "
-            "to skip symbolization.",
-        ] = "",
-        max_insns: Annotated[int, "Safety cap on instruction count (default 500)."] = 500,
-        reinit: Annotated[
-            bool,
-            "When true, re-initialize the Triton context before analysis (fresh slate).",
-        ] = True,
-        timeout_ms: Annotated[int, "Z3 solver timeout in ms (0 = no limit)."] = 10000,
-    ) -> dict:
-        """One-shot symbolic execution analysis of a whole function.
-
-        Runs the full pipeline in a single call:
-          1. (re-)initialize the Triton context, auto-detecting architecture from IDA
-          2. mark the listed argument registers as symbolic
-          3. linearly process every instruction inside the function (capped by max_insns)
-          4. ask Z3 to find a concrete input satisfying the accumulated path predicate
-          5. return symbolic variables, path constraints, taint state, and the model
-
-        This is a convenience tool — for fine-grained control use triton_init,
-        triton_symbolize_register, triton_process_function, and triton_solve_path_constraints
-        individually.
-        """
-        import idaapi
-        import ida_funcs
-
-        try:
-            from .utils import parse_address
-            ea = parse_address(address)
-
-            func = ida_funcs.get_func(ea)
-            if func is None:
-                return {"ok": False, "address": address, "error": f"No function at {hex(ea)}"}
-
-            # Step 1: (re-)init context, auto-detecting architecture
-            if reinit or _contexts.get(_CTX_KEY) is None:
-                arch = _detect_arch_from_ida()
-                ctx = _build_ctx(arch)
-                _set_ctx(_CTX_KEY, ctx)
-            else:
-                ctx = _get_ctx()
-
-            # Step 2: parse and symbolize argument registers
-            if isinstance(symbolize_args, str):
-                reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
-            else:
-                reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
-
-            symbolized = _symbolize_registers_internal(ctx, reg_list) if reg_list else []
-
-            # Step 3: linearly process the function
-            sym_start = len(ctx.getSymbolicExpressions())
-            pc_start = len(ctx.getPathConstraints())
-            tainted_reg_start = len(ctx.getTaintedRegisters())
-            tainted_mem_start = len(ctx.getTaintedMemory())
-
-            processed, truncated = _process_function_instructions_linear(
-                ctx, func.start_ea, func.end_ea, max_insns
-            )
-
-            sym_end = len(ctx.getSymbolicExpressions())
-            pc_end = len(ctx.getPathConstraints())
-
-            # Step 4: capture state summaries
-            sym_vars_info = []
-            try:
-                from triton import SYMBOLIC
-                for vid, sv in ctx.getSymbolicVariables().items():
-                    sym_vars_info.append({
-                        "id": vid,
-                        "name": sv.getName(),
-                        "alias": sv.getAlias(),
-                        "bitsize": sv.getBitSize(),
-                        "kind": "register" if sv.getType() == SYMBOLIC.REGISTER_VARIABLE else "memory",
-                    })
-            except Exception:
-                pass
-
-            pc_records = []
-            try:
-                for pc in ctx.getPathConstraints():
-                    branches_info = []
-                    for br in pc.getBranchConstraints():
-                        branches_info.append({
-                            "is_taken": br["isTaken"],
-                            "src": hex(br["srcAddr"]),
-                            "dst": hex(br["dstAddr"]),
-                        })
-                    pc_records.append({
-                        "multiple_branches": pc.isMultipleBranches(),
-                        "branches": branches_info,
-                    })
-            except Exception:
-                pass
-
-            tainted_outputs = {
-                "registers": [r.getName() for r in ctx.getTaintedRegisters()],
-                "memory_addrs": [hex(a) for a in ctx.getTaintedMemory()],
-            }
-
-            # Step 5: solve
-            solve_result = _try_solve_predicate(ctx, timeout_ms)
-
-            return {
-                "ok": True,
-                "function_ea": hex(func.start_ea),
-                "function_end": hex(func.end_ea),
-                "function_name": ida_funcs.get_func_name(func.start_ea) or "",
-                "architecture": _arch_to_str(ctx.getArchitecture()),
-                "reinitialised": reinit,
-                "symbolized_args": symbolized,
-                "instructions_processed": len(processed),
-                "instructions_truncated": truncated,
-                "new_symbolic_expressions": sym_end - sym_start,
-                "new_path_constraints": pc_end - pc_start,
-                "symbolic_variables": sym_vars_info,
-                "path_constraints": pc_records,
-                "tainted_outputs": tainted_outputs,
-                "tainted_register_delta": len(ctx.getTaintedRegisters()) - tainted_reg_start,
-                "tainted_memory_delta": len(ctx.getTaintedMemory()) - tainted_mem_start,
-                "solver": solve_result,
-                "instructions": processed,
-            }
-
-        except IDAError as e:
-            return {"ok": False, "address": address, "error": e.message}
-        except Exception as e:
-            logger.exception("triton_analyze_function failed at %s", address)
-            return {"ok": False, "address": address, "error": str(e)}
-
-    def _build_block_path_to_target(
-        flowchart, target_ea: int, max_path_len: int = 256
-    ) -> tuple[list, int | None]:
-        """BFS over IDA basic blocks from the function entry to the block containing target_ea.
-
-        Returns (path_of_blocks, target_block_id) or ([], None) if unreachable.
-        The path is a list of basic-block objects, ordered entry → … → target.
-        """
-        from collections import deque
-
-        blocks_by_id = {bb.id: bb for bb in flowchart}
-        if not blocks_by_id:
-            return [], None
-
-        # Find target block
-        target_id = None
-        for bb_id, bb in blocks_by_id.items():
-            if bb.start_ea <= target_ea < bb.end_ea:
-                target_id = bb_id
-                break
-        if target_id is None:
-            return [], None
-
-        # Entry is conventionally the block at id 0, but verify with start_ea match
-        entry = blocks_by_id.get(0)
-        if entry is None:
-            # Fallback: lowest id, lowest start_ea
-            entry = min(blocks_by_id.values(), key=lambda b: (b.start_ea, b.id))
-
-        # BFS with parent tracking
-        parents: dict[int, int | None] = {entry.id: None}
-        queue = deque([entry.id])
-        found = False
-        while queue:
-            cur_id = queue.popleft()
-            if cur_id == target_id:
-                found = True
-                break
-            cur_bb = blocks_by_id[cur_id]
-            for succ in cur_bb.succs():
-                if succ.id not in parents:
-                    parents[succ.id] = cur_id
-                    queue.append(succ.id)
-
-        if not found:
-            return [], target_id
-
-        # Reconstruct path
-        path_ids: list[int] = []
-        cur: int | None = target_id
-        while cur is not None and len(path_ids) < max_path_len:
-            path_ids.append(cur)
-            cur = parents.get(cur)
-        path_ids.reverse()
-        return [blocks_by_id[i] for i in path_ids], target_id
-
-    @tool
-    @idasync
-    def triton_find_input_for_branch(
-        function_address: Annotated[str, "Function start address (hex or symbol)."],
-        target_address: Annotated[
-            str,
-            "Address of the instruction (or block) we want execution to reach.",
-        ],
-        symbolize_args: Annotated[
-            str | list[str],
-            "Registers to mark symbolic — usually the function's ABI argument "
-            "registers. Accepts JSON array or comma-separated string.",
-        ] = "",
-        max_insns: Annotated[
-            int, "Per-instruction cap inside the CFG path (default 500)."
-        ] = 500,
-        reinit: Annotated[
-            bool,
-            "Re-initialize the Triton context before exploration (default true).",
-        ] = True,
-        timeout_ms: Annotated[int, "Z3 solver timeout in ms (default 10000)."] = 10000,
-    ) -> dict:
-        """CFG-guided branch reachability: find concrete inputs that reach a target address.
-
-        Algorithm:
-          1. Init Triton + symbolize the listed argument registers.
-          2. Use IDA's basic-block CFG to BFS the shortest sequence of blocks
-             from the function entry to the block containing target_address.
-          3. Execute Triton symbolically over **only those blocks**, in order
-             (side branches and dead paths are not visited).
-          4. Ask Z3 for an input satisfying the accumulated path predicate —
-             that is, an input that makes the program take exactly that path.
-
-        Returns the chosen block path, the per-instruction trace, accumulated
-        path constraints, and a Z3 model (or 'unsatisfiable' / solver error).
-        """
-        import idaapi
-        import ida_funcs
-        import ida_gdl
-        import idc
-        import ida_lines
-
-        try:
-            from .utils import parse_address
-            func_ea = parse_address(function_address)
-            target_ea = parse_address(target_address)
-
-            func = ida_funcs.get_func(func_ea)
-            if func is None:
-                return {"ok": False, "error": f"No function at {hex(func_ea)}"}
-            if not (func.start_ea <= target_ea < func.end_ea):
-                return {
-                    "ok": False,
-                    "error": f"target_address {hex(target_ea)} is outside function "
-                             f"{hex(func.start_ea)}-{hex(func.end_ea)}",
-                }
-
-            flowchart = ida_gdl.FlowChart(func)
-            block_path, target_block_id = _build_block_path_to_target(flowchart, target_ea)
-            if not block_path:
-                return {
-                    "ok": False,
-                    "error": (
-                        f"No reachable path from entry to {hex(target_ea)} "
-                        f"(target_block_id={target_block_id})"
-                    ),
-                }
-
-            # Init / reset context
-            if reinit or _contexts.get(_CTX_KEY) is None:
-                arch = _detect_arch_from_ida()
-                ctx = _build_ctx(arch)
-                _set_ctx(_CTX_KEY, ctx)
-            else:
-                ctx = _get_ctx()
-
-            # Symbolize the listed registers
-            if isinstance(symbolize_args, str):
-                reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
-            else:
-                reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
-            symbolized = _symbolize_registers_internal(ctx, reg_list) if reg_list else []
-
-            # Preload the whole function's bytes once
-            raw_func = idc.get_bytes(func.start_ea, func.end_ea - func.start_ea)
-            if raw_func:
-                ctx.setConcreteMemoryAreaValue(func.start_ea, raw_func)
-
-            # Walk each block in the chosen path, instruction-by-instruction
-            pc_before = len(ctx.getPathConstraints())
-            trace: list[dict] = []
-            insn_count = 0
-            stop_after_target = False
-
-            for bb in block_path:
-                if insn_count >= max_insns:
-                    break
-
-                # If this is the target block, stop AT the target instruction (inclusive)
-                bb_end = bb.end_ea
-                if bb.id == target_block_id:
-                    bb_end = min(bb.end_ea, target_ea + 1)
-                    # We still need to process up to and including target_ea
-                    stop_after_target = True
-
-                curr = bb.start_ea
-                while curr < bb_end and insn_count < max_insns:
-                    insn_ida = idaapi.insn_t()
-                    length = idaapi.decode_insn(insn_ida, curr)
-                    if length == 0:
-                        break
-
-                    # If processing one more instruction would jump us past the target inside
-                    # the target block, stop after this instruction.
-                    raw = idc.get_bytes(curr, length)
-                    if not raw:
-                        curr += 1
-                        continue
-
-                    insn = TritonInstruction()
-                    insn.setAddress(curr)
-                    insn.setOpcode(raw)
-                    ctx.processing(insn)
-
-                    disasm_raw = ida_lines.generate_disasm_line(curr, 0)
-                    disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
-
-                    trace.append({
-                        "address": hex(curr),
-                        "block_id": bb.id,
-                        "disasm": disasm,
-                        "size": length,
-                        "is_branch": insn.isBranch(),
-                        "is_symbolised": insn.isSymbolized(),
-                    })
-
-                    if stop_after_target and curr <= target_ea < curr + length:
-                        insn_count += 1
-                        curr += length
-                        break
-
-                    curr += length
-                    insn_count += 1
-
-                if stop_after_target:
-                    break
-
-            pc_after = len(ctx.getPathConstraints())
-            new_pcs = pc_after - pc_before
-
-            # Collect the path constraints we accumulated
-            pc_records = []
-            try:
-                for pc in ctx.getPathConstraints():
-                    branches_info = []
-                    for br in pc.getBranchConstraints():
-                        branches_info.append({
-                            "is_taken": br["isTaken"],
-                            "src": hex(br["srcAddr"]),
-                            "dst": hex(br["dstAddr"]),
-                        })
-                    pc_records.append({
-                        "multiple_branches": pc.isMultipleBranches(),
-                        "branches": branches_info,
-                    })
-            except Exception:
-                pass
-
-            # Solve
-            solve_result = _try_solve_predicate(ctx, timeout_ms)
-            reached = any(int(t["address"], 16) == target_ea for t in trace)
-
-            return {
-                "ok": True,
-                "function_ea": hex(func.start_ea),
-                "target_ea": hex(target_ea),
-                "target_reached_in_trace": reached,
-                "block_path": [
-                    {"id": bb.id, "start_ea": hex(bb.start_ea), "end_ea": hex(bb.end_ea)}
-                    for bb in block_path
-                ],
-                "symbolized_args": symbolized,
-                "instructions_executed": len(trace),
-                "instructions_truncated": insn_count >= max_insns,
-                "path_constraints_collected": new_pcs,
-                "path_constraints": pc_records,
-                "solver": solve_result,
-                "trace": trace,
-            }
-
-        except IDAError as e:
-            return {"ok": False, "error": e.message}
-        except Exception as e:
-            logger.exception("triton_find_input_for_branch failed")
-            return {"ok": False, "error": str(e)}
-
-    # ============================================================================
-    # IDA annotation tools
-    # ============================================================================
-
-    @tool
-    @idasync
-    def triton_annotate_function(
-        address: Annotated[str, "Function address (hex or symbol name)."],
-        symbolize_args: Annotated[
-            str | list[str],
-            "Registers to symbolize before execution (comma-separated or JSON array). "
-            "Pass empty string to skip symbolization.",
-        ] = "",
-        max_insns: Annotated[int, "Safety cap on instruction count (default 500)."] = 500,
-        overwrite: Annotated[bool, "Overwrite existing comments at branch points."] = False,
-    ) -> dict:
-        """Run symbolic execution on a function and write IDA comments at branch points.
-
-        Each comment contains the path condition (constraint) that determines
-        which branch is taken. This makes the symbolic analysis results visible
-        directly in the IDA disassembly view.
-        """
-        import ida_funcs
-        import idc
-        import idaapi
-        import ida_lines
-
-        try:
-            from .utils import parse_address
-            ea = parse_address(address)
-            func = ida_funcs.get_func(ea)
-            if func is None:
-                return {"ok": False, "error": f"No function at {hex(ea)}"}
-
-            # Re-use the compound analysis logic but keep it internal
-            if _contexts.get(_CTX_KEY) is None:
-                arch = _detect_arch_from_ida()
-                ctx = _build_ctx(arch)
-                _set_ctx(_CTX_KEY, ctx)
-            else:
-                ctx = _get_ctx()
-
-            # Parse and symbolize argument registers
-            if isinstance(symbolize_args, str):
-                reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
-            else:
-                reg_list = [str(r).strip() for r in symbolize_args if str(r).strip()]
-
-            if reg_list:
-                _symbolize_registers_internal(ctx, reg_list)
-
-            # Linearly process the function and collect branch info
-            processed, _ = _process_function_instructions_linear(
-                ctx, func.start_ea, func.end_ea, max_insns
-            )
-
-            # Get path constraints with readable AST strings
-            pcs = ctx.getPathConstraints()
-            annotations = 0
-            annotated_addrs: set[int] = set()
-
-            for pc in pcs:
-                for br in pc.getBranchConstraints():
-                    if not br["isTaken"]:
-                        continue
-                    src_ea = br["srcAddr"]
-                    if src_ea in annotated_addrs and not overwrite:
-                        continue
-                    cond_str = str(br["constraint"])
-                    # Truncate very long constraints
-                    if len(cond_str) > 240:
-                        cond_str = cond_str[:237] + "..."
-                    new_comment = f"[Triton] {cond_str}"
-                    try:
-                        existing = idc.get_cmt(src_ea, 0) or ""
-                        if overwrite or not existing:
-                            idc.set_cmt(src_ea, new_comment, 0)
-                            annotations += 1
-                            annotated_addrs.add(src_ea)
-                    except Exception:
-                        pass
-
-            return {
-                "ok": True,
-                "function_ea": hex(func.start_ea),
-                "annotations_written": annotations,
-                "path_constraints_found": len(pcs),
-            }
-
-        except IDAError as e:
-            return {"ok": False, "error": e.message}
-        except Exception as e:
-            logger.exception("triton_annotate_function failed")
-            return {"ok": False, "error": str(e)}
-
-    @tool
-    @idasync
-    def triton_highlight_tainted_instructions(
-        function_address: Annotated[str, "Function address (hex or symbol name)."],
-        color: Annotated[str, "Hex color value (default 0x00ff00 for green)."] = "0x00ff00",
-        max_insns: Annotated[int, "Maximum instructions to scan (default 500)."] = 500,
-    ) -> dict:
-        """Scan a function and highlight instructions that operate on tainted data.
-
-        Processes each instruction through Triton and uses `insn.isTainted()`
-        to determine whether the instruction touches tainted registers or memory.
-        Highlighted instructions are colored in IDA's disassembly view.
-
-        Note: this modifies the current Triton context state (registers, memory).
-        Use triton_snapshot_save first if you need to preserve state.
-        """
-        import ida_funcs
-        import idc
-        import idaapi
-
-        try:
-            from .utils import parse_address
-            ea = parse_address(function_address)
-            func = ida_funcs.get_func(ea)
-            if func is None:
-                return {"ok": False, "error": f"No function at {hex(ea)}"}
-
-            ctx = _get_ctx()
-            color_val = int(color, 16) if isinstance(color, str) and color.startswith("0x") else int(color, 0)
-
-            highlighted = 0
-            curr = func.start_ea
-            count = 0
-
-            while curr < func.end_ea and count < max_insns:
-                insn_ida = idaapi.insn_t()
-                length = idaapi.decode_insn(insn_ida, curr)
-                if length == 0:
-                    break
-
-                raw = idc.get_bytes(curr, length)
-                if not raw:
-                    curr += 1
-                    continue
-
-                insn = TritonInstruction()
-                insn.setAddress(curr)
-                insn.setOpcode(raw)
-                ctx.processing(insn)
-
-                if insn.isTainted():
-                    idc.set_color(curr, idc.CIC_ITEM, color_val)
-                    highlighted += 1
-
-                curr += length
-                count += 1
-
-            return {
-                "ok": True,
-                "function_ea": hex(func.start_ea),
-                "highlighted_count": highlighted,
-                "instructions_scanned": count,
-                "color": hex(color_val),
-            }
-
-        except IDAError as e:
-            return {"ok": False, "error": e.message}
-        except Exception as e:
-            logger.exception("triton_highlight_tainted_instructions failed")
-            return {"ok": False, "error": str(e)}
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "highlighted_count": highlighted,
+            "instructions_scanned": count,
+            "color": hex(color_val),
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_highlight_tainted_instructions failed")
+        return {"ok": False, "error": str(e)}

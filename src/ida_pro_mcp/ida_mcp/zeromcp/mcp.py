@@ -1108,7 +1108,13 @@ class McpServer:
 
     def _generate_tool_schema(self, func_name: str, func: Callable) -> dict:
         """Generate MCP tool schema from a function"""
-        hints = get_type_hints(func, include_extras=True)
+        try:
+            hints = get_type_hints(func, include_extras=True)
+        except NameError:
+            # Forward reference evaluation failed (often because @functools.wraps
+            # changes the evaluation namespace). Fall back to hints without extras
+            # so the tool remains discoverable even if Annotated descriptions are lost.
+            hints = get_type_hints(func, include_extras=False)
         return_type = hints.pop("return", None)
         sig = inspect.signature(func)
 

@@ -284,695 +284,728 @@ def miasm_status() -> dict:
 # ============================================================================
 
 
-if MIASM_AVAILABLE:
 
-    @tool
-    @idasync
-    def miasm_sync() -> dict:
-        """Re-synchronise Miasm architecture with the currently loaded IDA binary."""
-        arch = _manager.sync()
+@tool
+@idasync
+def miasm_sync() -> dict:
+    """Re-synchronise Miasm architecture with the currently loaded IDA binary."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    arch = _manager.sync()
+    return {
+        "ok": True,
+        "architecture": arch,
+        "bitness": _manager.bitness,
+        "endianness": "big" if _manager.is_big_endian else "little",
+    }
+
+@tool
+@idasync
+def miasm_init(
+    arch: Annotated[
+        str,
+        "Optional architecture override (e.g. x86_32, x86_64, arml, armb, "
+        "aarch64l, aarch64b, mips32l, mips32b, ppc32b). "
+        "Leave empty to auto-detect from the loaded IDA binary.",
+    ] = "",
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Explicitly (re-)initialize the Miasm Machine.
+
+    Use this when you want a clean slate — e.g. after the IDA binary has
+    been rebased, after switching binaries, or to force a specific architecture.
+    This discards the cached Machine and rebuilds it. Architecture is
+    auto-detected from IDA unless overridden.
+
+    Endianness is derived from IDA's `inf_is_be()` for ARM / AArch64 / MIPS / PPC.
+    """
+    try:
+        arch_resolved = _manager.init(override_arch=arch)
         return {
             "ok": True,
-            "architecture": arch,
-            "bitness": _manager.bitness,
-            "endianness": "big" if _manager.is_big_endian else "little",
-        }
-
-    @tool
-    @idasync
-    def miasm_init(
-        arch: Annotated[
-            str,
-            "Optional architecture override (e.g. x86_32, x86_64, arml, armb, "
-            "aarch64l, aarch64b, mips32l, mips32b, ppc32b). "
-            "Leave empty to auto-detect from the loaded IDA binary.",
-        ] = "",
-    ) -> dict:
-        """
-        Explicitly (re-)initialize the Miasm Machine.
-
-        Use this when you want a clean slate — e.g. after the IDA binary has
-        been rebased, after switching binaries, or to force a specific architecture.
-        This discards the cached Machine and rebuilds it. Architecture is
-        auto-detected from IDA unless overridden.
-
-        Endianness is derived from IDA's `inf_is_be()` for ARM / AArch64 / MIPS / PPC.
-        """
-        try:
-            arch_resolved = _manager.init(override_arch=arch)
-            return {
-                "ok": True,
-                "architecture": arch_resolved,
-                "bitness": _manager.bitness,
-                "endianness": "big" if _manager.is_big_endian else "little",
-                "procname": _manager.procname,
-                "override_used": bool(arch),
-            }
-        except IDAError as e:
-            return {"ok": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("miasm_init failed")
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    @tool
-    @idasync
-    def miasm_get_context_info() -> dict:
-        """
-        Return a detailed summary of the current Miasm session state.
-
-        Includes architecture, bitness, endianness, the IDA procname that the
-        Machine was built from, and the Miasm version. If the Machine has not
-        been initialized yet, the response indicates that and points at the
-        autodetected target.
-        """
-        try:
-            import miasm
-            miasm_version = getattr(miasm, "__version__", "unknown")
-        except Exception:
-            miasm_version = "unknown"
-
-        if not _manager._arch_name:
-            try:
-                preview_arch, preview_bits, preview_be, preview_proc = _manager._detect_arch_from_ida()
-                return {
-                    "ok": True,
-                    "initialized": False,
-                    "miasm_version": miasm_version,
-                    "would_auto_detect_as": {
-                        "architecture": preview_arch,
-                        "bitness": preview_bits,
-                        "endianness": "big" if preview_be else "little",
-                        "procname": preview_proc,
-                    },
-                    "note": "Machine not yet built. First Miasm call auto-syncs, or call miasm_init explicitly.",
-                }
-            except IDAError as e:
-                return {
-                    "ok": False,
-                    "initialized": False,
-                    "miasm_version": miasm_version,
-                    "error": str(e),
-                }
-
-        machine = _manager.machine
-        return {
-            "ok": True,
-            "initialized": True,
-            "miasm_version": miasm_version,
-            "architecture": _manager.arch_name,
+            "architecture": arch_resolved,
             "bitness": _manager.bitness,
             "endianness": "big" if _manager.is_big_endian else "little",
             "procname": _manager.procname,
-            "machine_name": getattr(machine, "name", _manager.arch_name),
+            "override_used": bool(arch),
         }
+    except IDAError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        logger.exception("miasm_init failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    @tool
-    @idasync
-    def miasm_reset() -> dict:
-        """
-        Reset the Miasm Machine and re-auto-detect architecture from IDA.
+@tool
+@idasync
+def miasm_get_context_info() -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Return a detailed summary of the current Miasm session state.
 
-        Equivalent to calling `miasm_init()` with no override. Useful as a
-        recovery step if the Miasm state somehow drifts from IDA's current
-        view (e.g. after a forced architecture change in IDA's processor
-        configuration).
+    Includes architecture, bitness, endianness, the IDA procname that the
+    Machine was built from, and the Miasm version. If the Machine has not
+    been initialized yet, the response indicates that and points at the
+    autodetected target.
+    """
+    try:
+        import miasm
+        miasm_version = getattr(miasm, "__version__", "unknown")
+    except Exception:
+        miasm_version = "unknown"
 
-        Tool calls use a fresh `LocationDB` per request by design, so there
-        is no accumulated symbol state to clear — this resets only the
-        Machine and its associated architectural metadata.
-        """
+    if not _manager._arch_name:
         try:
-            arch_resolved = _manager.init(override_arch="")
+            preview_arch, preview_bits, preview_be, preview_proc = _manager._detect_arch_from_ida()
             return {
                 "ok": True,
-                "architecture": arch_resolved,
-                "bitness": _manager.bitness,
-                "endianness": "big" if _manager.is_big_endian else "little",
-                "message": "Miasm Machine rebuilt from current IDA state.",
+                "initialized": False,
+                "miasm_version": miasm_version,
+                "would_auto_detect_as": {
+                    "architecture": preview_arch,
+                    "bitness": preview_bits,
+                    "endianness": "big" if preview_be else "little",
+                    "procname": preview_proc,
+                },
+                "note": "Machine not yet built. First Miasm call auto-syncs, or call miasm_init explicitly.",
             }
         except IDAError as e:
-            return {"ok": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("miasm_reset failed")
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            return {
+                "ok": False,
+                "initialized": False,
+                "miasm_version": miasm_version,
+                "error": str(e),
+            }
 
-    # ========================================================================
-    # IR lifting
-    # ========================================================================
+    machine = _manager.machine
+    return {
+        "ok": True,
+        "initialized": True,
+        "miasm_version": miasm_version,
+        "architecture": _manager.arch_name,
+        "bitness": _manager.bitness,
+        "endianness": "big" if _manager.is_big_endian else "little",
+        "procname": _manager.procname,
+        "machine_name": getattr(machine, "name", _manager.arch_name),
+    }
 
-    @tool
-    @idasync
-    def miasm_lift_to_ir(
-        address: Annotated[str, "Start address (hex or symbol name) of the range to lift"],
-        end_address: Annotated[str, "End address (exclusive) of the range to lift (hex or symbol name)"],
-    ) -> list[dict]:
-        """Disassemble an address range and lift it to Miasm IR. Returns a list of IR blocks."""
-        ea = parse_address(address)
-        end_ea = parse_address(end_address)
-        data = _manager.get_bytes(ea, end_ea)
-        mdis, loc_db = _manager.get_mdis(data, ea)
+@tool
+@idasync
+def miasm_reset() -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Reset the Miasm Machine and re-auto-detect architecture from IDA.
 
-        asm_block = mdis.dis_block(ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg()
-        lifter.add_asmblock_to_ircfg(asm_block, ircfg)
+    Equivalent to calling `miasm_init()` with no override. Useful as a
+    recovery step if the Miasm state somehow drifts from IDA's current
+    view (e.g. after a forced architecture change in IDA's processor
+    configuration).
 
-        return _ir_blocks_to_dict(ircfg)
-
-    @tool
-    @idasync
-    def miasm_lift_function(
-        address: Annotated[str, "Any address inside the function to lift (hex or symbol name)"],
-    ) -> dict:
-        """Lift an entire function's CFG to Miasm IR and return all IR blocks and edges."""
-        import idaapi
-        ea = parse_address(address)
-        func = idaapi.get_func(ea)
-        if not func:
-            raise IDAError(f"No function found at {hex(ea)}")
-
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
-
-        asmcfg = mdis.dis_multiblock(func.start_ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
-
-        edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+    Tool calls use a fresh `LocationDB` per request by design, so there
+    is no accumulated symbol state to clear — this resets only the
+    Machine and its associated architectural metadata.
+    """
+    try:
+        arch_resolved = _manager.init(override_arch="")
         return {
-            "function_ea": hex(func.start_ea),
-            "blocks": _ir_blocks_to_dict(ircfg),
-            "edges": edges,
+            "ok": True,
+            "architecture": arch_resolved,
+            "bitness": _manager.bitness,
+            "endianness": "big" if _manager.is_big_endian else "little",
+            "message": "Miasm Machine rebuilt from current IDA state.",
         }
+    except IDAError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        logger.exception("miasm_reset failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    # ========================================================================
-    # SSA
-    # ========================================================================
+# ========================================================================
+# IR lifting
+# ========================================================================
 
-    @tool
-    @idasync
-    def miasm_get_ssa(
-        address: Annotated[str, "Any address inside the function to transform (hex or symbol name)"],
-    ) -> dict:
-        """Lift a function to IR and transform it into Static Single Assignment (SSA) form."""
-        import idaapi
-        from miasm.analysis.ssa import SSADiGraph
+@tool
+@idasync
+def miasm_lift_to_ir(
+    address: Annotated[str, "Start address (hex or symbol name) of the range to lift"],
+    end_address: Annotated[str, "End address (exclusive) of the range to lift (hex or symbol name)"],
+) -> list[dict]:
+    """Disassemble an address range and lift it to Miasm IR. Returns a list of IR blocks."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    ea = parse_address(address)
+    end_ea = parse_address(end_address)
+    data = _manager.get_bytes(ea, end_ea)
+    mdis, loc_db = _manager.get_mdis(data, ea)
 
-        ea = parse_address(address)
-        func = idaapi.get_func(ea)
-        if not func:
-            raise IDAError(f"No function found at {hex(ea)}")
+    asm_block = mdis.dis_block(ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg()
+    lifter.add_asmblock_to_ircfg(asm_block, ircfg)
 
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+    return _ir_blocks_to_dict(ircfg)
 
-        asmcfg = mdis.dis_multiblock(func.start_ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+@tool
+@idasync
+def miasm_lift_function(
+    address: Annotated[str, "Any address inside the function to lift (hex or symbol name)"],
+) -> dict:
+    """Lift an entire function's CFG to Miasm IR and return all IR blocks and edges."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    import idaapi
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at {hex(ea)}")
 
-        heads = list(ircfg.heads())
-        if not heads:
-            raise IDAError("IRCFG has no head block — cannot apply SSA.")
-        head = heads[0]
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
 
-        ssa = SSADiGraph(ircfg)
-        ssa.transform(head)
+    asmcfg = mdis.dis_multiblock(func.start_ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
 
-        edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
-        return {
-            "function_ea": hex(func.start_ea),
-            "form": "ssa",
-            "blocks": _ir_blocks_to_dict(ircfg),
-            "edges": edges,
-        }
+    edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+    return {
+        "function_ea": hex(func.start_ea),
+        "blocks": _ir_blocks_to_dict(ircfg),
+        "edges": edges,
+    }
 
-    # ========================================================================
-    # CFG analysis
-    # ========================================================================
+# ========================================================================
+# SSA
+# ========================================================================
 
-    @tool
-    @idasync
-    def miasm_get_cfg_dot(
-        address: Annotated[str, "Any address inside the function (hex or symbol name)"],
-    ) -> dict:
-        """Return a Graphviz DOT string for the function's assembly CFG."""
-        import idaapi
-        ea = parse_address(address)
-        func = idaapi.get_func(ea)
-        if not func:
-            raise IDAError(f"No function found at {hex(ea)}")
+@tool
+@idasync
+def miasm_get_ssa(
+    address: Annotated[str, "Any address inside the function to transform (hex or symbol name)"],
+) -> dict:
+    """Lift a function to IR and transform it into Static Single Assignment (SSA) form."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    import idaapi
+    from miasm.analysis.ssa import SSADiGraph
 
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, _ = _manager.get_mdis(data, func.start_ea)
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at {hex(ea)}")
 
-        asmcfg = mdis.dis_multiblock(func.start_ea)
-        return {"ok": True, "dot": asmcfg.dot()}
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
 
-    @tool
-    @idasync
-    def miasm_find_paths(
-        start_ea: Annotated[str, "Start address (hex or symbol name) — must be inside the same function as target"],
-        target_ea: Annotated[str, "Target address to reach (hex or symbol name)"],
-        max_paths: Annotated[int, "Maximum number of paths to return (default 20)"] = 20,
-    ) -> list[dict]:
-        """Find all execution paths between two addresses within the same function."""
-        import idaapi
-        start_addr = parse_address(start_ea)
-        target_addr = parse_address(target_ea)
-        func = idaapi.get_func(start_addr)
-        if not func:
-            raise IDAError(f"No function found at {hex(start_addr)}")
+    asmcfg = mdis.dis_multiblock(func.start_ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
 
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+    heads = list(ircfg.heads())
+    if not heads:
+        raise IDAError("IRCFG has no head block — cannot apply SSA.")
+    head = heads[0]
 
-        asmcfg = mdis.dis_multiblock(func.start_ea)
+    ssa = SSADiGraph(ircfg)
+    ssa.transform(head)
 
-        start_loc = None
-        target_loc = None
-        for block in asmcfg.blocks:
-            if not block.lines:
-                continue
-            bstart = block.lines[0].offset
-            bend = block.lines[-1].offset
-            if bstart <= start_addr <= bend:
-                start_loc = block.loc_key
-            if bstart <= target_addr <= bend:
-                target_loc = block.loc_key
+    edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+    return {
+        "function_ea": hex(func.start_ea),
+        "form": "ssa",
+        "blocks": _ir_blocks_to_dict(ircfg),
+        "edges": edges,
+    }
 
-        if start_loc is None:
-            raise IDAError(f"Address {hex(start_addr)} not found in function blocks.")
-        if target_loc is None:
-            raise IDAError(f"Address {hex(target_addr)} not found in function blocks.")
+# ========================================================================
+# CFG analysis
+# ========================================================================
 
-        paths = _find_all_paths(asmcfg, start_loc, target_loc, max_paths)
-        if not paths:
-            return []
+@tool
+@idasync
+def miasm_get_cfg_dot(
+    address: Annotated[str, "Any address inside the function (hex or symbol name)"],
+) -> dict:
+    """Return a Graphviz DOT string for the function's assembly CFG."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    import idaapi
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at {hex(ea)}")
 
-        results = []
-        for idx, path in enumerate(paths):
-            path_eas = []
-            for loc in path:
-                block = asmcfg.loc_key_to_block(loc)
-                if block and block.lines:
-                    path_eas.append(hex(block.lines[0].offset))
-                else:
-                    path_eas.append(str(loc))
-            results.append({"path_index": idx + 1, "addresses": path_eas})
-        return results
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, _ = _manager.get_mdis(data, func.start_ea)
 
-    # ========================================================================
-    # Deobfuscation / simplification
-    # ========================================================================
+    asmcfg = mdis.dis_multiblock(func.start_ea)
+    return {"ok": True, "dot": asmcfg.dot()}
 
-    @tool
-    @idasync
-    def miasm_deobfuscate_cfg(
-        address: Annotated[str, "Any address inside the function to deobfuscate (hex or symbol name)"],
-    ) -> dict:
-        """
-        Lift a function to IR and apply dead-code elimination to simplify obfuscated CFGs.
-        Returns the simplified IR blocks and edges.
-        """
-        import idaapi
-        from miasm.analysis.data_flow import DeadRemoval
+@tool
+@idasync
+def miasm_find_paths(
+    start_ea: Annotated[str, "Start address (hex or symbol name) — must be inside the same function as target"],
+    target_ea: Annotated[str, "Target address to reach (hex or symbol name)"],
+    max_paths: Annotated[int, "Maximum number of paths to return (default 20)"] = 20,
+) -> list[dict]:
+    """Find all execution paths between two addresses within the same function."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    import idaapi
+    start_addr = parse_address(start_ea)
+    target_addr = parse_address(target_ea)
+    func = idaapi.get_func(start_addr)
+    if not func:
+        raise IDAError(f"No function found at {hex(start_addr)}")
 
-        ea = parse_address(address)
-        func = idaapi.get_func(ea)
-        if not func:
-            raise IDAError(f"No function found at {hex(ea)}")
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
 
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+    asmcfg = mdis.dis_multiblock(func.start_ea)
 
-        asmcfg = mdis.dis_multiblock(func.start_ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+    start_loc = None
+    target_loc = None
+    for block in asmcfg.blocks:
+        if not block.lines:
+            continue
+        bstart = block.lines[0].offset
+        bend = block.lines[-1].offset
+        if bstart <= start_addr <= bend:
+            start_loc = block.loc_key
+        if bstart <= target_addr <= bend:
+            target_loc = block.loc_key
 
-        dead_rm = DeadRemoval(lifter)
-        dead_rm(ircfg)
+    if start_loc is None:
+        raise IDAError(f"Address {hex(start_addr)} not found in function blocks.")
+    if target_loc is None:
+        raise IDAError(f"Address {hex(target_addr)} not found in function blocks.")
 
-        edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
-        return {
-            "function_ea": hex(func.start_ea),
-            "simplified": True,
-            "blocks": _ir_blocks_to_dict(ircfg),
-            "edges": edges,
-        }
+    paths = _find_all_paths(asmcfg, start_loc, target_loc, max_paths)
+    if not paths:
+        return []
 
-    @tool
-    @idasync
-    def miasm_simplify_block(
-        address: Annotated[str, "Start address of the block to symbolically simplify (hex or symbol name)"],
-    ) -> dict:
-        """
-        Symbolically execute a single basic block and return the simplified register state.
-        Only registers whose values changed (i.e. are non-identity after simplification) are reported.
-        """
-        from miasm.ir.symbexec import SymbolicExecutionEngine
+    results = []
+    for idx, path in enumerate(paths):
+        path_eas = []
+        for loc in path:
+            block = asmcfg.loc_key_to_block(loc)
+            if block and block.lines:
+                path_eas.append(hex(block.lines[0].offset))
+            else:
+                path_eas.append(str(loc))
+        results.append({"path_index": idx + 1, "addresses": path_eas})
+    return results
 
-        ea = parse_address(address)
-        end_ea = ea + 256
-        data = _manager.get_bytes(ea, end_ea)
-        mdis, loc_db = _manager.get_mdis(data, ea)
+# ========================================================================
+# Deobfuscation / simplification
+# ========================================================================
 
-        asm_block = mdis.dis_block(ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg()
-        lifter.add_asmblock_to_ircfg(asm_block, ircfg)
+@tool
+@idasync
+def miasm_deobfuscate_cfg(
+    address: Annotated[str, "Any address inside the function to deobfuscate (hex or symbol name)"],
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Lift a function to IR and apply dead-code elimination to simplify obfuscated CFGs.
+    Returns the simplified IR blocks and edges.
+    """
+    import idaapi
+    from miasm.analysis.data_flow import DeadRemoval
 
-        sb = SymbolicExecutionEngine(lifter)
-        for _, irblock in _iter_ircfg_blocks(ircfg):
-            sb.eval_updt_irblock(irblock)
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at {hex(ea)}")
 
-        regs: dict[str, str] = {}
-        for dest, expr in sb.symbols.items():
-            simplified = expr.simplify()
-            if str(dest) != str(simplified):
-                regs[str(dest)] = str(simplified)
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
 
-        return {"address": hex(ea), "simplified_registers": regs}
+    asmcfg = mdis.dis_multiblock(func.start_ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
 
-    # ========================================================================
-    # Symbolic execution
-    # ========================================================================
+    dead_rm = DeadRemoval(lifter)
+    dead_rm(ircfg)
 
-    @tool
-    @idasync
-    def miasm_emulate_symbolic(
-        address: Annotated[str, "Start address of the block to emulate (hex or symbol name)"],
-        context_json: Annotated[
-            str,
-            'JSON object mapping register names to integer values, e.g. {"EAX": 1, "EBX": 2}',
-        ] = "{}",
-    ) -> dict:
-        """
-        Symbolically emulate a basic block with an optional concrete initial register state.
-        Returns all register assignments after execution.
-        """
-        from miasm.ir.symbexec import SymbolicExecutionEngine
+    edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+    return {
+        "function_ea": hex(func.start_ea),
+        "simplified": True,
+        "blocks": _ir_blocks_to_dict(ircfg),
+        "edges": edges,
+    }
 
+@tool
+@idasync
+def miasm_simplify_block(
+    address: Annotated[str, "Start address of the block to symbolically simplify (hex or symbol name)"],
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Symbolically execute a single basic block and return the simplified register state.
+    Only registers whose values changed (i.e. are non-identity after simplification) are reported.
+    """
+    from miasm.ir.symbexec import SymbolicExecutionEngine
+
+    ea = parse_address(address)
+    end_ea = ea + 256
+    data = _manager.get_bytes(ea, end_ea)
+    mdis, loc_db = _manager.get_mdis(data, ea)
+
+    asm_block = mdis.dis_block(ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg()
+    lifter.add_asmblock_to_ircfg(asm_block, ircfg)
+
+    sb = SymbolicExecutionEngine(lifter)
+    for _, irblock in _iter_ircfg_blocks(ircfg):
+        sb.eval_updt_irblock(irblock)
+
+    regs: dict[str, str] = {}
+    for dest, expr in sb.symbols.items():
+        simplified = expr.simplify()
+        if str(dest) != str(simplified):
+            regs[str(dest)] = str(simplified)
+
+    return {"address": hex(ea), "simplified_registers": regs}
+
+# ========================================================================
+# Symbolic execution
+# ========================================================================
+
+@tool
+@idasync
+def miasm_emulate_symbolic(
+    address: Annotated[str, "Start address of the block to emulate (hex or symbol name)"],
+    context_json: Annotated[
+        str,
+        'JSON object mapping register names to integer values, e.g. {"EAX": 1, "EBX": 2}',
+    ] = "{}",
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Symbolically emulate a basic block with an optional concrete initial register state.
+    Returns all register assignments after execution.
+    """
+    from miasm.ir.symbexec import SymbolicExecutionEngine
+
+    try:
+        context: dict = json.loads(context_json)
+    except Exception as exc:
+        raise IDAError(f"Invalid context_json: {exc}") from exc
+
+    ea = parse_address(address)
+    end_ea = ea + 256
+    data = _manager.get_bytes(ea, end_ea)
+    mdis, loc_db = _manager.get_mdis(data, ea)
+
+    asm_block = mdis.dis_block(ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg()
+    lifter.add_asmblock_to_ircfg(asm_block, ircfg)
+
+    sb = SymbolicExecutionEngine(lifter)
+
+    bits = _manager.bitness
+    for reg_name, val in context.items():
         try:
-            context: dict = json.loads(context_json)
-        except Exception as exc:
-            raise IDAError(f"Invalid context_json: {exc}") from exc
+            reg_expr = ExprId(reg_name.upper(), bits)
+            sb.symbols[reg_expr] = ExprInt(int(val), bits)
+        except Exception:
+            pass
 
-        ea = parse_address(address)
-        end_ea = ea + 256
-        data = _manager.get_bytes(ea, end_ea)
-        mdis, loc_db = _manager.get_mdis(data, ea)
+    for _, irblock in _iter_ircfg_blocks(ircfg):
+        sb.eval_updt_irblock(irblock)
 
-        asm_block = mdis.dis_block(ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg()
-        lifter.add_asmblock_to_ircfg(asm_block, ircfg)
+    regs: dict[str, str] = {}
+    for dest, expr in sb.symbols.items():
+        regs[str(dest)] = str(expr.simplify())
 
-        sb = SymbolicExecutionEngine(lifter)
+    return {"address": hex(ea), "registers": regs}
 
-        bits = _manager.bitness
-        for reg_name, val in context.items():
-            try:
-                reg_expr = ExprId(reg_name.upper(), bits)
-                sb.symbols[reg_expr] = ExprInt(int(val), bits)
-            except Exception:
-                pass
+# ========================================================================
+# Data flow / side effects
+# ========================================================================
 
-        for _, irblock in _iter_ircfg_blocks(ircfg):
-            sb.eval_updt_irblock(irblock)
+@tool
+@idasync
+def miasm_get_function_side_effects(
+    address: Annotated[str, "Any address inside the function to analyse (hex or symbol name)"],
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Report which registers and memory locations are read and written by a function.
+    Useful for quickly understanding a function's I/O surface.
+    """
+    import idaapi
 
-        regs: dict[str, str] = {}
-        for dest, expr in sb.symbols.items():
-            regs[str(dest)] = str(expr.simplify())
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at {hex(ea)}")
 
-        return {"address": hex(ea), "registers": regs}
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
 
-    # ========================================================================
-    # Data flow / side effects
-    # ========================================================================
+    asmcfg = mdis.dis_multiblock(func.start_ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
 
-    @tool
-    @idasync
-    def miasm_get_function_side_effects(
-        address: Annotated[str, "Any address inside the function to analyse (hex or symbol name)"],
-    ) -> dict:
-        """
-        Report which registers and memory locations are read and written by a function.
-        Useful for quickly understanding a function's I/O surface.
-        """
-        import idaapi
+    written: set[str] = set()
+    read: set[str] = set()
 
-        ea = parse_address(address)
-        func = idaapi.get_func(ea)
-        if not func:
-            raise IDAError(f"No function found at {hex(ea)}")
+    for _, irblock in _iter_ircfg_blocks(ircfg):
+        for assignblk in irblock:
+            for dst, src in assignblk.items():
+                if dst.is_id():
+                    written.add(str(dst))
+                elif dst.is_mem():
+                    written.add(f"@mem[{dst}]")
+                for r in get_expr_ids(src):
+                    read.add(str(r))
 
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+    return {
+        "function_ea": hex(func.start_ea),
+        "reads": sorted(read),
+        "writes": sorted(written),
+    }
 
-        asmcfg = mdis.dis_multiblock(func.start_ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+def _trace_data_flow_internal(register: str, ea: int) -> list[str]:
+    """Non-decorated helper to trace data-flow origins without nested @idasync deadlock."""
+    import idaapi
+    from miasm.analysis.depgraph import DependencyGraph
 
-        written: set[str] = set()
-        read: set[str] = set()
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at {hex(ea)}")
 
-        for _, irblock in _iter_ircfg_blocks(ircfg):
-            for assignblk in irblock:
-                for dst, src in assignblk.items():
-                    if dst.is_id():
-                        written.add(str(dst))
-                    elif dst.is_mem():
-                        written.add(f"@mem[{dst}]")
-                    for r in get_expr_ids(src):
-                        read.add(str(r))
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
 
-        return {
-            "function_ea": hex(func.start_ea),
-            "reads": sorted(read),
-            "writes": sorted(written),
-        }
+    asmcfg = mdis.dis_multiblock(func.start_ea)
+    lifter = _manager.machine.lifter_model_call(loc_db)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
 
-    def _trace_data_flow_internal(register: str, ea: int) -> list[str]:
-        """Non-decorated helper to trace data-flow origins without nested @idasync deadlock."""
-        import idaapi
-        from miasm.analysis.depgraph import DependencyGraph
+    dg = DependencyGraph(ircfg)
+    reg_expr = ExprId(register.upper(), _manager.bitness)
 
-        func = idaapi.get_func(ea)
-        if not func:
-            raise IDAError(f"No function found at {hex(ea)}")
-
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
-
-        asmcfg = mdis.dis_multiblock(func.start_ea)
-        lifter = _manager.machine.lifter_model_call(loc_db)
-        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
-
-        dg = DependencyGraph(ircfg)
-        reg_expr = ExprId(register.upper(), _manager.bitness)
-
-        target_loc = None
-        line_nb = 0
-        for _, irblock in _iter_ircfg_blocks(ircfg):
-            for idx, assignblk in enumerate(irblock):
-                instr = getattr(assignblk, "instr", None)
-                if instr is not None and instr.offset == ea:
-                    target_loc = irblock.loc_key
-                    line_nb = idx
-                    break
-            if target_loc is not None:
+    target_loc = None
+    line_nb = 0
+    for _, irblock in _iter_ircfg_blocks(ircfg):
+        for idx, assignblk in enumerate(irblock):
+            instr = getattr(assignblk, "instr", None)
+            if instr is not None and instr.offset == ea:
+                target_loc = irblock.loc_key
+                line_nb = idx
                 break
+        if target_loc is not None:
+            break
 
-        if target_loc is None:
-            raise IDAError(f"Address {hex(ea)} not found in function IR blocks.")
+    if target_loc is None:
+        raise IDAError(f"Address {hex(ea)} not found in function IR blocks.")
 
-        sols = dg.get(target_loc, {reg_expr}, line_nb, set())
+    sols = dg.get(target_loc, {reg_expr}, line_nb, set())
 
-        output: list[str] = []
-        for graph in sols:
-            for node in graph.nodes():
-                output.append(str(node))
+    output: list[str] = []
+    for graph in sols:
+        for node in graph.nodes():
+            output.append(str(node))
 
-        return output
+    return output
 
-    @tool
-    @idasync
-    def miasm_trace_data_flow(
-        register: Annotated[str, "Register name whose origin to trace (e.g. EAX, RAX)"],
-        address: Annotated[str, "Address of the instruction where the register value is used (hex or symbol name)"],
-    ) -> list[str]:
-        """
-        Trace the data-flow origins of a register at a given address using Miasm's dependency graph.
-        Returns a list of IR expression nodes that contribute to the register's value.
-        """
-        ea = parse_address(address)
-        return _trace_data_flow_internal(register, ea)
+@tool
+@idasync
+def miasm_trace_data_flow(
+    register: Annotated[str, "Register name whose origin to trace (e.g. EAX, RAX)"],
+    address: Annotated[str, "Address of the instruction where the register value is used (hex or symbol name)"],
+) -> list[str]:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Trace the data-flow origins of a register at a given address using Miasm's dependency graph.
+    Returns a list of IR expression nodes that contribute to the register's value.
+    """
+    ea = parse_address(address)
+    return _trace_data_flow_internal(register, ea)
 
-    # ========================================================================
-    # Assembly / patching
-    # ========================================================================
+# ========================================================================
+# Assembly / patching
+# ========================================================================
 
-    @tool
-    @idasync
-    def miasm_assemble(
-        asm_string: Annotated[str, "Assembly instruction text (e.g. 'MOV EAX, 1')"],
-        arch: Annotated[
-            str,
-            "Override architecture string (e.g. x86_32, x86_64, arml). "
-            "Leave empty to use the architecture of the currently loaded binary.",
-        ] = "",
-    ) -> dict:
-        """Assemble a single instruction and return all possible encodings."""
-        if arch:
-            machine = Machine(arch)
-            bits = int(arch.split("_")[-1]) if "_" in arch else _manager.bitness
-        else:
-            machine = _manager.machine
-            bits = _manager.bitness
-
-        loc_db = LocationDB()
-        mn = machine.mn
-        instr = mn.fromstring(asm_string, loc_db, bits)
-        encodings = mn.asm(instr)
-
-        if not encodings:
-            raise IDAError(f"No encodings found for: {asm_string!r}")
-
-        return {
-            "instruction": str(instr),
-            "encodings": [enc.hex() for enc in encodings],
-            "shortest": min(encodings, key=len).hex(),
-            "longest": max(encodings, key=len).hex(),
-        }
-
-    @unsafe
-    @tool
-    @idasync
-    def miasm_patch_instruction(
-        address: Annotated[str, "Address to patch in the IDA database (hex or symbol name)"],
-        asm_string: Annotated[str, "Assembly instruction text to assemble and write"],
-    ) -> dict:
-        """
-        Assemble an instruction and patch the bytes into the IDA database at the given address.
-        Uses the shortest available encoding. The change is reflected immediately in IDA's view.
-        """
-        import ida_bytes
-
-        ea = parse_address(address)
+@tool
+@idasync
+def miasm_assemble(
+    asm_string: Annotated[str, "Assembly instruction text (e.g. 'MOV EAX, 1')"],
+    arch: Annotated[
+        str,
+        "Override architecture string (e.g. x86_32, x86_64, arml). "
+        "Leave empty to use the architecture of the currently loaded binary.",
+    ] = "",
+) -> dict:
+    """Assemble a single instruction and return all possible encodings."""
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    if arch:
+        machine = Machine(arch)
+        bits = int(arch.split("_")[-1]) if "_" in arch else _manager.bitness
+    else:
         machine = _manager.machine
         bits = _manager.bitness
-        loc_db = LocationDB()
-        mn = machine.mn
-        instr = mn.fromstring(asm_string, loc_db, bits)
-        encodings = mn.asm(instr)
 
-        if not encodings:
-            raise IDAError(f"No encodings found for: {asm_string!r}")
+    loc_db = LocationDB()
+    mn = machine.mn
+    instr = mn.fromstring(asm_string, loc_db, bits)
+    encodings = mn.asm(instr)
 
-        shortest = min(encodings, key=len)
+    if not encodings:
+        raise IDAError(f"No encodings found for: {asm_string!r}")
 
-        if not ida_bytes.patch_bytes(ea, shortest):
-            raise IDAError(f"IDA patch_bytes failed at {hex(ea)}")
+    return {
+        "instruction": str(instr),
+        "encodings": [enc.hex() for enc in encodings],
+        "shortest": min(encodings, key=len).hex(),
+        "longest": max(encodings, key=len).hex(),
+    }
 
-        return {
-            "ok": True,
-            "address": hex(ea),
-            "bytes_patched": len(shortest),
-            "hex": shortest.hex(),
-            "instruction": asm_string,
-        }
+@unsafe
+@tool
+@idasync
+def miasm_patch_instruction(
+    address: Annotated[str, "Address to patch in the IDA database (hex or symbol name)"],
+    asm_string: Annotated[str, "Assembly instruction text to assemble and write"],
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Assemble an instruction and patch the bytes into the IDA database at the given address.
+    Uses the shortest available encoding. The change is reflected immediately in IDA's view.
+    """
+    import ida_bytes
 
-    # ========================================================================
-    # Pattern search (instruction-level)
-    # ========================================================================
+    ea = parse_address(address)
+    machine = _manager.machine
+    bits = _manager.bitness
+    loc_db = LocationDB()
+    mn = machine.mn
+    instr = mn.fromstring(asm_string, loc_db, bits)
+    encodings = mn.asm(instr)
 
-    @tool
-    @idasync
-    def miasm_search_instruction_pattern(
-        address: Annotated[str, "Any address inside the function to search (hex or symbol name)"],
-        mnemonics: Annotated[
-            str | list[str],
-            "Sequence of mnemonics to match consecutively (case-insensitive). "
-            "Accept either a JSON list like ['MOV','PUSH','CALL'] or a "
-            "comma-separated string 'MOV,PUSH,CALL'.",
-        ],
-        max_matches: Annotated[int, "Cap on returned match count (default 200)."] = 200,
-    ) -> dict:
-        """
-        Find every location inside the given function where the supplied
-        mnemonic sequence appears as consecutive instructions.
+    if not encodings:
+        raise IDAError(f"No encodings found for: {asm_string!r}")
 
-        Useful for spotting prologues, gadget-like sequences, or signature
-        instruction patterns the AI wants to locate before deeper analysis.
+    shortest = min(encodings, key=len)
 
-        Matches are reported as the address of the first instruction in the
-        sequence. Searches are case-insensitive and respect basic-block
-        boundaries (a pattern straddling a basic-block edge is reported
-        only when the consecutive Miasm-disassembled stream lists them in
-        sequence within a single block).
-        """
-        import idaapi
+    if not ida_bytes.patch_bytes(ea, shortest):
+        raise IDAError(f"IDA patch_bytes failed at {hex(ea)}")
 
-        # Normalise the mnemonics argument
-        if isinstance(mnemonics, str):
-            seq = [m.strip().upper() for m in mnemonics.split(",") if m.strip()]
-        else:
-            seq = [str(m).strip().upper() for m in mnemonics if str(m).strip()]
+    return {
+        "ok": True,
+        "address": hex(ea),
+        "bytes_patched": len(shortest),
+        "hex": shortest.hex(),
+        "instruction": asm_string,
+    }
 
-        if not seq:
-            return {"ok": False, "error": "Empty mnemonic sequence."}
+# ========================================================================
+# Pattern search (instruction-level)
+# ========================================================================
 
-        ea = parse_address(address)
-        func = idaapi.get_func(ea)
-        if not func:
-            return {"ok": False, "error": f"No function found at {hex(ea)}"}
+@tool
+@idasync
+def miasm_search_instruction_pattern(
+    address: Annotated[str, "Any address inside the function to search (hex or symbol name)"],
+    mnemonics: Annotated[
+        str | list[str],
+        "Sequence of mnemonics to match consecutively (case-insensitive). "
+        "Accept either a JSON list like ['MOV','PUSH','CALL'] or a "
+        "comma-separated string 'MOV,PUSH,CALL'.",
+    ],
+    max_matches: Annotated[int, "Cap on returned match count (default 200)."] = 200,
+) -> dict:
+    """
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
+    Find every location inside the given function where the supplied
+    mnemonic sequence appears as consecutive instructions.
 
-        data = _manager.get_bytes(func.start_ea, func.end_ea)
-        mdis, _ = _manager.get_mdis(data, func.start_ea)
+    Useful for spotting prologues, gadget-like sequences, or signature
+    instruction patterns the AI wants to locate before deeper analysis.
 
-        try:
-            asmcfg = mdis.dis_multiblock(func.start_ea)
-        except Exception as e:
-            return {"ok": False, "error": f"Miasm disassembly failed: {e}"}
+    Matches are reported as the address of the first instruction in the
+    sequence. Searches are case-insensitive and respect basic-block
+    boundaries (a pattern straddling a basic-block edge is reported
+    only when the consecutive Miasm-disassembled stream lists them in
+    sequence within a single block).
+    """
+    import idaapi
 
-        pattern_len = len(seq)
-        matches: list[dict] = []
+    # Normalise the mnemonics argument
+    if isinstance(mnemonics, str):
+        seq = [m.strip().upper() for m in mnemonics.split(",") if m.strip()]
+    else:
+        seq = [str(m).strip().upper() for m in mnemonics if str(m).strip()]
 
-        for block in asmcfg.blocks:
-            lines = list(getattr(block, "lines", []) or [])
-            if len(lines) < pattern_len:
-                continue
+    if not seq:
+        return {"ok": False, "error": "Empty mnemonic sequence."}
 
-            for i in range(len(lines) - pattern_len + 1):
-                ok = True
-                for j in range(pattern_len):
-                    if lines[i + j].name.upper() != seq[j]:
-                        ok = False
-                        break
-                if ok:
-                    head = lines[i]
-                    tail = lines[i + pattern_len - 1]
-                    matches.append(
-                        {
-                            "address": hex(head.offset),
-                            "end_address": hex(tail.offset),
-                            "block_loc_key": str(block.loc_key),
-                            "instructions": [
-                                {"address": hex(lines[i + k].offset), "mnemonic": lines[i + k].name}
-                                for k in range(pattern_len)
-                            ],
-                        }
-                    )
-                    if len(matches) >= max_matches:
-                        break
-            if len(matches) >= max_matches:
-                break
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        return {"ok": False, "error": f"No function found at {hex(ea)}"}
 
-        return {
-            "ok": True,
-            "function_ea": hex(func.start_ea),
-            "pattern": seq,
-            "match_count": len(matches),
-            "truncated": len(matches) >= max_matches,
-            "matches": matches,
-        }
+    data = _manager.get_bytes(func.start_ea, func.end_ea)
+    mdis, _ = _manager.get_mdis(data, func.start_ea)
+
+    try:
+        asmcfg = mdis.dis_multiblock(func.start_ea)
+    except Exception as e:
+        return {"ok": False, "error": f"Miasm disassembly failed: {e}"}
+
+    pattern_len = len(seq)
+    matches: list[dict] = []
+
+    for block in asmcfg.blocks:
+        lines = list(getattr(block, "lines", []) or [])
+        if len(lines) < pattern_len:
+            continue
+
+        for i in range(len(lines) - pattern_len + 1):
+            ok = True
+            for j in range(pattern_len):
+                if lines[i + j].name.upper() != seq[j]:
+                    ok = False
+                    break
+            if ok:
+                head = lines[i]
+                tail = lines[i + pattern_len - 1]
+                matches.append(
+                    {
+                        "address": hex(head.offset),
+                        "end_address": hex(tail.offset),
+                        "block_loc_key": str(block.loc_key),
+                        "instructions": [
+                            {"address": hex(lines[i + k].offset), "mnemonic": lines[i + k].name}
+                            for k in range(pattern_len)
+                        ],
+                    }
+                )
+                if len(matches) >= max_matches:
+                    break
+        if len(matches) >= max_matches:
+            break
+
+    return {
+        "ok": True,
+        "function_ea": hex(func.start_ea),
+        "pattern": seq,
+        "match_count": len(matches),
+        "truncated": len(matches) >= max_matches,
+        "matches": matches,
+    }
