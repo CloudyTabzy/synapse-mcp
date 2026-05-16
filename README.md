@@ -82,6 +82,16 @@ miasm_status    # → {"ok": true, "available": true, ...}
 
 If a dependency is missing, the probe reports `"available": false` and the engine-specific tools are hidden. The rest of the IDA MCP tools work normally.
 
+### CLI aliases
+
+This fork registers three equivalent CLI names so you can use whichever is clearest in your context:
+
+| Command | Purpose |
+|---------|---------|
+| `ida-pro-mcp` | Same name as upstream — drop-in replacement |
+| `ida-triton-miasm-mcp` | Fork-specific alias |
+| `ida-pro-mcp-enhanced` | Fork-specific alias |
+
 > **Forked from** [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) — upstream core IDA tools, zeromcp transport, and idalib support are from that project.
 
 ### Triton tools (36 tools)
@@ -231,28 +241,70 @@ In addition to `ida://` resources, the fork exposes Triton and Miasm session sta
 
 ## Installation
 
-### Via MCP Client (Claude Code)
+### Quick Start (One-Click Installer)
 
-The upstream plugin is available in the Claude Code marketplace:
-
-```bash
-claude plugin marketplace add mrexodia/claude-marketplace
-claude plugin install ida-pro-mcp@mrexodia
+**Windows** — double-click or run from CMD:
+```batch
+install.bat
 ```
 
-To use **this fork** instead, install from source into your project:
-
+**Linux / macOS**:
 ```bash
-# Clone or download this repository, then
-pip install .
-# or directly from GitHub
-pip install "https://github.com/your-org/ida-pro-triton-miasm-mcp/archive/refs/heads/main.zip"
+chmod +x install.sh
+./install.sh
 ```
 
-Then install the IDA plugin:
+This script will:
+1. Remove conflicting upstream packages (`ida-pro-mcp`, `ida-pro-mcp-xjoker`)
+2. Install this fork from source in editable mode
+3. Install the IDA Pro plugin
+4. Prompt you to install optional analysis engines (Triton / Miasm / Both)
+
+### Manual Install
+
+If you prefer manual control:
 
 ```bash
+# 1. Remove conflicting upstream packages
+pip uninstall ida-pro-mcp ida-pro-mcp-xjoker
+
+# 2. Install this fork from source
+cd ida-pro-triton-miasm-mcp-main
+pip install -e .
+
+# 3. Install the IDA plugin
 ida-pro-mcp --install
+
+# 4. (Optional) Install analysis engines
+ida-pro-mcp --install-deps all       # both
+ida-pro-mcp --install-deps triton    # Triton only
+ida-pro-mcp --install-deps miasm     # Miasm only
+```
+
+### MCP Client Configuration
+
+Add the server to your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-triton-miasm": {
+      "command": "ida-pro-mcp"
+    }
+  }
+}
+```
+
+For SSE transport:
+```json
+{
+  "mcpServers": {
+    "ida-pro-triton-miasm": {
+      "command": "ida-pro-mcp",
+      "args": ["--transport", "http://127.0.0.1:8744/sse"]
+    }
+  }
+}
 ```
 
 **Note**: Headless `idalib-mcp` requires having idalib activated globally and [uv](https://astral.sh/uv) installed:
@@ -263,53 +315,6 @@ uv run "C:\Program Files\IDA Professional 9.3\idalib\python\py-activate-idalib.p
 # macos
 uv run "/Applications/IDA Professional 9.3.app/Contents/MacOS/idalib/python/py-activate-idalib.py"
 ```
-
-### Manual MCP Configuration
-
-If your MCP client does not support plugins, add the server manually to your client's MCP config:
-
-```json
-{
-  "mcpServers": {
-    "ida-pro-triton-miasm": {
-      "command": "uv",
-      "args": ["run", "ida-pro-mcp", "--transport", "http://127.0.0.1:8744/sse"]
-    }
-  }
-}
-```
-
-For stdio transport (most clients):
-
-```json
-{
-  "mcpServers": {
-    "ida-pro-triton-miasm": {
-      "command": "uv",
-      "args": ["run", "ida-pro-mcp"]
-    }
-  }
-}
-```
-
-### Installing from the IDA GUI
-
-**Note**: the MCP plugin approach is no longer recommended and will eventually be deprecated. Use `idalib-mcp` instead.
-
-If you want to configure the MCP server manually from the IDA GUI:
-
-```sh
-pip uninstall ida-pro-mcp
-pip install https://github.com/your-org/ida-pro-triton-miasm-mcp/archive/refs/heads/main.zip
-```
-
-Configure the MCP servers and install the IDA Plugin:
-
-```
-ida-pro-mcp --install
-```
-
-**Important**: Make sure you completely restart IDA and your MCP client for the installation to take effect. Some clients (like Claude) run in the background and need to be quit from the tray icon.
 
 ## Prompt Engineering
 

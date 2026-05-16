@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/sebter1994/ida-pro-triton-miasm-mcp"
-Issues = "https://github.com/sebter1994/ida-pro-triton-miasm-mcp/issues"
+Repository = "https://github.com/CloudyTabzy/ida-pro-triton-miasm-mcp"
+Issues = "https://github.com/CloudyTabzy/ida-pro-triton-miasm-mcp/issues"
 Upstream = "https://github.com/mrexodia/ida-pro-mcp"
 
 [build-system]
@@ -47,6 +47,7 @@ build-backend = "setuptools.build_meta"
 [project.scripts]
 ida-pro-mcp = "ida_pro_mcp.server:main"
 ida-triton-miasm-mcp = "ida_pro_mcp.server:main"
+ida-pro-mcp-enhanced = "ida_pro_mcp.server:main"
 idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
 ida-mcp-test = "ida_pro_mcp.test:main"
 ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"
