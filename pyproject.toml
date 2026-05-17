@@ -1,7 +1,7 @@
 [project]
 name = "ida-pro-triton-miasm-mcp"
 version = "1.0.0"
-description = "IDA Pro MCP server with built-in Triton symbolic execution and Miasm IR analysis"
+description = "IDA Pro MCP server with built-in Triton symbolic execution, Miasm IR analysis, declarative binary format parsing, and comprehensive binary reconnaissance tools"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -9,7 +9,7 @@ authors = [
     { name = "can1357" },
     { name = "IDA Pro MCP Contributors" },
 ]
-keywords = ["ida", "mcp", "llm", "plugin", "triton", "miasm", "symbolic-execution"]
+keywords = ["ida", "mcp", "llm", "plugin", "triton", "miasm", "symbolic-execution", "binary-analysis", "deobfuscation", "reverse-engineering"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -24,9 +24,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-triton = ["triton-library>=0.10.0"]
-miasm  = ["miasm>=0.1.5", "future>=0.18.0"]
-all    = ["triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0"]
+triton   = ["triton-library>=0.10.0"]
+miasm    = ["miasm>=0.1.5", "future>=0.18.0"]
+construct = ["construct>=2.10.68"]
+cstruct  = ["dissect.cstruct>=4.0", "filetype>=1.2.0"]
+all      = [
+    "triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0",
+    "construct>=2.10.68",
+    "dissect.cstruct>=4.0", "filetype>=1.2.0",
+]
 
 [dependency-groups]
 dev = [

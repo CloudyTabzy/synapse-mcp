@@ -1,12 +1,12 @@
 ---
 name: stripped-binary-recovery
-description: Recover semantics from stripped executables in IDA Pro. Use when a binary has no symbols, no debug info, and all functions appear as FUN_xxxx or sub_xxxx. Combines FLIRT signature scanning, code-gap discovery, string xref triage, call-graph hub analysis, constant matching, and structural similarity detection to rebuild a meaningful function map.
-allowed-tools: mcp__ida_pro_mcp__get_metadata, mcp__ida_pro_mcp__list_segments, mcp__ida_pro_mcp__list_functions, mcp__ida_pro_mcp__list_functions_enhanced, mcp__ida_pro_mcp__find_code_gaps, mcp__ida_pro_mcp__find_next_undefined_function, mcp__ida_pro_mcp__find_undocumented_by_string, mcp__ida_pro_mcp__find_similar_functions, mcp__ida_pro_mcp__get_bulk_function_hashes, mcp__ida_pro_mcp__batch_string_anchor_report, mcp__ida_pro_mcp__get_function_signature, mcp__ida_pro_mcp__get_function_hash, mcp__ida_pro_mcp__get_function_call_graph, mcp__ida_pro_mcp__callgraph, mcp__ida_pro_mcp__analyze_function_complete, mcp__ida_pro_mcp__analyze_data_region, mcp__ida_pro_mcp__apply_data_classification, mcp__ida_pro_mcp__find_regex, mcp__ida_pro_mcp__find_bytes, mcp__ida_pro_mcp__find_insns, mcp__ida_pro_mcp__list_strings, mcp__ida_pro_mcp__xrefs_to, mcp__ida_pro_mcp__xrefs_from, mcp__ida_pro_mcp__lookup_funcs, mcp__ida_pro_mcp__decompile, mcp__ida_pro_mcp__disasm, mcp__ida_pro_mcp__basic_blocks, mcp__ida_pro_mcp__imports, mcp__ida_pro_mcp__exports, mcp__ida_pro_mcp__get_entry_points, mcp__ida_pro_mcp__set_comments, mcp__ida_pro_mcp__rename, mcp__ida_pro_mcp__int_convert, mcp__ida_pro_mcp__py_eval, Bash, Read, Write, AskUserQuestion
+description: Recover semantics from stripped executables in IDA Pro. Use when a binary has no symbols, no debug info, and all functions appear as FUN_xxxx or sub_xxxx. Combines FLIRT signatures, prologue scanning, VTable discovery, string xref triage, call-graph hub analysis, and structural similarity detection to rebuild a meaningful function map.
+allowed-tools: mcp__ida_pro_mcp__survey_binary, mcp__ida_pro_mcp__get_binary_sections, mcp__ida_pro_mcp__find_function_prologues, mcp__ida_pro_mcp__find_vtable_candidates, mcp__ida_pro_mcp__find_indirect_calls, mcp__ida_pro_mcp__identify_vtable_call, mcp__ida_pro_mcp__find_global_writers, mcp__ida_pro_mcp__analyze_cleanup_function, mcp__ida_pro_mcp__apply_flirt_signature, mcp__ida_pro_mcp__load_type_library, mcp__ida_pro_mcp__list_type_libraries, mcp__ida_pro_mcp__find_similar_functions, mcp__ida_pro_mcp__find_regex, mcp__ida_pro_mcp__find_bytes, mcp__ida_pro_mcp__find, mcp__ida_pro_mcp__list_funcs, mcp__ida_pro_mcp__xrefs_to, mcp__ida_pro_mcp__xrefs_query, mcp__ida_pro_mcp__lookup_funcs, mcp__ida_pro_mcp__decompile, mcp__ida_pro_mcp__disasm, mcp__ida_pro_mcp__basic_blocks, mcp__ida_pro_mcp__callgraph, mcp__ida_pro_mcp__imports, mcp__ida_pro_mcp__export_funcs, mcp__ida_pro_mcp__set_comments, mcp__ida_pro_mcp__rename, mcp__ida_pro_mcp__int_convert, mcp__ida_pro_mcp__py_eval, mcp__ida_pro_mcp__func_profile, mcp__ida_pro_mcp__analyze_function, Bash, Read, Write, AskUserQuestion
 ---
 
 # stripped-binary-recovery
 
-Recover function names, semantics, and structure from stripped binaries where all symbols have been removed. This skill systematically rebuilds a meaningful function map using signature matching, heuristics, string analysis, and graph analysis.
+Recover function names, semantics, and structure from stripped binaries where all symbols have been removed. This skill systematically rebuilds a meaningful function map using FLIRT signatures, reconnaissance heuristics, string analysis, and graph analysis.
 
 > **Tool prefix note**: MCP tool names depend on your client configuration. If your server is named differently, adjust the prefix accordingly.
 
@@ -26,12 +26,11 @@ Recover function names, semantics, and structure from stripped binaries where al
 
 ### 1. Assess what is stripped
 
-Read metadata and get an overview:
+Run a quick survey and section enumeration:
 
 ```
-mcp__ida_pro_mcp__get_metadata()
-mcp__ida_pro_mcp__list_segments()
-mcp__ida_pro_mcp__get_entry_points()
+mcp__ida_pro_mcp__survey_binary(detail_level="minimal")
+mcp__ida_pro_mcp__get_binary_sections()
 ```
 
 Check:
@@ -39,13 +38,7 @@ Check:
 - **Debug sections**: `.debug_info`, `.debug_line`, `.pdb` — usually absent in stripped binaries.
 - **Relocation info**: `.rel.dyn`, `.rela.dyn` — may hint at PLT/GOT structure.
 
-Call `mcp__ida_pro_mcp__list_functions_enhanced` to see the ratio of named vs. unnamed functions:
-
-```
-mcp__ida_pro_mcp__list_functions_enhanced(limit=1000)
-```
-
-If >80% of functions are `FUN_*` or `sub_*`, this skill is appropriate.
+Call `mcp__ida_pro_mcp__list_funcs` to see the ratio of named vs. unnamed functions. If >80% are `FUN_*` or `sub_*`, this skill is appropriate.
 
 ### 2. Run FLIRT signature scans
 
@@ -53,38 +46,33 @@ IDA's Fast Library Identification and Recognition Technology (FLIRT) can recover
 
 #### 2a. Scan with built-in signatures
 
-Use the sigmaker tools to apply known signatures:
+Apply known signatures and wait for analysis:
 
 ```
+mcp__ida_pro_mcp__apply_flirt_signature(sig_name="vc64rtf")
+mcp__ida_pro_mcp__apply_flirt_signature(sig_name="gnulnx_x64")
+```
+
+Use `py_eval` to list available signatures if unsure:
+
+```python
 mcp__ida_pro_mcp__py_eval(code="""
 import idaapi
-import idautils
-# Apply all available FLIRT signatures
-for i in range(idaapi.get_sig_qty()):
-    sig = idaapi.get_sig(i)
-    if sig:
-        idaapi.apply_sig(sig)
-print(f'Applied {idaapi.get_sig_qty()} signatures')
+sigs = [idaapi.get_sig(i) for i in range(idaapi.get_sig_qty()) if idaapi.get_sig(i)]
+print([str(s) for s in sigs[:20]])
 """)
 ```
 
-Wait for analysis to complete, then re-check `list_functions_enhanced` to see how many functions were renamed.
+Re-check `list_funcs` after application to see how many functions were renamed.
 
-#### 2b. Scan with custom signatures
+#### 2b. Load type libraries
 
-If you have custom `.sig` or `.pat` files for the target compiler (e.g., MSVC 2019, GCC 11, musl), load them:
+If FLIRT identified a compiler runtime, load its type library:
 
 ```
-mcp__ida_pro_mcp__py_eval(code="""
-import idaapi
-idaapi.plan_to_apply_idasgn('path/to/custom.sig')
-ida_auto.auto_wait()
-""")
+mcp__ida_pro_mcp__load_type_library(name="vc64rtf")
+mcp__ida_pro_mcp__list_type_libraries()
 ```
-
-After signature application, record:
-- How many functions were renamed
-- Which libraries were identified (CRT, STL, OpenSSL, zlib, etc.)
 
 ### 3. Discover missed functions
 
@@ -94,53 +82,63 @@ IDA's auto-analysis sometimes misses functions, especially in:
 - Functions reached only via indirect jumps
 - Firmware/embedded code with non-standard prologues
 
-#### 3a. Find code gaps
+#### 3a. Scan for function prologues
 
 ```
-mcp__ida_pro_mcp__find_code_gaps(min_size=16, limit=100)
-```
-
-For each gap:
-- Disassemble the first few bytes
-- Look for function prologues (`push rbp; mov rbp, rsp`, `sub rsp, N`, `push ebx`)
-- If it looks like a function, create it with `mcp__ida_pro_mcp__create_function`
-
-#### 3b. Find undefined functions near known code
-
-```
-mcp__ida_pro_mcp__find_next_undefined_function(
-    start_address="<addr>",
-    direction="forward",
-    pattern="push",
-    criteria="unexplored"
+mcp__ida_pro_mcp__find_function_prologues(
+    start="0x140000000",
+    end="0x140010000",
+    create=true
 )
 ```
 
-### 4. String cross-reference triage
+This scans for common x64/x86 prologue patterns and optionally materializes functions. Use `create=false` first to preview, then `create=true` (requires `--unsafe`) to apply.
+
+#### 3b. List functions in ranges
+
+For code gaps between known functions:
+
+```
+mcp__ida_pro_mcp__list_funcs(queries="0x140001000-0x140005000")
+```
+
+### 4. Object-oriented reconstruction (C++ binaries)
+
+#### 4a. Find VTable candidates
+
+```
+mcp__ida_pro_mcp__find_vtable_candidates(section=".data", min_pointers=4)
+```
+
+Scan for arrays of consecutive executable code pointers. These are strong indicators of C++ virtual method tables.
+
+#### 4b. Find indirect calls
+
+```
+mcp__ida_pro_mcp__find_indirect_calls(
+    start="0x140001000",
+    end="0x140005000",
+    max_results=100
+)
+```
+
+Find `call [reg+offset]` and `call [reg]` sites. The offset histogram helps identify common vtable displacements.
+
+#### 4c. Trace vtable calls
+
+For a specific indirect call, trace backwards to find the object-loading chain:
+
+```
+mcp__ida_pro_mcp__identify_vtable_call(call_addr="0x1400023a0", lookback=20)
+```
+
+### 5. String cross-reference triage
 
 Strings are the richest source of semantic hints in stripped binaries. Find which `FUN_*` functions reference interesting strings.
 
-#### 4a. Batch string anchor report
+#### 5a. Search for source-file and error strings
 
-```
-mcp__ida_pro_mcp__batch_string_anchor_report(pattern=".cpp")
-```
-
-This maps source-file strings (e.g., `path/to/file.cpp`) to the `FUN_*` functions that reference them. Functions referencing the same source file are likely from the same compilation unit.
-
-#### 4b. Find undocumented functions by string
-
-For each interesting string address found in step 4a:
-
-```
-mcp__ida_pro_mcp__find_undocumented_by_string(address="<string_addr>")
-```
-
-This finds `FUN_*` functions that reference that string. Record the function addresses.
-
-#### 4c. Categorize strings by security relevance
-
-Use `mcp__ida_pro_mcp__find_regex` to search strings for:
+Use `find_regex` to locate:
 
 | Category | Patterns |
 |---|---|
@@ -153,17 +151,25 @@ Use `mcp__ida_pro_mcp__find_regex` to search strings for:
 | **Credentials** | `password`, `secret`, `token`, `api_key`, `auth` |
 | **Debug** | `debug`, `trace`, `log`, `assert`, `TODO`, `FIXME` |
 
-For each matching string, find its xrefs and note the calling `FUN_*` functions. These are your primary targets for manual analysis.
+#### 5b. Cross-reference strings to functions
 
-### 5. Entry point and initialization analysis
+For each interesting string address, find xrefs:
+
+```
+mcp__ida_pro_mcp__xrefs_to(addrs="0x405000")
+```
+
+Note the calling `FUN_*` functions. These are your primary targets for manual analysis.
+
+### 6. Entry point and initialization analysis
 
 The entry point and initialization functions are rarely stripped and often call many application functions.
 
-#### 5a. Analyze entry points
+#### 6a. Analyze entry points
 
 ```
-mcp__ida_pro_mcp__decompile(addr="<entry_point>")
-mcp__ida_pro_mcp__callgraph(roots="<entry_point>", max_depth=3)
+mcp__ida_pro_mcp__decompile(addr="start")
+mcp__ida_pro_mcp__callgraph(roots="start", max_depth=3)
 ```
 
 Look for:
@@ -173,49 +179,46 @@ Look for:
 - Global constructors (`__init_array`, `.ctors`)
 - TLS callbacks
 
-#### 5b. Follow the call chain to find main logic
+#### 6b. Profile key functions
 
-Trace from the entry point to the actual application logic:
-1. Entry point → CRT initialization
-2. CRT → `main` / `WinMain`
-3. `main` → application functions
+For functions called directly from entry points:
 
-The functions called directly from `main` are likely high-level application logic.
+```
+mcp__ida_pro_mcp__func_profile(queries="0x140001000,0x140001200")
+```
 
-### 6. Call graph hub analysis
+This gives instruction counts, basic blocks, callers, callees, strings, and constants — great for triage.
+
+### 7. Call graph hub analysis
 
 Find "hub" functions — functions called by many others (likely utility/library code) vs. "leaf" functions that call few others (likely application-specific logic).
 
-```
-mcp__ida_pro_mcp__get_function_call_graph(depth=2, direction="both")
-```
-
-Alternatively, use `py_eval` to compute connectivity metrics:
+Use `py_eval` to compute connectivity metrics:
 
 ```python
-import idautils, ida_funcs, ida_xref
+mcp__ida_pro_mcp__py_eval(code="""
+import idautils, ida_funcs
 
 connectivity = {}
 for func_ea in idautils.Functions():
     name = ida_funcs.get_func_name(func_ea)
-    if not name.startswith("FUN_") and not name.startswith("sub_"):
-        continue  # Skip already-named functions
-    
+    if not name.startswith('FUN_') and not name.startswith('sub_'):
+        continue
     callers = len(list(idautils.XrefsTo(func_ea)))
     callees = len(list(idautils.XrefsFrom(func_ea)))
-    connectivity[func_ea] = {"callers": callers, "callees": callees}
+    connectivity[func_ea] = {'callers': callers, 'callees': callees}
 
-# Sort by caller count (hubs) and callee count (complex functions)
-hubs = sorted(connectivity.items(), key=lambda x: x[1]["callers"], reverse=True)[:20]
-complex_funcs = sorted(connectivity.items(), key=lambda x: x[1]["callees"], reverse=True)[:20]
+hubs = sorted(connectivity.items(), key=lambda x: x[1]['callers'], reverse=True)[:20]
+complex_funcs = sorted(connectivity.items(), key=lambda x: x[1]['callees'], reverse=True)[:20]
 
-print("=== Hub functions (many callers) ===")
+print('=== Hub functions (many callers) ===')
 for ea, info in hubs:
-    print(f"{ea:#x}: {info['callers']} callers, {info['callees']} callees")
+    print(f'{ea:#x}: {info[\"callers\"]} callers, {info[\"callees\"]} callees')
 
-print("\n=== Complex functions (many callees) ===")
+print('\\n=== Complex functions (many callees) ===')
 for ea, info in complex_funcs:
-    print(f"{ea:#x}: {info['callers']} callers, {info['callees']} callees")
+    print(f'{ea:#x}: {info[\"callers\"]} callers, {info[\"callees\"]} callees')
+""")
 ```
 
 Functions with:
@@ -223,17 +226,18 @@ Functions with:
 - **Few callers + many callees** → likely application logic (protocol handlers, file parsers)
 - **Zero callers** → possibly dead code, callbacks, or dynamically resolved
 
-### 7. Constant and pattern matching
+### 8. Constant and pattern matching
 
-#### 7a. Crypto constants
+#### 8a. Crypto constants
 
 Search for known cryptographic constants:
 
 ```
-mcp__ida_pro_mcp__find_bytes(patterns="63727970746f67726170686572")  # "cryptographer"
+mcp__ida_pro_mcp__find_bytes(pattern="67 45 23 01")
+mcp__ida_pro_mcp__find_bytes(pattern="EF CD AB 89")
 ```
 
-Better yet, search for common S-boxes, IVs, and magic numbers:
+Common targets:
 - MD5 initialization constants: `0x67452301`, `0xEFCDAB89`
 - SHA-256 constants: `0x6a09e667`, `0xbb67ae85`
 - AES S-box, Te0-Te4 tables
@@ -245,7 +249,7 @@ For each constant found:
 2. Find xrefs to that address
 3. The xref-ing functions are likely crypto-related
 
-#### 7b. Magic numbers and file signatures
+#### 8b. Magic numbers and file signatures
 
 Search for file format signatures:
 - `MZ` (DOS/PE header)
@@ -257,43 +261,24 @@ Search for file format signatures:
 
 Functions referencing these are likely file parsers or packers.
 
-#### 7c. Instruction patterns
-
-Find function prologues to discover missed functions:
-- x64: `55 48 89 e5` (`push rbp; mov rbp, rsp`)
-- x64: `48 89 5c 24` (`mov [rsp+8], rbx` — MSVC)
-- x86: `55 89 e5` (`push ebp; mov ebp, esp`)
-- ARM: `f0 4f 2d e9` (`push {r4-r11, lr}`)
-- AArch64: `fd 7b bf a9` (`stp x29, x30, [sp, #-0x10]!`)
-
-### 8. Structural similarity detection
+### 9. Structural similarity detection
 
 Find groups of similar functions — these are often:
 - Auto-generated code (protobuf, RPC stubs, dispatchers)
 - Wrapper functions (error handling wrappers, API adapters)
 - Compiler-generated constructors/destructors
 
-#### 8a. Find similar functions locally
-
 ```
-mcp__ida_pro_mcp__find_similar_functions(target_function="<addr>", threshold=0.8)
+mcp__ida_pro_mcp__find_similar_functions(targets="0x140001000", threshold=0.95)
 ```
 
-#### 8b. Bulk function hashing for clustering
-
-```
-mcp__ida_pro_mcp__get_bulk_function_hashes(filter="FUN_*", limit=500)
-```
-
-Group functions by hash similarity. Functions with identical or near-identical hashes are likely clones or wrappers.
-
-### 9. Batch rename based on findings
+### 10. Batch rename based on findings
 
 After triage, apply systematic naming:
 
-#### 9a. Rename recovered library functions
+#### 10a. Rename recovered library functions
 
-Functions identified by FLIRT signatures are already renamed. For any missed standard library functions, use the signature:
+Functions identified by FLIRT signatures are already renamed. For any missed standard library functions:
 
 ```
 mcp__ida_pro_mcp__rename(batch={"func": [
@@ -302,7 +287,7 @@ mcp__ida_pro_mcp__rename(batch={"func": [
 ]})
 ```
 
-#### 9b. Rename by string reference
+#### 10b. Rename by string reference
 
 Functions referenced by interesting strings get descriptive names:
 
@@ -314,7 +299,7 @@ mcp__ida_pro_mcp__rename(batch={"func": [
 ]})
 ```
 
-#### 9c. Rename by pattern
+#### 10c. Rename by pattern
 
 Functions found via crypto constants:
 
@@ -325,7 +310,7 @@ mcp__ida_pro_mcp__rename(batch={"func": [
 ]})
 ```
 
-### 10. Generate recovery report
+### 11. Generate recovery report
 
 Write a markdown report to `./reports/stripped_recovery.md`:
 
@@ -348,10 +333,15 @@ Write a markdown report to `./reports/stripped_recovery.md`:
 ## Newly Discovered Functions
 | Address | Method | Evidence | Proposed Name |
 |---|---|---|---|
-| ... | Code gap | Function prologue | ... |
+| ... | Prologue scan | Function prologue | ... |
 | ... | String xref | References "config.json" | ... |
 | ... | Crypto constant | References SHA-256 K table | ... |
 | ... | Call graph hub | 45 callers, 2 callees | ... |
+
+## VTable Candidates (C++ binaries)
+| Address | Pointer Count | Section |
+|---|---|---|
+| ... | ... | ... |
 
 ## Function Clusters
 ### Library / Utility functions

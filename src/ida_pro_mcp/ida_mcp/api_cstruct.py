@@ -50,52 +50,52 @@ from .utils import parse_address, read_bytes_bss_safe, tool_error
 # ============================================================================
 
 
-class CstructStatusResult(TypedDict):
+class CstructStatusResult(TypedDict, total=False):
     available: bool
     version: str
     registered_structs: int
     predefined_templates: list[str]
 
 
-class CstructParseResult(TypedDict):
+class CstructParseResult(TypedDict, total=False):
     ok: bool
     parsed: Any
     bytes_consumed: int
     struct_size: int
     count: int
-    error: NotRequired[str]
+    error: str
 
 
-class CstructDefineResult(TypedDict):
+class CstructDefineResult(TypedDict, total=False):
     ok: bool
     name: str
     struct_size: int
     fields: list[str]
     defined_types: list[str]
-    error: NotRequired[str]
+    error: str
 
 
-class CstructListResult(TypedDict):
+class CstructListResult(TypedDict, total=False):
     ok: bool
     structs: list[dict[str, Any]]
     predefined_count: int
     user_defined_count: int
-    error: NotRequired[str]
+    error: str
 
 
-class CstructBuildResult(TypedDict):
+class CstructBuildResult(TypedDict, total=False):
     ok: bool
     hex: str
     size: int
-    error: NotRequired[str]
+    error: str
 
 
-class CstructIdaBridgeResult(TypedDict):
+class CstructIdaBridgeResult(TypedDict, total=False):
     ok: bool
     c_definition: str
     parsed: Any
     field_count: int
-    error: NotRequired[str]
+    error: str
 
 
 # ============================================================================
@@ -647,7 +647,7 @@ def cstruct_parse_c_definition(
         }
 
     except Exception as e:
-        return {**tool_error(e), "parsed": None, "bytes_consumed": 0, "struct_size": 0, "count": 0}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "parsed": None, "bytes_consumed": 0, "struct_size": 0, "count": 0}
 
 
 @tool
@@ -711,7 +711,7 @@ def cstruct_parse_at_address(
         }
 
     except Exception as e:
-        return {**tool_error(e), "parsed": None, "bytes_consumed": 0, "struct_size": 0, "count": 0}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "parsed": None, "bytes_consumed": 0, "struct_size": 0, "count": 0}
 
 
 @tool
@@ -766,7 +766,7 @@ def cstruct_define_struct(
         }
 
     except Exception as e:
-        return {**tool_error(e), "name": name, "struct_size": 0, "fields": [], "defined_types": []}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "name": name, "struct_size": 0, "fields": [], "defined_types": []}  # type: ignore[return-value]
 
 
 @tool
@@ -817,7 +817,7 @@ def cstruct_list_defined_structs(
         }
 
     except Exception as e:
-        return {**tool_error(e), "structs": [], "predefined_count": 0, "user_defined_count": 0}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "structs": [], "predefined_count": 0, "user_defined_count": 0}  # type: ignore[return-value]
 
 
 @tool
@@ -884,7 +884,7 @@ def cstruct_to_bytes(
         }
 
     except Exception as e:
-        return {**tool_error(e), "hex": "", "size": 0}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "hex": "", "size": 0}  # type: ignore[return-value]
 
 
 # ============================================================================
@@ -1121,4 +1121,4 @@ def cstruct_parse_ida_struct(
         }
 
     except Exception as e:
-        return {**tool_error(e), "c_definition": "", "parsed": None, "field_count": 0}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "c_definition": "", "parsed": None, "field_count": 0}  # type: ignore[return-value]

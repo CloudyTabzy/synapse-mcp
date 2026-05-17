@@ -419,6 +419,7 @@ def triton_reset() -> TritonResetResult:
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_reset failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -469,6 +470,7 @@ def triton_get_context_info() -> dict:
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_reset failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -502,6 +504,7 @@ def triton_symbolize_register(
     except IDAError as e:
         return {"ok": False, "register": register, "error": e.message}
     except Exception as e:
+        logger.exception("triton_symbolize_register failed")
         return {"ok": False, "register": register, "error": str(e)}
 
 
@@ -530,6 +533,7 @@ def triton_symbolize_memory(
     except IDAError as e:
         return {"ok": False, "address": address, "error": e.message}
     except Exception as e:
+        logger.exception("triton_symbolize_memory failed")
         return {"ok": False, "address": address, "error": str(e)}
 
 
@@ -591,6 +595,7 @@ def triton_set_concrete_register_value(
     except IDAError as e:
         return {"ok": False, "register": register, "error": e.message}
     except Exception as e:
+        logger.exception("triton_set_concrete_register_value failed")
         return {"ok": False, "register": register, "error": str(e)}
 
 
@@ -610,6 +615,7 @@ def triton_get_concrete_register_value(
     except IDAError as e:
         return {"ok": False, "register": register, "error": e.message}
     except Exception as e:
+        logger.exception("triton_set_concrete_register_value failed")
         return {"ok": False, "register": register, "error": str(e)}
 
 
@@ -635,6 +641,7 @@ def triton_set_concrete_memory_value(
     except IDAError as e:
         return {"ok": False, "address": address, "error": e.message}
     except Exception as e:
+        logger.exception("triton_set_concrete_memory_value failed")
         return {"ok": False, "address": address, "error": str(e)}
 
 
@@ -660,6 +667,7 @@ def triton_get_concrete_memory_value(
     except IDAError as e:
         return {"ok": False, "address": address, "error": e.message}
     except Exception as e:
+        logger.exception("triton_get_concrete_memory_value failed")
         return {"ok": False, "address": address, "error": str(e)}
 
 
@@ -876,6 +884,7 @@ def triton_get_symbolic_variables() -> dict:
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_reset failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -917,6 +926,7 @@ def triton_get_symbolic_expressions(
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_reset failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -956,6 +966,7 @@ def triton_get_path_constraints() -> dict:
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_reset failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -979,6 +990,7 @@ def triton_taint_register(
     except IDAError as e:
         return {"ok": False, "target": register, "error": e.message}
     except Exception as e:
+        logger.exception("triton_taint_register failed")
         return {"ok": False, "target": register, "error": str(e)}
 
 
@@ -998,6 +1010,7 @@ def triton_untaint_register(
     except IDAError as e:
         return {"ok": False, "target": register, "error": e.message}
     except Exception as e:
+        logger.exception("triton_untaint_register failed")
         return {"ok": False, "target": register, "error": str(e)}
 
 
@@ -1019,6 +1032,7 @@ def triton_taint_memory(
     except IDAError as e:
         return {"ok": False, "target": address, "error": e.message}
     except Exception as e:
+        logger.exception("triton_taint_memory failed")
         return {"ok": False, "target": address, "error": str(e)}
 
 
@@ -1040,6 +1054,7 @@ def triton_untaint_memory(
     except IDAError as e:
         return {"ok": False, "target": address, "error": e.message}
     except Exception as e:
+        logger.exception("triton_untaint_memory failed")
         return {"ok": False, "target": address, "error": str(e)}
 
 
@@ -1088,6 +1103,7 @@ def triton_is_register_tainted(
     except IDAError as e:
         return {"ok": False, "register": register, "error": e.message}
     except Exception as e:
+        logger.exception("triton_set_concrete_register_value failed")
         return {"ok": False, "register": register, "error": str(e)}
 
 
@@ -1108,6 +1124,7 @@ def triton_is_memory_tainted(
     except IDAError as e:
         return {"ok": False, "address": address, "error": e.message}
     except Exception as e:
+        logger.exception("triton_set_concrete_memory_value failed")
         return {"ok": False, "address": address, "error": str(e)}
 
 
@@ -1131,6 +1148,7 @@ def triton_get_taint_summary() -> TaintSummaryResult:
     except IDAError as e:
         return {"ok": False, "tainted_registers": [], "tainted_memory_addrs": [], "total_count": 0, "error": e.message}
     except Exception as e:
+        logger.exception("triton_get_taint_summary failed")
         return {"ok": False, "tainted_registers": [], "tainted_memory_addrs": [], "total_count": 0, "error": str(e)}
 
 
@@ -1240,6 +1258,7 @@ def triton_get_ast_expression(
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_get_ast_expression failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -1275,6 +1294,7 @@ def triton_simplify_expression(
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_simplify_expression failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -1306,6 +1326,7 @@ def triton_lift_to_smt(
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
+        logger.exception("triton_reset failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -1706,6 +1727,7 @@ def _try_solve_predicate(ctx: "TritonContext", timeout_ms: int) -> dict:
             result[alias] = hex(sm.getValue())
         return {"sat": True, "model": result, "solver_used": "z3"}
     except Exception as e:
+        logger.exception("triton_solve_path_constraints_inner failed")
         return {"sat": False, "model": {}, "error": str(e)}
 
 @tool
@@ -2303,15 +2325,69 @@ def triton_backward_slice(
     try:
         ctx = _get_ctx()
 
+        # First try as integer ID; ValueError means the string isn't a valid int
+        # TypeError means the ID was valid but no such variable exists — fall back to name
         try:
             sv = ctx.getSymbolicVariable(int(sym_var_id_or_name))
-        except (ValueError, TypeError):
-            sv = ctx.getSymbolicVariable(sym_var_id_or_name)
+        except ValueError:
+            # Not an integer — treat as a name directly
+            try:
+                sv = ctx.getSymbolicVariable(sym_var_id_or_name)
+            except TypeError:
+                # Name doesn't exist either
+                return {"ok": False, "error": f"Symbolic variable not found: {sym_var_id_or_name!r}"}
+        except TypeError:
+            # Integer ID was valid syntax but no such variable exists — try name as fallback
+            try:
+                sv = ctx.getSymbolicVariable(sym_var_id_or_name)
+            except TypeError:
+                return {"ok": False, "error": f"Symbolic variable not found: {sym_var_id_or_name!r}"}
 
         if sv is None:
             return {"ok": False, "error": f"Symbolic variable not found: {sym_var_id_or_name!r}"}
 
-        slice_result = ctx.sliceExpressions(sv)
+        # sliceExpressions() requires a SymbolicExpression, not a SymbolicVariable.
+        # Locate the current expression for this variable via its origin:
+        #   REGISTER_VARIABLE → origin is the register ID (key in getSymbolicRegisters())
+        #   MEMORY_VARIABLE   → origin is the memory address (arg to getSymbolicMemory())
+        var_origin = sv.getOrigin()
+        expr_to_slice = None
+
+        # Try register-based lookup first (most common case)
+        sym_regs = ctx.getSymbolicRegisters()  # dict[reg_id → SymbolicExpression]
+        expr_to_slice = sym_regs.get(var_origin)
+
+        # If not found in registers, try memory lookup
+        if expr_to_slice is None:
+            try:
+                # getSymbolicMemory(addr) returns the expression at that address
+                expr_to_slice = ctx.getSymbolicMemory(var_origin)
+            except Exception:
+                pass
+
+        # Last resort: scan all expressions for the first one whose AST references
+        # this variable by name (e.g. "SymVar_0" appears in the AST string)
+        if expr_to_slice is None:
+            sv_name = sv.getName()
+            for _, expr in ctx.getSymbolicExpressions().items():
+                try:
+                    if sv_name in str(expr.getAst()):
+                        expr_to_slice = expr
+                        break
+                except Exception:
+                    pass
+
+        if expr_to_slice is None:
+            return {
+                "ok": False,
+                "error": (
+                    f"Symbolic variable {sv.getName()!r} found but no SymbolicExpression "
+                    "references it. The register/memory may have been restored to a concrete "
+                    "value after symbolization. Try running more instructions before slicing."
+                ),
+            }
+
+        slice_result = ctx.sliceExpressions(expr_to_slice)
 
         entries = []
         for expr_id, expr in slice_result.items():

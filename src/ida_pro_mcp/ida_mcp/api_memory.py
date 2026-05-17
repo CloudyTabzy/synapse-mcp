@@ -21,6 +21,7 @@ from .utils import (
     parse_address,
     read_bytes_bss_safe,
     read_int_bss_safe,
+    item_error,
 )
 
 
@@ -85,7 +86,7 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
             data = " ".join(f"{x:#02x}" for x in raw)
             results.append({"addr": addr, "data": data})
         except Exception as e:
-            results.append({"addr": addr, "data": None, "error": str(e)})
+            results.append({"addr": addr, "data": None, **item_error(e, f"read {size} bytes at {addr}")})
 
     return results
 
@@ -156,7 +157,7 @@ def get_int(
                 {"addr": addr, "ty": normalized, "value": value}
             )
         except Exception as e:
-            results.append({"addr": addr, "ty": ty, "value": None, "error": str(e)})
+            results.append({"addr": addr, "ty": ty, "value": None, **item_error(e, f"read {ty} at {addr}")})
 
     return results
 
@@ -182,7 +183,7 @@ def get_string(
             value = raw.decode("utf-8", errors="replace")
             results.append({"addr": addr, "value": value})
         except Exception as e:
-            results.append({"addr": addr, "value": None, "error": str(e)})
+            results.append({"addr": addr, "value": None, **item_error(e, f"read string at {addr}")})
 
     return results
 
@@ -251,7 +252,7 @@ def get_global_value(
             value = get_global_variable_value_internal(ea)
             results.append({"query": query, "value": value})
         except Exception as e:
-            results.append({"query": query, "value": None, "error": str(e)})
+            results.append({"query": query, "value": None, **item_error(e, f"read global {query!r}")})
 
     return results
 
@@ -284,7 +285,7 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[PatchResult]:
             )
 
         except Exception as e:
-            results.append({"addr": patch.get("addr"), "size": 0, "error": str(e)})
+            results.append({"addr": patch.get("addr"), "size": 0, **item_error(e, f"patch bytes at {patch.get('addr', '?')}")})
 
     return results
 
@@ -333,7 +334,7 @@ def put_int(
                     "addr": addr,
                     "ty": ty,
                     "value": str(value_text) if value_text is not None else None,
-                    "error": str(e),
+                    **item_error(e, f"write {ty} at {addr}"),
                 }
             )
 

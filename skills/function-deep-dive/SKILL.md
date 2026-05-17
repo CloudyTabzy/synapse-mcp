@@ -1,214 +1,210 @@
 ---
 name: function-deep-dive
-description: Deep analysis of a single function in IDA Pro. Decompile, disassemble, trace cross-references, analyze control flow, examine the stack frame, and improve database quality with renames, comments, and type applications. Use when you need to thoroughly understand one function's behavior.
-allowed-tools: mcp__ida_pro_mcp__lookup_funcs, mcp__ida_pro_mcp__decompile, mcp__ida_pro_mcp__disasm, mcp__ida_pro_mcp__xrefs_to, mcp__ida_pro_mcp__xrefs_from, mcp__ida_pro_mcp__callees, mcp__ida_pro_mcp__callers, mcp__ida_pro_mcp__callgraph, mcp__ida_pro_mcp__basic_blocks, mcp__ida_pro_mcp__analyze_funcs, mcp__ida_pro_mcp__stack_frame, mcp__ida_pro_mcp__get_bytes, mcp__ida_pro_mcp__get_int, mcp__ida_pro_mcp__get_string, mcp__ida_pro_mcp__set_comments, mcp__ida_pro_mcp__rename, mcp__ida_pro_mcp__set_type, mcp__ida_pro_mcp__infer_types, mcp__ida_pro_mcp__int_convert, mcp__ida_pro_mcp__find_regex, mcp__ida_pro_mcp__py_eval, Bash, Read, Write, AskUserQuestion
+description: Thorough single-function analysis in IDA Pro. Decompile, disassemble, trace xrefs, analyze CFG, inspect stack frame, rename variables, apply types, and add comments. Use after binary-survey or stripped-binary-recovery has identified a target function.
+allowed-tools: mcp__ida_pro_mcp__lookup_funcs, mcp__ida_pro_mcp__decompile, mcp__ida_pro_mcp__disasm, mcp__ida_pro_mcp__xrefs_to, mcp__ida_pro_mcp__xrefs_query, mcp__ida_pro_mcp__basic_blocks, mcp__ida_pro_mcp__callgraph, mcp__ida_pro_mcp__stack_frame, mcp__ida_pro_mcp__find_regex, mcp__ida_pro_mcp__find_bytes, mcp__ida_pro_mcp__find, mcp__ida_pro_mcp__get_bytes, mcp__ida_pro_mcp__get_int, mcp__ida_pro_mcp__get_string, mcp__ida_pro_mcp__func_profile, mcp__ida_pro_mcp__analyze_function, mcp__ida_pro_mcp__rename, mcp__ida_pro_mcp__set_comments, mcp__ida_pro_mcp__declare_type, mcp__ida_pro_mcp__apply_type_batch, mcp__ida_pro_mcp__infer_type, mcp__ida_pro_mcp__declare_stack, mcp__ida_pro_mcp__patch_asm, mcp__ida_pro_mcp__int_convert, mcp__ida_pro_mcp__survey_binary, Bash, Read, Write, AskUserQuestion
 ---
 
 # function-deep-dive
 
-Thoroughly analyze a single function in IDA Pro. This skill walks through decompilation, disassembly, cross-reference analysis, control flow, stack frame examination, and database annotation.
+Perform a deep, systematic analysis of a single function in IDA Pro. This skill produces a comprehensive understanding of what the function does, how it interacts with the rest of the program, and improves the database quality through renaming, typing, and commenting.
 
 > **Tool prefix note**: MCP tool names depend on your client configuration. If your server is named differently, adjust the prefix accordingly.
 
+## When to use this skill
+
+- You have identified a specific function of interest (via survey, stripped recovery, or user direction)
+- You need to understand a function's logic, inputs, outputs, and side effects
+- You want to improve the database by adding types, comments, and better names
+
 ## Prerequisites
 
-- Target function address or name
-- IDA auto-analysis complete for the target function
+- Target function address or name is known
+- Auto-analysis is complete
 
 ## Instructions
 
-### 1. Resolve target address
-
-If given a name, resolve it:
+### 1. Resolve and profile the target
 
 ```
-mcp__ida_pro_mcp__lookup_funcs(queries="target_name")
+mcp__ida_pro_mcp__lookup_funcs(queries="<name_or_addr>")
+mcp__ida_pro_mcp__func_profile(queries="<addr>")
 ```
 
-If given an address string (hex), use `mcp__ida_pro_mcp__int_convert` to normalize it, then pass it directly.
+Record:
+- Exact address, size, and cross-reference count
+- Instruction count and basic block count
+- Caller count and callee count
+- Strings and non-trivial constants referenced
 
-Record the resolved address as `target_addr`.
-
-### 2. Decompile
-
-Call `mcp__ida_pro_mcp__decompile(addr=target_addr)` to get the Hex-Rays pseudocode.
-
-Read the output carefully and note:
-- **Function signature** — return type, parameter names/types
-- **Local variables** — names, types, array vs pointer distinctions
-- **Control flow** — loops, conditionals, switch statements
-- **API calls** — which imported functions are called and with what arguments
-- **String usage** — any string literals or format strings
-- **Global variable access** — reads/writes to data sections
-- **Arithmetic** — any integer operations that might overflow
-
-### 3. Disassemble
-
-Call `mcp__ida_pro_mcp__disasm(addr=target_addr)` to get the full assembly listing.
-
-Cross-reference with the decompilation:
-- Verify the compiler's optimizations (inlined functions, tail calls)
-- Look for anti-decompilation tricks (opaque predicates, overlapping instructions, fake returns)
-- Identify compiler-generated vs. hand-written code
-
-### 4. Cross-reference analysis
-
-#### 4a. Who calls this function?
+### 2. Decompile and inspect pseudocode
 
 ```
-mcp__ida_pro_mcp__xrefs_to(addrs=target_addr)
+mcp__ida_pro_mcp__decompile(addr="<addr>", include_addresses=true)
 ```
 
-Note each caller's address and context. Is this function called from:
-- Main logic?
-- A library initialization routine?
-- An export/DLL entry point?
-- A callback registration?
+Analyze:
+- **Function signature**: argument types, return type, calling convention
+- **Local variables**: buffers, counters, flags, structs
+- **Control flow**: loops, conditionals, switch statements
+- **External calls**: which APIs are invoked and with what arguments
+- **Attacker-controllable inputs**: which arguments or globals influence control flow
 
-#### 4b. What does this function call?
-
-```
-mcp__ida_pro_mcp__callees(addrs=target_addr)
-```
-
-Categorize callees:
-- **Imported APIs** (from `imports`) — external behavior
-- **Internal functions** — follow these for deeper analysis
-- **Library/runtime functions** — stdlib, CRT, C++ STL
-
-### 5. Control flow analysis
+### 3. Cross-check with disassembly
 
 ```
-mcp__ida_pro_mcp__basic_blocks(addrs=target_addr)
+mcp__ida_pro_mcp__disasm(addr="<addr>", max_instructions=200)
 ```
-
-Note:
-- Number of basic blocks
-- Cyclomatic complexity (blocks - edges + 2)
-- Unreachable blocks
-- Abnormal terminators (indirect jumps, exceptions)
-- Loop structures (back edges)
-
-For complex control flow, also call:
-
-```
-mcp__ida_pro_mcp__callgraph(roots=target_addr, max_depth=2)
-```
-
-### 6. Stack frame analysis
-
-```
-mcp__ida_pro_mcp__stack_frame(addrs=target_addr)
-```
-
-Note:
-- Total stack frame size
-- Buffer sizes (arrays, structs)
-- Saved registers
-- SEH frames (if present)
-- Alignment padding
 
 Look for:
-- Large stack buffers (>256 bytes) — potential stack overflow targets
-- Uninitialized variables used before assignment
-- Format string buffers
+- Anti-decompilation tricks (opaque predicates, bogus jumps)
+- Inline assembly or compiler intrinsics
+- Unusual instruction sequences not reflected in pseudocode
+- Manually verify critical logic that looks suspicious in the decompilation
 
-### 7. Data references
-
-Search for strings and constants referenced by this function:
+### 4. Trace callers and callees
 
 ```
-mcp__ida_pro_mcp__find_regex(queries={"pattern": "...", "scope": "function", "function": target_addr})
+mcp__ida_pro_mcp__xrefs_to(addrs="<addr>")
+mcp__ida_pro_mcp__callgraph(roots="<addr>", max_depth=2)
 ```
 
-Or use `mcp__ida_pro_mcp__get_string` at specific addresses found in the disassembly.
+Understand:
+- **Who calls this function?** How many callers? From what contexts?
+- **What does it call?** Deep callee chains may indicate complex logic
+- **Is it a callback?** Zero callers but referenced in a vtable or function pointer array
 
-### 8. Improve database quality
+### 5. Analyze control flow graph
 
-Based on all findings, improve the IDA database:
+```
+mcp__ida_pro_mcp__basic_blocks(addrs="<addr>")
+```
+
+Note:
+- Cyclomatic complexity (number of independent paths)
+- Deeply nested conditions (possible state machines)
+- Unreachable or suspiciously empty basic blocks (obfuscation hints)
+- Back edges (loops)
+
+### 6. Inspect stack frame
+
+```
+mcp__ida_pro_mcp__stack_frame(addrs="<addr>")
+```
+
+Look for:
+- **Large buffers** (>64 bytes) — potential stack overflow targets
+- **SEH frames** — exception handling setup
+- **Alignment gaps** — compiler padding or optimization artifacts
+- **Struct layouts** — arrays of objects, nested structures
+
+### 7. Trace data sources
+
+Find where key values come from:
+
+- **String references**: `find_regex` near the function address for error messages, format strings
+- **Constant references**: `find_bytes` for magic numbers, crypto constants
+- **Global variables**: `get_bytes` / `get_int` at addresses referenced by the function
+
+```
+mcp__ida_pro_mcp__get_bytes(addrs="0x406000")
+mcp__ida_pro_mcp__get_string(addrs="0x406100")
+```
+
+### 8. Rename and type the function
 
 #### 8a. Rename the function
 
 ```
-mcp__ida_pro_mcp__rename(batch={"func": [{"address": target_addr, "name": "descriptive_name"}]})
+mcp__ida_pro_mcp__rename(batch={"func": [{"address": "<addr>", "name": "descriptive_name"}]})
 ```
 
-Use a descriptive name that captures the function's purpose (e.g., `encrypt_payload`, `parse_config_file`, `validate_license_key`).
+Naming conventions:
+- `process_xxx` — main logic / state machine
+- `parse_xxx` / `decode_xxx` — format conversion
+- `init_xxx` / `setup_xxx` — initialization
+- `handle_xxx` / `on_xxx` — event/callback handlers
+- `check_xxx` / `validate_xxx` — input validation
+- `encrypt_xxx` / `hash_xxx` — crypto routines
 
-#### 8b. Rename variables and arguments
-
-```
-mcp__ida_pro_mcp__rename(batch={"local": [{"function": target_addr, "old_name": "a1", "new_name": "input_buffer"}]})
-```
-
-#### 8c. Apply types
-
-```
-mcp__ida_pro_mcp__set_type(edits=[{"address": target_addr, "type": "int __cdecl decrypt_payload(char *src, size_t len, char *dst)"}])
-```
-
-#### 8d. Add comments
+#### 8b. Apply argument types
 
 ```
-mcp__ida_pro_mcp__set_comments(items=[{"address": target_addr, "comment": "Main decryption loop — XOR with rolling key 0x41"}])
+mcp__ida_pro_mcp__apply_type_batch(batch=[
+    {"type": "int (__fastcall *)(const char *, size_t)", "target": "<addr>", "target_type": "function"}
+])
 ```
 
-Add comments at:
-- Function entry (overview)
-- Each major loop
-- Each API call (explain why it's called)
-- Each conditional branch (explain the decision)
-- Each suspicious instruction
+#### 8c. Create/stack variable types
 
-### 9. Generate analysis report
+```
+mcp__ida_pro_mcp__declare_stack(items=[
+    {"func": "<addr>", "offset": -0x20, "name": "buffer", "type": "char[64]"}
+])
+```
 
-Write a markdown report to `./reports/function_analysis_<function_name>.md`:
+### 9. Add comments
+
+```
+mcp__ida_pro_mcp__set_comments(items=[
+    {"address": "<addr>", "comment": "Entry point: validates header magic"},
+    {"address": "<addr>+0x45", "comment": "Loop: processes each record in the table"}
+])
+```
+
+Comment strategically:
+- **Function header**: one-line summary of purpose
+- **Loops**: iteration variable and termination condition
+- **Branches**: what condition is being tested
+- **External calls**: what API does and why it's called
+- **Crypto**: algorithm name, key size, mode
+
+### 10. Generate analysis report
+
+Write a markdown report to `./reports/function_analysis_<name>.md`:
 
 ```markdown
 # Function Analysis: <name>
 
+## Metadata
+| Property | Value |
+|---|---|
+| Address | ... |
+| Size | ... bytes |
+| Instructions | ... |
+| Basic Blocks | ... |
+| Callers | ... |
+| Callees | ... |
+
 ## Signature
 ```c
-<decompiled signature>
+<return_type> <name>(<args>);
 ```
 
-## Overview
-<1-2 paragraph summary of what this function does>
-
-## Cross References
-### Callers
-| Address | Function | Context |
-|---|---|---|
-| ... | ... | ... |
-
-### Callees
-| Address | Function | Purpose |
-|---|---|---|
-| ... | ... | ... |
+## Summary
+<1-paragraph description of what the function does>
 
 ## Control Flow
-- Basic blocks: N
-- Cyclomatic complexity: N
-- Loops: <description>
-- Key branches: <description>
+- Entry checks: ...
+- Main loop: ...
+- Exit path: ...
 
-## Stack Frame
-| Variable | Offset | Size | Type | Notes |
-|---|---|---|---|---|
-| ... | ... | ... | ... | ... |
+## External APIs Called
+| Address | API | Purpose |
+|---|---|---|
+| ... | ... | ... |
 
-## Key Behaviors
-1. <behavior 1>
-2. <behavior 2>
+## Inputs and Outputs
+- **Inputs**: ...
+- **Outputs**: ...
+- **Side effects**: ...
 
-## Suspicious / Notable
-- <anything unusual>
+## Security Relevance
+- <any vulnerability hints, buffer handling, untrusted input paths>
 
-## Improvements Made
-- Renamed function to: ...
-- Renamed variables: ...
-- Applied types: ...
-- Added comments at: ...
+## Database Changes Applied
+- Renamed to: `<name>`
+- Types applied: ...
+- Comments added at: ...
 ```
 
-Present the report to the user.
+Present the report and ask: "Would you like to trace data flow from this function, patch it, or analyze a related function?"

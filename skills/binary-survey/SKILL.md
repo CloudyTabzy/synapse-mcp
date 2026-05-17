@@ -1,7 +1,7 @@
 ---
 name: binary-survey
 description: Initial reconnaissance and survey of a binary loaded in IDA Pro. Use when first opening a file to understand its structure, entry points, imports, strings, exports, and key functions. Produces a structured markdown survey report.
-allowed-tools: mcp__ida_pro_mcp__get_metadata, mcp__ida_pro_mcp__list_segments, mcp__ida_pro_mcp__get_entry_points, mcp__ida_pro_mcp__imports, mcp__ida_pro_mcp__exports, mcp__ida_pro_mcp__find_regex, mcp__ida_pro_mcp__list_funcs, mcp__ida_pro_mcp__list_globals, mcp__ida_pro_mcp__lookup_funcs, mcp__ida_pro_mcp__decompile, mcp__ida_pro_mcp__disasm, mcp__ida_pro_mcp__int_convert, mcp__ida_pro_mcp__get_bytes, mcp__ida_pro_mcp__get_string, mcp__ida_pro_mcp__basic_blocks, mcp__ida_pro_mcp__callgraph, mcp__ida_pro_mcp__xrefs_to, mcp__ida_pro_mcp__analyze_funcs, Bash, Read, Write, AskUserQuestion
+allowed-tools: mcp__ida_pro_mcp__survey_binary, mcp__ida_pro_mcp__imports, mcp__ida_pro_mcp__export_funcs, mcp__ida_pro_mcp__find_regex, mcp__ida_pro_mcp__find_bytes, mcp__ida_pro_mcp__find, mcp__ida_pro_mcp__list_funcs, mcp__ida_pro_mcp__list_globals, mcp__ida_pro_mcp__lookup_funcs, mcp__ida_pro_mcp__decompile, mcp__ida_pro_mcp__disasm, mcp__ida_pro_mcp__int_convert, mcp__ida_pro_mcp__get_bytes, mcp__ida_pro_mcp__get_string, mcp__ida_pro_mcp__basic_blocks, mcp__ida_pro_mcp__callgraph, mcp__ida_pro_mcp__xrefs_to, mcp__ida_pro_mcp__analyze_function, mcp__ida_pro_mcp__scan_signature, mcp__ida_pro_mcp__filetype_identify_buffer, mcp__ida_pro_mcp__filetype_identify_ida_segment, mcp__ida_pro_mcp__filetype_list_supported, Bash, Read, Write, AskUserQuestion
 ---
 
 # binary-survey
@@ -19,18 +19,20 @@ Perform initial reconnaissance on a binary loaded in IDA Pro. This skill produce
 
 ### 1. Gather metadata
 
-Read the IDB metadata resource to get the binary's basic info:
+Read the IDB metadata resources and run `survey_binary` for a one-shot triage:
 
 ```
 Read("ida://idb/metadata")
 Read("ida://idb/segments")
 Read("ida://idb/entrypoints")
+mcp__ida_pro_mcp__survey_binary(detail_level="standard")
 ```
 
 Record:
-- Architecture, bitness, base address, image size
+- Architecture, bitness, base address, image size, compiler, MD5/SHA256
 - Number of segments and their permissions
 - Entry points (main, TLS callbacks, exports, etc.)
+- Top strings/functions by xref count, import categories
 
 ### 2. Enumerate imports
 
@@ -53,9 +55,22 @@ Also note any `LoadLibraryA` + `GetProcAddress` pairs that may indicate dynamic 
 
 ### 3. Enumerate exports
 
-Call `mcp__ida_pro_mcp__exports` (or read `ida://exports`) to list exported functions. These are externally callable entry points — especially relevant for DLLs.
+Call `mcp__ida_pro_mcp__export_funcs` to list exported functions. These are externally callable entry points — especially relevant for DLLs.
 
-### 4. Search strings
+```
+mcp__ida_pro_mcp__export_funcs(addrs="*")
+```
+
+### 4. File type identification (optional)
+
+If analyzing embedded blobs or unknown segments, use `filetype`:
+
+```
+mcp__ida_pro_mcp__filetype_identify_ida_segment(segment_name=".rsrc")
+mcp__ida_pro_mcp__filetype_identify_buffer(address="0x405000", size=256)
+```
+
+### 5. Search strings
 
 Use `mcp__ida_pro_mcp__find_regex` to search for interesting indicators:
 
@@ -68,7 +83,7 @@ Use `mcp__ida_pro_mcp__find_regex` to search for interesting indicators:
 
 Use a limit of 100–200 per search to avoid token bloat. Focus on unique/distinctive strings.
 
-### 5. List and triage functions
+### 6. List and triage functions
 
 Call `mcp__ida_pro_mcp__list_funcs` to get the function list. Identify:
 
@@ -80,12 +95,12 @@ Call `mcp__ida_pro_mcp__list_funcs` to get the function list. Identify:
 
 For the top 5–10 most interesting functions, call `mcp__ida_pro_mcp__lookup_funcs` to get their addresses and basic info.
 
-### 6. Quick decompile of key functions
+### 7. Quick analysis of key functions
 
-Decompile the most interesting functions identified in step 5:
+Analyze the most interesting functions identified in step 6:
 
 ```
-mcp__ida_pro_mcp__decompile(addr="main")
+mcp__ida_pro_mcp__analyze_function(addr="main")
 mcp__ida_pro_mcp__decompile(addr="DllMain")
 ```
 
@@ -94,16 +109,21 @@ For each, note:
 - Whether it handles attacker-controllable input
 - Any obvious crypto, encoding, or obfuscation patterns
 
-### 7. Identify interesting code patterns
+### 8. Identify interesting code patterns
 
-Use `mcp__ida_pro_mcp__find_bytes` or `mcp__ida_pro_mcp__find_insns` to detect:
+Use `mcp__ida_pro_mcp__find_bytes` or `mcp__ida_pro_mcp__find` to detect:
 
 - **Anti-debug**: `64 A1 30 00 00 00` (mov eax, fs:[30h] → PEB), followed by `0F B6 40 02` (movzx eax, byte ptr [eax+2] → BeingDebugged)
 - **SEH setup**: `64 8B 0D 00 00 00 00` (mov ecx, fs:[0])
 - **Common crypto constants**: S-boxes, IVs, lookup tables
 - **Common instruction patterns**: `rdtsc`, `cpuid`, `int3`, `int 2dh`
 
-### 8. Generate survey report
+Also scan for known signatures:
+```
+mcp__ida_pro_mcp__scan_signature(pattern="48 8B ?? ??")
+```
+
+### 9. Generate survey report
 
 Write a markdown report to `./reports/binary_survey.md` with the following structure:
 
@@ -119,6 +139,7 @@ Write a markdown report to `./reports/binary_survey.md` with the following struc
 | Base Address | ... |
 | Image Size | ... |
 | Compiler | ... |
+| SHA256 | ... |
 
 ## Segments
 | Name | Start | End | Size | Permissions |

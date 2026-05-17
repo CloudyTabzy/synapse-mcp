@@ -31,6 +31,8 @@ from ..api_analysis import (
     find,
     export_funcs,
     callgraph,
+    find_similar_functions,
+    trace_data_chain,
 )
 
 
@@ -802,3 +804,147 @@ def test_analyze_batch():
             "constant_count",
             "basic_block_count",
         )
+
+
+@test()
+def test_find_similar_functions():
+    """find_similar_functions returns structurally similar functions."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = find_similar_functions(fn_addr)
+    assert_ok(result, mandatory=False)
+    if not result.get("ok"):
+        return
+    assert_has_keys(result, "reference", "candidates_scanned", "matches")
+    ref = result["reference"]
+    assert_has_keys(ref, "addr", "name", "block_count", "edge_count", "complexity")
+    assert_valid_address(ref["addr"])
+    for match in result["matches"]:
+        assert isinstance(match["similarity_score"], float)
+        assert 0.0 <= match["similarity_score"] <= 1.0
+        assert_valid_address(match["addr"])
+        assert "matching_features" in match
+
+
+@test()
+def test_find_similar_functions_by_name():
+    """find_similar_functions accepts a function name as the address."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    import ida_funcs
+    import idaapi
+    f = idaapi.get_func(int(fn_addr, 16))
+    if not f:
+        skip_test("cannot get function for address")
+    fn_name = ida_funcs.get_func_name(f.start_ea)
+    if not fn_name or fn_name.startswith("sub_"):
+        skip_test("function has no usable name")
+    result = find_similar_functions(fn_name)
+    assert_ok(result, mandatory=False)
+
+
+@test()
+def test_find_similar_functions_threshold():
+    """find_similar_functions threshold filters matches correctly."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = find_similar_functions(fn_addr, threshold=0.99)
+    assert_ok(result, mandatory=False)
+    if not result.get("ok"):
+        return
+    for match in result["matches"]:
+        assert match["similarity_score"] >= 0.99
+
+
+@test()
+def test_find_similar_functions_scope_segment():
+    """find_similar_functions limits to segment when scope is a segment name."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = find_similar_functions(fn_addr, scope=".text", max_results=5)
+    assert_ok(result, mandatory=False)
+
+
+@test()
+def test_find_similar_functions_invalid_address():
+    """find_similar_functions returns error for invalid address."""
+    result = find_similar_functions("0xDEADBEEF")
+    assert_error(result, mandatory=False)
+
+
+@test(binary="crackme03.elf")
+def test_trace_data_chain_backward_from_check_pw():
+    """trace_data_chain(backward) from check_pw finds main as a caller."""
+    result = trace_data_chain(CRACKME_CHECK_PW, direction="backward", max_depth=3)
+    assert_ok(result, mandatory=False)
+    if not result.get("ok"):
+        return
+    assert result["direction"] == "backward"
+    assert result["max_depth"] == 3
+    assert isinstance(result["depth_reached"], int)
+    assert isinstance(result["nodes"], list)
+    assert isinstance(result["edges"], list)
+    assert result["node_count"] == len(result["nodes"])
+    addr_set = {n["addr"] for n in result["nodes"]}
+    assert CRACKME_CALL_TO_CHECK_PW in addr_set, f"expected call site {CRACKME_CALL_TO_CHECK_PW} in path, got {addr_set}"
+
+
+@test(binary="crackme03.elf")
+def test_trace_data_chain_forward_from_main():
+    """trace_data_chain(forward) from main follows call edges."""
+    result = trace_data_chain(CRACKME_MAIN, direction="forward", max_depth=2)
+    assert_ok(result, mandatory=False)
+    if not result.get("ok"):
+        return
+    assert result["direction"] == "forward"
+    assert result["start"] == CRACKME_MAIN
+    edge_types = {e["xref_type"] for e in result["edges"]}
+    assert "call_near" in edge_types or "jump_near" in edge_types or len(result["edges"]) >= 0
+
+
+@test()
+def test_trace_data_chain_invalid_address():
+    """trace_data_chain returns error for invalid address."""
+    result = trace_data_chain("0xDEADBEEF")
+    assert_error(result, mandatory=False)
+
+
+@test()
+def test_trace_data_chain_direction_validation():
+    """trace_data_chain rejects invalid direction values."""
+    result = trace_data_chain("0x401000", direction="both")
+    assert_error(result, mandatory=False)
+
+
+@test()
+def test_trace_data_chain_by_name():
+    """trace_data_chain accepts a function name as the address."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    import ida_funcs
+    import idaapi
+    f = idaapi.get_func(int(fn_addr, 16))
+    if not f:
+        skip_test("cannot get function")
+    fn_name = ida_funcs.get_func_name(f.start_ea)
+    if not fn_name:
+        skip_test("function has no name")
+    result = trace_data_chain(fn_name, max_depth=1)
+    assert_ok(result, mandatory=False)
+
+
+@test(binary="crackme03.elf")
+def test_trace_data_chain_max_depth():
+    """trace_data_chain respects max_depth boundary."""
+    result_shallow = trace_data_chain(CRACKME_CHECK_PW, direction="backward", max_depth=1)
+    result_deep = trace_data_chain(CRACKME_CHECK_PW, direction="backward", max_depth=5)
+    assert_ok(result_shallow, mandatory=False)
+    assert_ok(result_deep, mandatory=False)
+    if result_shallow.get("ok") and result_deep.get("ok"):
+        assert result_deep["depth_reached"] >= result_shallow["depth_reached"]

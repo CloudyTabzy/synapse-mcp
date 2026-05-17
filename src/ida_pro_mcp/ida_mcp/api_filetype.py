@@ -39,26 +39,26 @@ from .utils import parse_address, read_bytes_bss_safe, tool_error
 # ============================================================================
 
 
-class FiletypeStatusResult(TypedDict):
+class FiletypeStatusResult(TypedDict, total=False):
     available: bool
     version: str
     supported_types_count: int
 
 
-class FiletypeIdentifyResult(TypedDict):
+class FiletypeIdentifyResult(TypedDict, total=False):
     ok: bool
     extension: str
     mime: str
     category: str
     confidence: str
-    error: NotRequired[str]
+    error: str
 
 
-class FiletypeListResult(TypedDict):
+class FiletypeListResult(TypedDict, total=False):
     ok: bool
     types: list[dict[str, str]]
     total: int
-    error: NotRequired[str]
+    error: str
 
 
 # ============================================================================
@@ -185,7 +185,7 @@ def filetype_identify_buffer(
         result["confidence"] = "signature" if kind else "none"
         return result  # type: ignore[return-value]
     except Exception as e:
-        return {**tool_error(e), "extension": "", "mime": "", "category": "", "confidence": ""}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "extension": "", "mime": "", "category": "", "confidence": ""}  # type: ignore[return-value]
 
 
 @tool
@@ -245,7 +245,7 @@ def filetype_identify_ida_segment(
         result["confidence"] = "signature" if kind else "none"
         return result  # type: ignore[return-value]
     except Exception as e:
-        return {**tool_error(e), "extension": "", "mime": "", "category": "", "confidence": ""}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "extension": "", "mime": "", "category": "", "confidence": ""}  # type: ignore[return-value]
 
 
 @tool
@@ -287,4 +287,4 @@ def filetype_list_supported(
             "total": len(types),
         }
     except Exception as e:
-        return {**tool_error(e), "types": [], "total": 0}  # type: ignore[return-value]
+        return {"ok": False, "error": str(e), "types": [], "total": 0}  # type: ignore[return-value]

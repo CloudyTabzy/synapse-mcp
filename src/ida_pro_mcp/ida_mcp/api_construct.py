@@ -39,7 +39,7 @@ try:
         # Context
         this, len_,
         # Containers / errors
-        Container, StreamError, ConstError, FormatFieldError,
+        Container, StreamError, ConstError, FormatFieldError, SizeofError,
     )
     CONSTRUCT_AVAILABLE = True
 except ImportError:
@@ -52,7 +52,7 @@ except ImportError:
 
 from .rpc import tool, unsafe
 from .sync import idasync, IDAError
-from .utils import parse_address, read_bytes_bss_safe, tool_error
+from .utils import parse_address, read_bytes_bss_safe
 
 # ============================================================================
 # Safe DSL Evaluator
@@ -207,7 +207,7 @@ def _compile_dsl(source: str) -> Any:
 # PE templates ----------------------------------------------------------------
 
 _PE_DOS_HEADER = Struct(
-    "e_magic" / Const(b"MZ"),
+    "e_magic" / Bytes(2),
     "e_cblp" / Int16ul,
     "e_cp" / Int16ul,
     "e_crlc" / Int16ul,
@@ -562,6 +562,23 @@ def _read_file_bytes(path: str, offset: int, size: int) -> bytes:
         return f.read(size)
 
 
+def _sizeof_parsed(template: Any, result: Any) -> int:
+    """Get the size of a parsed result. Tries multiple strategies."""
+    try:
+        return result.sizeof()
+    except (SizeofError, AttributeError, TypeError):
+        pass
+    try:
+        return template.sizeof()
+    except (SizeofError, AttributeError, TypeError):
+        pass
+    try:
+        return template.sizeof(result)
+    except (SizeofError, AttributeError, TypeError):
+        pass
+    return 0
+
+
 def _parse_from_source(
     template: Any,
     address: str = "",
@@ -578,11 +595,17 @@ def _parse_from_source(
         ea = parse_address(address)
         raw = read_bytes_bss_safe(ea, size_hint)
         result = template.parse(raw)
-        return _container_to_dict(result), len(raw)
+        consumed = _sizeof_parsed(template, result)
+        if consumed == 0:
+            consumed = len(raw)
+        return _container_to_dict(result), consumed
     elif file_path:
         raw = _read_file_bytes(file_path, file_offset, size_hint)
         result = template.parse(raw)
-        return _container_to_dict(result), len(raw)
+        consumed = _sizeof_parsed(template, result)
+        if consumed == 0:
+            consumed = len(raw)
+        return _container_to_dict(result), consumed
     else:
         raise ValueError("Either address or file_path must be provided.")
 
@@ -609,68 +632,68 @@ def _get_pe_optional_header_type(pe_file_path: str | None = None) -> Any:
 # TypedDict result types
 # ============================================================================
 
-class ConstructStatusResult(TypedDict):
+class ConstructStatusResult(TypedDict, total=False):
     available: bool
     version: str
     templates_loaded: int
-    install_hint: NotRequired[str]
+    install_hint: str
 
 
-class ConstructParseResult(TypedDict):
+class ConstructParseResult(TypedDict, total=False):
     ok: bool
-    parsed: NotRequired[dict[str, Any]]
-    bytes_consumed: NotRequired[int]
-    template: NotRequired[str]
-    error: NotRequired[str]
+    parsed: dict[str, Any]
+    bytes_consumed: int
+    template: str
+    error: str
 
 
-class ConstructBuildResult(TypedDict):
+class ConstructBuildResult(TypedDict, total=False):
     ok: bool
-    hex: NotRequired[str]
-    size: NotRequired[int]
-    patched_at: NotRequired[str]
-    error: NotRequired[str]
+    hex: str
+    size: int
+    patched_at: str
+    error: str
 
 
-class ConstructParseIdaStructResult(TypedDict):
+class ConstructParseIdaStructResult(TypedDict, total=False):
     ok: bool
-    struct_name: NotRequired[str]
-    address: NotRequired[str]
-    parsed: NotRequired[list[dict[str, Any]]]
-    construct_template: NotRequired[str]
-    error: NotRequired[str]
+    struct_name: str
+    address: str
+    parsed: list[dict[str, Any]]
+    construct_template: str
+    error: str
 
 
-class ConstructGuessResult(TypedDict):
+class ConstructGuessResult(TypedDict, total=False):
     ok: bool
-    guessed_template: NotRequired[str]
-    fields: NotRequired[list[dict[str, Any]]]
-    note: NotRequired[str]
-    error: NotRequired[str]
+    guessed_template: str
+    fields: list[dict[str, Any]]
+    note: str
+    error: str
 
 
-class ConstructBatchParseResult(TypedDict):
+class ConstructBatchParseResult(TypedDict, total=False):
     ok: bool
-    count: NotRequired[int]
-    elements: NotRequired[list[dict[str, Any]]]
-    total_bytes: NotRequired[int]
-    error: NotRequired[str]
+    count: int
+    elements: list[dict[str, Any]]
+    total_bytes: int
+    error: str
 
 
-class ConstructProtocolResult(TypedDict):
+class ConstructProtocolResult(TypedDict, total=False):
     ok: bool
-    protocol: NotRequired[str]
-    parsed: NotRequired[dict[str, Any]]
-    header_length: NotRequired[int]
-    error: NotRequired[str]
+    protocol: str
+    parsed: dict[str, Any]
+    header_length: int
+    error: str
 
 
-class ConstructScanResult(TypedDict):
+class ConstructScanResult(TypedDict, total=False):
     ok: bool
-    matches: NotRequired[list[dict[str, Any]]]
-    scan_attempts: NotRequired[int]
-    region_size: NotRequired[int]
-    error: NotRequired[str]
+    matches: list[dict[str, Any]]
+    scan_attempts: int
+    region_size: int
+    error: str
 
 
 # ============================================================================
@@ -734,10 +757,13 @@ def construct_parse_pe_headers(
             dos_raw = f.read(64)
             dos = _PE_DOS_HEADER.parse(dos_raw)
 
+            if dos.e_magic != b"MZ":
+                return {"ok": False, "error": f"Not a PE file: DOS magic is {dos.e_magic!r}, expected b'MZ'. Did you mean construct_parse_elf_headers?"}
+
             f.seek(dos.e_lfanew)
             sig = f.read(4)
             if sig != b"PE\x00\x00":
-                return {"ok": False, "error": f"Invalid PE signature at e_lfanew={dos.e_lfanew}: {sig!r}"}
+                return {"ok": False, "error": f"Invalid PE signature at e_lfanew={dos.e_lfanew}: {sig!r}. This file may be ELF or another format."}
 
             file_hdr_raw = f.read(20)
             file_hdr = _PE_FILE_HEADER.parse(file_hdr_raw)
@@ -755,6 +781,8 @@ def construct_parse_pe_headers(
 
         if include_data_dirs:
             result["data_directories"] = result["optional_header"].pop("DataDirectory", [])
+        else:
+            result["optional_header"].pop("DataDirectory", [])
 
         if include_sections:
             with open(path, "rb") as f:
@@ -777,9 +805,13 @@ def construct_parse_pe_headers(
             "template": "PE_HEADER",
         }
 
+    except ConstError as e:
+        return {"ok": False, "error": f"PE format error: expected DOS magic b'MZ' but got {e}"}
+    except (StreamError, FormatFieldError) as e:
+        return {"ok": False, "error": f"PE parse error: {e}"}
     except Exception as e:
         logger.exception("construct_parse_pe_headers failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 @tool
@@ -869,7 +901,7 @@ def construct_parse_elf_headers(
 
     except Exception as e:
         logger.exception("construct_parse_elf_headers failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 # ============================================================================
@@ -910,11 +942,13 @@ def construct_parse_custom_struct(
         }
     except DSLSecurityError as e:
         return {"ok": False, "error": f"DSL security error: {e}"}
-    except (StreamError, ConstError, FormatFieldError) as e:
-        return {"ok": False, "error": f"Parse error — template may not match data: {e}"}
+    except ConstError as e:
+        return {"ok": False, "error": f"Parse error — struct field mismatch: {e}"}
+    except (StreamError, FormatFieldError) as e:
+        return {"ok": False, "error": f"Parse error: {e}"}
     except Exception as e:
         logger.exception("construct_parse_custom_struct failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 @tool
@@ -962,7 +996,7 @@ def construct_build_struct(
         return {"ok": False, "error": f"DSL security error: {e}"}
     except Exception as e:
         logger.exception("construct_build_struct failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 # ============================================================================
@@ -1090,7 +1124,7 @@ def _ida_struct_to_construct(struct_name: str, ptr_size: int) -> Any | None:
         # Try union
         if tif.get_named_type(None, struct_name, ida_typeinf.BTF_UNION):
             return _ida_type_to_construct(tif, ptr_size)
-    except Exception:
+    except Exception as e:
         logger.exception("_ida_struct_to_construct failed for %r", struct_name)
     return None
 
@@ -1162,7 +1196,7 @@ def construct_parse_ida_struct(
 
     except Exception as e:
         logger.exception("construct_parse_ida_struct failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 # ============================================================================
@@ -1327,7 +1361,7 @@ def construct_guess_struct(
 
     except Exception as e:
         logger.exception("construct_guess_struct failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 # ============================================================================
@@ -1387,9 +1421,10 @@ def construct_batch_parse_array(
                     break
 
             try:
-                elem_size = template.sizeof(result)
+                elem_size = _sizeof_parsed(template, result)
             except Exception:
-                # Fallback: estimate size from parsed fields
+                elem_size = 1
+            if elem_size == 0:
                 elem_size = 1
 
             elements.append({
@@ -1416,7 +1451,7 @@ def construct_batch_parse_array(
         return {"ok": False, "error": f"DSL security error: {e}"}
     except Exception as e:
         logger.exception("construct_batch_parse_array failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 # ============================================================================
@@ -1486,7 +1521,7 @@ def construct_extract_protocol_header(
 
     except Exception as e:
         logger.exception("construct_extract_protocol_header failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}
 
 
 # ============================================================================
@@ -1569,10 +1604,9 @@ def construct_scan_for_structs(
                         continue
 
                 # Try to get consumed size
-                try:
-                    consumed = template.sizeof(result)
-                except Exception:
-                    consumed = 0
+                consumed = _sizeof_parsed(template, result)
+                if consumed == 0:
+                    consumed = template.sizeof()
 
                 matches.append({
                     "address": hex(start_ea + offset),
@@ -1596,4 +1630,4 @@ def construct_scan_for_structs(
         return {"ok": False, "error": f"DSL security error: {e}"}
     except Exception as e:
         logger.exception("construct_scan_for_structs failed")
-        return {**tool_error(e), "ok": False}
+        return {"ok": False, "error": str(e)}

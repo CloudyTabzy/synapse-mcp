@@ -77,14 +77,15 @@ class SurveyImportsByCategory(TypedDict):
     other: list[SurveyImportEntry]
 
 
-class SurveyCallGraphSummary(TypedDict):
+class SurveyCallGraphSummary(TypedDict, total=False):
     total_edges: int
-    max_depth_estimate: None
+    max_depth_estimate: int | None
     root_functions: list[str]
     leaf_functions_count: int
 
 
 class SurveyBinaryResult(TypedDict, total=False):
+    ok: bool
     metadata: SurveyMetadata
     statistics: SurveyStatistics
     segments: list[SurveySegmentInfo]
@@ -94,6 +95,7 @@ class SurveyBinaryResult(TypedDict, total=False):
     imports_by_category: SurveyImportsByCategory
     call_graph_summary: SurveyCallGraphSummary
     _note: str
+    error: str
 
 # Max functions to iterate for xref counting on large binaries.
 _MAX_FUNC_ITER = 10_000

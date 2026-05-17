@@ -13,6 +13,7 @@ import ida_idaapi
 import ida_xref
 import ida_ua
 import ida_name
+import idc
 from .rpc import tool
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
@@ -44,6 +45,8 @@ from .utils import (
     InsnPattern,
     FuncProfileQuery,
     AnalyzeBatchQuery,
+    tool_error,
+    item_error,
 )
 from . import compat
 
@@ -772,7 +775,7 @@ def decompile(
             pass
         return result
     except Exception as e:
-        return {"addr": addr, "code": None, "error": str(e)}
+        return {"addr": addr, "code": None, **item_error(e, f"decompile at {addr}")}
 
 
 @tool
@@ -920,8 +923,8 @@ def disasm(
         return {
             "addr": addr,
             "asm": None,
-            "error": str(e),
             "cursor": {"done": True},
+            **item_error(e, f"disassemble at {addr}"),
         }
 
 
@@ -1209,7 +1212,7 @@ def analyze_batch(
                     "addr": hex(start_ea),
                     "name": None,
                     "analysis": None,
-                    "error": str(e),
+                    **item_error(e, f"profile function {q}"),
                 }
             )
 
@@ -1252,7 +1255,7 @@ def xrefs_to(
                 )
             results.append({"addr": addr, "xrefs": xrefs, "more": more})
         except Exception as e:
-            results.append({"addr": addr, "xrefs": None, "error": str(e)})
+            results.append({"addr": addr, "xrefs": None, **item_error(e, f"xrefs to {addr}")})
 
     return results
 
@@ -1370,7 +1373,7 @@ def xref_query(
                     "data": [],
                     "next_offset": None,
                     "total": 0,
-                    "error": str(e),
+                    **item_error(e, f"xref query for {q!r}"),
                 }
             )
 
@@ -1459,7 +1462,7 @@ def xrefs_to_field(
                     "struct": struct_name,
                     "field": field_name,
                     "xrefs": [],
-                    "error": str(e),
+                    **item_error(e, f"xrefs to {struct_name}.{field_name}"),
                 }
             )
 
@@ -1543,7 +1546,7 @@ def callees(
                 }
             )
         except Exception as e:
-            results.append({"addr": fn_addr, "callees": None, "error": str(e)})
+            results.append({"addr": fn_addr, "callees": None, **item_error(e, f"get callees of {fn_addr}")})
 
     return results
 
@@ -1620,7 +1623,7 @@ def find_bytes(
                     "matches": [],
                     "n": 0,
                     "cursor": {"done": True},
-                    "error": str(e),
+                    **item_error(e, f"find bytes pattern {pattern!r}"),
                 }
             )
             continue
@@ -1708,9 +1711,9 @@ def basic_blocks(
             results.append(
                 {
                     "addr": fn_addr,
-                    "error": str(e),
                     "blocks": [],
                     "cursor": {"done": True},
+                    **item_error(e, f"get basic blocks of {fn_addr}"),
                 }
             )
     return results
@@ -1896,7 +1899,7 @@ def find(
                         "matches": [],
                         "count": 0,
                         "cursor": {"done": True},
-                        "error": str(e),
+                        **item_error(e, f"name/string pattern search for {target_str!r}"),
                     }
                 )
 
@@ -1930,7 +1933,7 @@ def find(
                         "matches": [],
                         "count": 0,
                         "cursor": {"done": True},
-                        "error": str(e),
+                        **item_error(e, f"code refs to {target_str}"),
                     }
                 )
 
@@ -2207,7 +2210,7 @@ def insn_query(
                     "scanned": 0,
                     "truncated": False,
                     "next_start": None,
-                    "error": str(e),
+                    **item_error(e, f"instruction search (mnem={mnem!r})"),
                 }
             )
 
@@ -2255,7 +2258,7 @@ def export_funcs(
             results.append(func_data)
 
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e, f"export function at {addr}")})
 
     if format == "c_header":
         # Generate C header file
@@ -2407,7 +2410,7 @@ def callgraph(
             )
 
         except Exception as e:
-            results.append({"root": root, "error": str(e), "nodes": [], "edges": []})
+            results.append({"root": root, "nodes": [], "edges": [], **item_error(e, f"call graph for {root}")})
 
     return results
 
@@ -2424,6 +2427,313 @@ class CfgDotResult(TypedDict, total=False):
     block_count: int
     dot: str
     error: str
+
+
+class SimilarFunctionMatch(TypedDict):
+    addr: str
+    name: str
+    similarity_score: float
+    block_count: int
+    edge_count: int
+    complexity: int
+    size_bytes: int
+    matching_features: dict[str, float]
+    fingerprint_name: NotRequired[str]
+    fingerprint_description: NotRequired[str]
+
+
+class ChainNode(TypedDict):
+    addr: str
+    type: str
+    instruction: str | None
+    function: str | None
+    name: str | None
+    depth: int
+
+
+class ChainEdge(TypedDict):
+    from_addr: str
+    to_addr: str
+    xref_type: str
+
+
+class TerminatedAt(TypedDict):
+    reason: str
+    address: str
+
+
+class TraceDataChainResult(TypedDict, total=False):
+    ok: bool
+    start: str
+    direction: str
+    max_depth: int
+    depth_reached: int
+    nodes: list[ChainNode]
+    edges: list[ChainEdge]
+    terminated_at: TerminatedAt | None
+    node_count: int
+    cross_functions: NotRequired[bool]
+    functions_entered: NotRequired[list[str]]
+    error: str
+
+
+class FindSimilarFunctionsResult(TypedDict, total=False):
+    ok: bool
+    reference: dict
+    candidates_scanned: int
+    matches: list[SimilarFunctionMatch]
+    error: str
+
+
+_MNEM_ARITH = frozenset({
+    "add", "sub", "mul", "imul", "div", "idiv", "inc", "dec",
+    "and", "or", "xor", "not", "neg", "shl", "shr", "sar", "rol", "ror",
+    "adc", "sbb",
+})
+
+_MNEM_LOAD = frozenset({"mov", "movzx", "movsx", "movaps", "movups", "movdqa", "movq", "movsb", "movsw"})
+_MNEM_STORE = frozenset({"stosb", "stosw", "stosd", "stosq"})
+_MNEM_JMP = frozenset({"jmp", "je", "jne", "jz", "jnz", "jg", "jge", "jl", "jle", "ja", "jb", "jae", "jbe", "jo", "jno", "js", "jns", "jc", "jnc", "loop", "loope", "loopne"})
+
+
+def _compute_function_features(func_ea: int, fc) -> dict:
+    import idautils
+    import ida_ua
+
+    func = idaapi.get_func(func_ea)
+    if not func:
+        return {}
+
+    size_bytes = func.end_ea - func.start_ea
+    edge_count = 0
+    block_count = 0
+    for block in fc:
+        block_count += 1
+        edge_count += len(list(block.succs()))
+
+    cyclomatic = edge_count - block_count + 2 if block_count > 0 else 1
+
+    instruction_count = 0
+    mnem_counts: dict[str, int] = {}
+    callee_addrs: set[int] = set()
+
+    for item_ea in idautils.FuncItems(func_ea):
+        instruction_count += 1
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, item_ea) == 0:
+            continue
+        mnem = insn.get_canon_mnem().lower()
+        mnem_counts[mnem] = mnem_counts.get(mnem, 0) + 1
+        if insn.itype in (idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni):
+            op = insn.ops[0]
+            if op.type in (ida_ua.o_mem, ida_ua.o_near, ida_ua.o_far):
+                callee_addrs.add(op.addr)
+            elif op.type == ida_ua.o_imm:
+                callee_addrs.add(op.value)
+
+    total = max(instruction_count, 1)
+    feat = {
+        "block_count": block_count,
+        "edge_count": edge_count,
+        "cyclomatic_complexity": cyclomatic,
+        "size_bytes": size_bytes,
+        "instruction_count": instruction_count,
+        "caller_count": sum(1 for _ in idautils.CodeRefsTo(func_ea, 0)),
+        "callee_count": len(callee_addrs),
+        "mnem_load_ratio": sum(mnem_counts.get(m, 0) for m in _MNEM_LOAD) / total,
+        "mnem_store_ratio": sum(mnem_counts.get(m, 0) for m in _MNEM_STORE) / total,
+        "mnem_jmp_ratio": sum(mnem_counts.get(m, 0) for m in _MNEM_JMP) / total,
+        "mnem_call_ratio": mnem_counts.get("call", 0) / total,
+        "mnem_ret_ratio": mnem_counts.get("retn", 0) / total,
+        "mnem_mov_ratio": mnem_counts.get("mov", 0) / total,
+        "mnem_arith_ratio": sum(mnem_counts.get(m, 0) for m in _MNEM_ARITH) / total,
+    }
+    return feat
+
+
+_RAW_FEATURE_SCALES = {
+    "block_count": 100.0,
+    "edge_count": 200.0,
+    "cyclomatic_complexity": 50.0,
+    "size_bytes": 50000.0,
+    "instruction_count": 10000.0,
+    "caller_count": 1000.0,
+    "callee_count": 100.0,
+}
+
+
+def _unit_normalize(vec: list[float]) -> list[float]:
+    import math
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0:
+        return vec
+    return [x / norm for x in vec]
+
+
+def _feature_dict_to_vector(feat: dict) -> list[float]:
+    raw = [
+        min(float(feat.get("block_count", 0)) / _RAW_FEATURE_SCALES["block_count"], 1.0),
+        min(float(feat.get("edge_count", 0)) / _RAW_FEATURE_SCALES["edge_count"], 1.0),
+        min(float(feat.get("cyclomatic_complexity", 0)) / _RAW_FEATURE_SCALES["cyclomatic_complexity"], 1.0),
+        min(float(feat.get("size_bytes", 1)) / _RAW_FEATURE_SCALES["size_bytes"], 1.0),
+        min(float(feat.get("instruction_count", 0)) / _RAW_FEATURE_SCALES["instruction_count"], 1.0),
+        min(float(feat.get("caller_count", 0)) / _RAW_FEATURE_SCALES["caller_count"], 1.0),
+        min(float(feat.get("callee_count", 0)) / _RAW_FEATURE_SCALES["callee_count"], 1.0),
+    ]
+    ratios = [
+        feat.get("mnem_load_ratio", 0.0),
+        feat.get("mnem_store_ratio", 0.0),
+        feat.get("mnem_jmp_ratio", 0.0),
+        feat.get("mnem_call_ratio", 0.0),
+        feat.get("mnem_ret_ratio", 0.0),
+        feat.get("mnem_mov_ratio", 0.0),
+        feat.get("mnem_arith_ratio", 0.0),
+    ]
+    norm_raw = _unit_normalize(raw)
+    norm_ratios = _unit_normalize(ratios)
+    return norm_raw + norm_ratios
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+_FINGERPRINT_DB: dict[str, dict] = {}
+
+
+def _register_fingerprints() -> None:
+    global _FINGERPRINT_DB
+
+    _FINGERPRINT_DB = {
+        "memcpy": {
+            "description": "Memory copy function",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.3, "mnem_store_ratio": 0.3, "mnem_call_ratio": 0.0,
+                "mnem_jmp_ratio": 0.05, "mnem_arith_ratio": 0.1, "mnem_mov_ratio": 0.5,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "memset": {
+            "description": "Memory set function",
+            "features": {
+                "block_count": 2, "edge_count": 2, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.1, "mnem_store_ratio": 0.4, "mnem_call_ratio": 0.0,
+                "mnem_jmp_ratio": 0.05, "mnem_arith_ratio": 0.2, "mnem_mov_ratio": 0.4,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "strlen": {
+            "description": "String length function",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.4, "mnem_store_ratio": 0.05, "mnem_call_ratio": 0.0,
+                "mnem_jmp_ratio": 0.15, "mnem_arith_ratio": 0.15, "mnem_mov_ratio": 0.15,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "strcpy": {
+            "description": "String copy function",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.3, "mnem_store_ratio": 0.3, "mnem_call_ratio": 0.0,
+                "mnem_jmp_ratio": 0.1, "mnem_arith_ratio": 0.05, "mnem_mov_ratio": 0.5,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "malloc": {
+            "description": "Memory allocator",
+            "features": {
+                "block_count": 3, "edge_count": 4, "cyclomatic_complexity": 3,
+                "mnem_load_ratio": 0.1, "mnem_store_ratio": 0.2, "mnem_call_ratio": 0.3,
+                "mnem_jmp_ratio": 0.1, "mnem_arith_ratio": 0.1, "mnem_mov_ratio": 0.2,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "free": {
+            "description": "Memory deallocator",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.15, "mnem_store_ratio": 0.1, "mnem_call_ratio": 0.25,
+                "mnem_jmp_ratio": 0.1, "mnem_arith_ratio": 0.05, "mnem_mov_ratio": 0.2,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "open": {
+            "description": "File open (Unix)",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.1, "mnem_store_ratio": 0.05, "mnem_call_ratio": 0.4,
+                "mnem_jmp_ratio": 0.05, "mnem_arith_ratio": 0.05, "mnem_mov_ratio": 0.2,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "read": {
+            "description": "File read (Unix)",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.2, "mnem_store_ratio": 0.2, "mnem_call_ratio": 0.3,
+                "mnem_jmp_ratio": 0.05, "mnem_arith_ratio": 0.05, "mnem_mov_ratio": 0.2,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "write": {
+            "description": "File write (Unix)",
+            "features": {
+                "block_count": 2, "edge_count": 3, "cyclomatic_complexity": 2,
+                "mnem_load_ratio": 0.1, "mnem_store_ratio": 0.25, "mnem_call_ratio": 0.3,
+                "mnem_jmp_ratio": 0.05, "mnem_arith_ratio": 0.05, "mnem_mov_ratio": 0.2,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "printf": {
+            "description": "Formatted print",
+            "features": {
+                "block_count": 3, "edge_count": 5, "cyclomatic_complexity": 3,
+                "mnem_load_ratio": 0.15, "mnem_store_ratio": 0.05, "mnem_call_ratio": 0.4,
+                "mnem_jmp_ratio": 0.1, "mnem_arith_ratio": 0.05, "mnem_mov_ratio": 0.15,
+                "mnem_ret_ratio": 0.05,
+            },
+        },
+        "exit": {
+            "description": "Process termination",
+            "features": {
+                "block_count": 1, "edge_count": 1, "cyclomatic_complexity": 1,
+                "mnem_load_ratio": 0.0, "mnem_store_ratio": 0.0, "mnem_call_ratio": 0.6,
+                "mnem_jmp_ratio": 0.0, "mnem_arith_ratio": 0.0, "mnem_mov_ratio": 0.1,
+                "mnem_ret_ratio": 0.0,
+            },
+        },
+    }
+
+
+_register_fingerprints()
+
+
+def _fingerprint_match_score(feat: dict) -> tuple[float, str, str]:
+    """Score a function against all fingerprints; return (best_score, name, description)."""
+    best_score = 0.0
+    best_name = ""
+    best_desc = ""
+    feat_vec = _feature_dict_to_vector(feat)
+    for fp_name, fp_data in _FINGERPRINT_DB.items():
+        fp_feat = fp_data["features"]
+        fp_vec = _feature_dict_to_vector(fp_feat)
+        score = _cosine_similarity(feat_vec, fp_vec)
+        if score > best_score:
+            best_score = score
+            best_name = fp_name
+            best_desc = fp_data.get("description", "")
+    return best_score, best_name, best_desc
+
+
+_FINGERPRINT_BOOST_WEIGHT = 0.3  # How much fingerprint score contributes to final score
 
 
 @tool
@@ -2500,4 +2810,398 @@ def get_cfg_dot(
         }
 
     except Exception as e:
+        return tool_error(e, f"cfg_dot at {address}")
+
+
+# ============================================================================
+# Function Clone / Similarity Detection
+# ============================================================================
+
+
+@tool
+@idasync
+def find_similar_functions(
+    address: Annotated[
+        str,
+        "Reference function address or name to find similar functions for "
+        "(e.g. '0x401000', 'memcpy', 'main')",
+    ],
+    scope: Annotated[
+        str,
+        "Scope of the search: 'all' to search all functions, or a specific "
+        "segment name like '.text' to limit search to that segment. "
+        "(default: 'all')",
+    ] = "all",
+    max_results: Annotated[int, "Maximum number of matches to return (default: 10, max: 50)"] = 10,
+    threshold: Annotated[
+        float,
+        "Minimum similarity score to return (0.0-1.0, default: 0.75). "
+        "Set lower for more matches, higher for stricter matching.",
+    ] = 0.75,
+) -> FindSimilarFunctionsResult:
+    """Find functions structurally similar to a reference function.
+
+    Uses a feature-vector approach combining:
+    - CFG metrics: block count, edge count, cyclomatic complexity
+    - Code metrics: instruction count, caller/callee counts
+    - Mnemonic ratios: relative frequency of load/store/jump/call/mov/arithmetic ops
+
+    Returns top-N matches sorted by cosine similarity to the reference.
+    Includes an embedded fingerprint database for common library functions
+    (memcpy, memset, strlen, strcpy, malloc, free, open, read, write, printf, exit).
+
+    Use this to identify library wrappers, thunks, and known functions in
+    stripped binaries where FLIRT signatures don't cover everything.
+    """
+    try:
+        ea = parse_address(address)
+        ref_func = idaapi.get_func(ea)
+        if not ref_func:
+            return {"ok": False, "error": f"No function found at {address}"}
+
+        ref_ea = ref_func.start_ea
+        ref_name = ida_funcs.get_func_name(ref_ea) or hex(ref_ea)
+
+        ref_fc = idaapi.FlowChart(ref_func)
+        ref_feat = _compute_function_features(ref_ea, ref_fc)
+        if not ref_feat:
+            return {"ok": False, "error": f"Could not compute features for {address}"}
+
+        ref_vector = _feature_dict_to_vector(ref_feat)
+
+        candidate_funcs: list[tuple[int, str]] = []
+        if scope == "all":
+            for func_ea in idautils.Functions():
+                if func_ea != ref_ea:
+                    candidate_funcs.append((func_ea, ida_funcs.get_func_name(func_ea) or ""))
+        else:
+            seg = idaapi.get_segm_by_name(scope)
+            if not seg:
+                return {"ok": False, "error": f"Segment not found: {scope}"}
+            for func_ea in idautils.Functions():
+                if func_ea < seg.start_ea or func_ea >= seg.end_ea:
+                    continue
+                if func_ea == ref_ea:
+                    continue
+                candidate_funcs.append((func_ea, ida_funcs.get_func_name(func_ea) or ""))
+
+        candidates_scanned = len(candidate_funcs)
+
+        scored: list[tuple[int, str, float, float, dict, str, str]] = []
+        for func_ea, func_name in candidate_funcs:
+            f = idaapi.get_func(func_ea)
+            if not f:
+                continue
+            fc = idaapi.FlowChart(f)
+            feat = _compute_function_features(func_ea, fc)
+            if not feat:
+                continue
+            vec = _feature_dict_to_vector(feat)
+            cosine_score = _cosine_similarity(ref_vector, vec)
+            fp_score, fp_name, fp_desc = _fingerprint_match_score(feat)
+            combined_score = (1.0 - _FINGERPRINT_BOOST_WEIGHT) * cosine_score + _FINGERPRINT_BOOST_WEIGHT * fp_score
+            if combined_score >= threshold:
+                scored.append((func_ea, func_name, combined_score, cosine_score, feat, fp_name, fp_desc))
+
+        scored.sort(key=lambda x: x[2], reverse=True)
+        top = scored[:max_results]
+
+        matches: list[SimilarFunctionMatch] = []
+        for func_ea, func_name, combined_score, cosine_score, feat, fp_name, fp_desc in top:
+            f = idaapi.get_func(func_ea)
+            fc = idaapi.FlowChart(f) if f else None
+            block_count = sum(1 for _ in fc) if fc else 0
+            edge_count = feat.get("edge_count", 0)
+            match: SimilarFunctionMatch = SimilarFunctionMatch(
+                addr=hex(func_ea),
+                name=func_name or hex(func_ea),
+                similarity_score=round(combined_score, 4),
+                block_count=block_count,
+                edge_count=edge_count,
+                complexity=feat.get("cyclomatic_complexity", 0),
+                size_bytes=feat.get("size_bytes", 0),
+                matching_features={
+                    "mnem_mov_ratio": feat.get("mnem_mov_ratio", 0.0),
+                    "mnem_load_ratio": feat.get("mnem_load_ratio", 0.0),
+                    "mnem_store_ratio": feat.get("mnem_store_ratio", 0.0),
+                    "mnem_call_ratio": feat.get("mnem_call_ratio", 0.0),
+                    "mnem_jmp_ratio": feat.get("mnem_jmp_ratio", 0.0),
+                    "mnem_arith_ratio": feat.get("mnem_arith_ratio", 0.0),
+                },
+            )
+            if fp_name:
+                match["fingerprint_name"] = fp_name
+                match["fingerprint_description"] = fp_desc
+            matches.append(match)
+
+        ref_block_count = ref_feat.get("block_count", 0)
+        ref_edge_count = ref_feat.get("edge_count", 0)
+        return {
+            "ok": True,
+            "reference": {
+                "addr": hex(ref_ea),
+                "name": ref_name,
+                "block_count": ref_block_count,
+                "edge_count": ref_edge_count,
+                "complexity": ref_feat.get("cyclomatic_complexity", 0),
+                "size_bytes": ref_feat.get("size_bytes", 0),
+            },
+            "candidates_scanned": candidates_scanned,
+            "matches": matches,
+        }
+    except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+_MAX_CHAIN_NODES = 500
+_MAX_CHAIN_EDGES = 600
+
+
+@tool
+@idasync
+def trace_data_chain(
+    address: Annotated[str, "Starting address for the chain traversal (hex or symbol name)"],
+    direction: Annotated[
+        str,
+        "Traversal direction: 'backward' follows xrefs TO the address (data-flow origins), "
+        "'forward' follows xrefs FROM the address (data-flow destinations)",
+    ] = "backward",
+    max_depth: Annotated[int, "Maximum traversal depth (default: 5, max: 20)"] = 5,
+    include_data: Annotated[
+        bool,
+        "Include data cross-references in the traversal (default: True)",
+    ] = True,
+    include_code: Annotated[
+        bool,
+        "Include code cross-references in the traversal (default: True)",
+    ] = True,
+    cross_functions: Annotated[
+        bool,
+        "When True (default False), follow calls/jumps across function boundaries. "
+        "When False, traversal stops at call/jump xrefs and does not enter the target function's CFG. "
+        "Useful for tracing data-flow through call chains rather than just within a single function.",
+    ] = False,
+) -> TraceDataChainResult:
+    """Multi-hop cross-reference chain traversal for surgical RE workflows.
+
+    Traces data-flow across multiple hops in a single call. On stripped binaries
+    this is essential for tracking pointer chains without manually chaining xrefs_to
+    calls. The traversal stops at code/data boundaries — does not cross into
+    unexamined segments unless they contain the next xref target.
+
+    **Backward mode** ("backward", the default) answers: "where does this value originate?"
+    Use cases:
+      - Trace a vtable pointer back to its constructor
+      - Find the source of a function pointer argument
+      - Discover all writers to a global variable
+
+    **Forward mode** ("forward") answers: "where does this value flow to?"
+    Use cases:
+      - Trace a stack variable to see which functions receive it
+      - Follow a registered callback to its invocation sites
+      - Map out a data structure's consumer functions
+
+    The traversal is bounded by max_depth (not by following through functions).
+    Each node in the path represents one address visited; edges represent xrefs
+    between them. Nodes that are code (inside functions) report the enclosing
+    function name and the disassembly at that address. Data nodes report the
+    name/label at that address if any.
+
+    Parameters
+    ----------
+    address : str
+        Starting address (hex, e.g. "0x401000", or symbol name)
+    direction : str
+        "backward" | "forward". Default: "backward"
+    max_depth : int
+        Maximum graph depth to traverse (1-20, default 5)
+    include_data : bool
+        Include data xrefs (dr_R, dr_W, dr_O). Default True.
+    include_code : bool
+        Include code xrefs (fl_CN, fl_JN, fl_CF, fl_JF, fl_F). Default True.
+
+    Returns
+    -------
+    TraceDataChainResult
+        path: ordered list of nodes visited, each with addr/type/function/instruction/name
+        terminated_at: reason traversal stopped (depth_limit, no_more_xrefs, node_limit)
+        depth_reached: actual deepest depth reached
+    """
+    if direction not in ("forward", "backward"):
+        return {"ok": False, "error": f"direction must be 'forward' or 'backward', got {direction!r}"}
+
+    if max_depth < 1:
+        max_depth = 1
+    if max_depth > 20:
+        max_depth = 20
+
+    try:
+        start_ea = parse_address(address)
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to resolve address {address!r}: {e}"}
+
+    visited: set[int] = {start_ea}
+    nodes: list[ChainNode] = []
+    edges: list[ChainEdge] = []
+    depth_reached = 0
+    terminated_reason: str | None = None
+    terminated_addr: str | None = hex(start_ea)
+    functions_entered: list[str] = []
+    _cross_func = cross_functions
+
+    from collections import deque
+    queue: deque[tuple[int, int]] = deque()
+    queue.append((start_ea, 0))
+
+    def _expand_function(func_ea: int, call_depth: int) -> None:
+        """Expand all basic blocks of func_ea into the queue (up to depth limit)."""
+        if call_depth >= max_depth:
+            return
+        func = idaapi.get_func(func_ea)
+        if not func:
+            return
+        fc = idaapi.FlowChart(func)
+        for block in fc:
+            entry = block.start_ea
+            if entry not in visited and len(nodes) + len(queue) < _MAX_CHAIN_NODES:
+                visited.add(entry)
+                queue.append((entry, call_depth))
+
+    while queue:
+        ea, depth = queue.popleft()
+
+        if depth > max_depth:
+            continue
+        if depth > depth_reached:
+            depth_reached = depth
+
+        if len(nodes) >= _MAX_CHAIN_NODES:
+            terminated_reason = "node_limit"
+            terminated_addr = hex(ea)
+            break
+
+        func = idaapi.get_func(ea)
+        func_name = ida_funcs.get_func_name(ea) if func else None
+        flags = idaapi.get_flags(ea)
+        is_code_addr = idaapi.is_code(flags)
+        node_type = "code" if is_code_addr else "data"
+        name_at_raw = ida_name.get_name(ea)
+        name_at = name_at_raw if name_at_raw and name_at_raw != f"loc_{ea:X}" else None
+        disasm_text: str | None = None
+        if is_code_addr and idaapi.is_loaded(ea):
+            disasm_text = idc.GetDisasm(ea)
+
+        nodes.append(ChainNode(
+            addr=hex(ea),
+            type=node_type,
+            instruction=disasm_text,
+            function=func_name,
+            name=name_at,
+            depth=depth,
+        ))
+
+        if depth >= max_depth:
+            terminated_reason = "depth_limit"
+            terminated_addr = hex(ea)
+            continue
+
+        xref_list: list[Any] = []
+        if direction == "forward":
+            xref_list = list(idautils.XrefsFrom(ea, 0))
+        else:
+            xref_list = list(idautils.XrefsTo(ea, 0))
+
+        if not xref_list:
+            terminated_reason = "no_more_xrefs"
+            terminated_addr = hex(ea)
+
+        next_nodes_to_queue: list[tuple[int, int]] = []
+        for xref in xref_list:
+            if len(edges) >= _MAX_CHAIN_EDGES:
+                terminated_reason = "edge_limit"
+                terminated_addr = hex(ea)
+                break
+
+            if direction == "forward":
+                target = xref.to
+                from_addr = ea
+                to_addr = target
+            else:
+                target = xref.frm
+                from_addr = target
+                to_addr = ea
+
+            is_code_xref = bool(xref.iscode)
+            if is_code_xref and not include_code:
+                continue
+            if not is_code_xref and not include_data:
+                continue
+
+            xref_type_str: str
+            if is_code_xref:
+                t = xref.type
+                if t == ida_xref.fl_CN:
+                    xref_type_str = "call_near"
+                elif t == ida_xref.fl_CF:
+                    xref_type_str = "call_far"
+                elif t == ida_xref.fl_JN:
+                    xref_type_str = "jump_near"
+                elif t == ida_xref.fl_JF:
+                    xref_type_str = "jump_far"
+                elif t == ida_xref.fl_F:
+                    xref_type_str = "flow"
+                else:
+                    xref_type_str = "code"
+            else:
+                t = xref.type
+                if t == ida_xref.dr_O:
+                    xref_type_str = "offset"
+                elif t == ida_xref.dr_R:
+                    xref_type_str = "data_read"
+                elif t == ida_xref.dr_W:
+                    xref_type_str = "data_write"
+                else:
+                    xref_type_str = "data"
+
+            edges.append(ChainEdge(
+                from_addr=hex(from_addr),
+                to_addr=hex(to_addr),
+                xref_type=xref_type_str,
+            ))
+
+            if target not in visited and len(nodes) + len(queue) + len(next_nodes_to_queue) < _MAX_CHAIN_NODES:
+                visited.add(target)
+                if _cross_func and xref_type_str in ("call_near", "call_far"):
+                    fn_name = ida_funcs.get_func_name(target)
+                    fn_label = fn_name if fn_name else hex(target)
+                    if fn_label not in functions_entered:
+                        functions_entered.append(fn_label)
+                    _expand_function(target, depth + 1)
+                else:
+                    next_nodes_to_queue.append((target, depth + 1))
+
+        for item in next_nodes_to_queue:
+            queue.append(item)
+
+    if not terminated_reason:
+        terminated_reason = "exhausted"
+
+    terminated_at: TerminatedAt | None = None
+    if terminated_reason and terminated_reason not in ("exhausted",) and terminated_addr:
+        terminated_at = TerminatedAt(reason=terminated_reason, address=terminated_addr)
+
+    result = {
+        "ok": True,
+        "start": hex(start_ea),
+        "direction": direction,
+        "max_depth": max_depth,
+        "depth_reached": depth_reached,
+        "nodes": nodes,
+        "edges": edges,
+        "terminated_at": terminated_at,
+        "node_count": len(nodes),
+        "cross_functions": _cross_func,
+    }
+    if functions_entered:
+        result["functions_entered"] = functions_entered
+    return result

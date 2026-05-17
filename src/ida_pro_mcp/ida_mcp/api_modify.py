@@ -31,6 +31,8 @@ from .utils import (
     RenameBatch,
     DefineOp,
     UndefineOp,
+    tool_error,
+    item_error,
 )
 
 
@@ -175,7 +177,7 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"set comment at {addr_str}")})
 
     return results
 
@@ -243,7 +245,7 @@ def append_comments(
                 continue
             results.append({"addr": addr_str, "scope": "line", "appended": True})
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"append comment at {addr_str}")})
 
     return results
 
@@ -315,7 +317,7 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
                     break
             results.append(results_entry)
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"patch asm at {addr_str}")})
 
     return results
 
@@ -470,7 +472,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"addr": item.get("addr"), "error": str(e)})
+                results.append({"addr": item.get("addr"), **item_error(e, "rename function")})
                 if stop_on_error:
                     halted = True
                     break
@@ -539,7 +541,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"old": item.get("old"), "error": str(e)})
+                results.append({"old": item.get("old"), **item_error(e, "rename global")})
                 if stop_on_error:
                     halted = True
                     break
@@ -603,7 +605,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"func_addr": item.get("func_addr"), "error": str(e)})
+                results.append({"func_addr": item.get("func_addr"), **item_error(e, "rename local var")})
                 if stop_on_error:
                     halted = True
                     break
@@ -724,7 +726,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"func_addr": item.get("func_addr"), "error": str(e)})
+                results.append({"func_addr": item.get("func_addr"), **item_error(e, "rename stack var")})
                 if stop_on_error:
                     halted = True
                     break
@@ -848,7 +850,7 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"define function at {addr_str}")})
 
     return results
 
@@ -880,7 +882,7 @@ def define_code(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"create instruction at {addr_str}")})
 
     return results
 
@@ -929,7 +931,7 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[DefineResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"undefine at {addr_str}")})
 
     return results
 
@@ -1002,7 +1004,7 @@ def add_xref(
         return {"ok": True, "from_addr": hex(frm), "to_addr": hex(to), "xref_type": xtype}
 
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return tool_error(e, "add_xref")
 
 
 # ============================================================================
@@ -1037,4 +1039,4 @@ def remove_type(
             pass
         return {"ok": True, "addr": hex(ea)}
     except Exception as e:
-        return {"ok": False, "addr": addr, "error": str(e)}
+        return {**tool_error(e, f"remove_type at {addr}"), "addr": addr}

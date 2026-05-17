@@ -2,23 +2,30 @@
 
 All notable changes to this fork of `ida-pro-mcp` are documented in this file.
 
-## [Unreleased] — Phase 5: Binary Format Parsing + Comprehensive Quality Audit
+## [1.1.0] — 2026-05-18
 
-### New Modules
+### Phase 5 — Binary Format Parsing + Comprehensive Quality Audit
 
-#### `api_construct.py` — Declarative Binary Format Parsing (`construct` library)
+#### New Modules
+
+##### `api_construct.py` — Declarative Binary Format Parsing (`construct` library)
 
 Optional module (`pip install construct`). Uses `construct 2.10.x` declarative grammar.
 
 | Tool | Description |
 |------|-------------|
-| `construct_status` | Report availability and construct version (always available) |
-| `construct_parse_binary` | Parse a hex-encoded buffer using any construct template string |
-| `construct_parse_ida_segment` | Parse bytes from an IDA segment by name |
-| `construct_parse_ida_struct` | Parse one or more struct instances starting at an IDA address |
+| `construct_status` | Report availability, version, and loaded templates (always available) |
+| `construct_parse_pe_headers` | Parse DOS/NT/File/Optional/Section headers from a PE file |
+| `construct_parse_elf_headers` | Parse ELF header, program headers, section headers; auto-detects 32/64-bit |
+| `construct_parse_custom_struct` | Safe DSL evaluator (AST whitelist, 256-node cap) for arbitrary Construct templates |
 | `construct_build_struct` | Build binary bytes from a construct template + data dict; optionally patch into IDA (`return_only=False`) |
+| `construct_parse_ida_struct` | Bridge: auto-convert an IDA struct type to Construct and parse |
+| `construct_guess_struct` | Heuristic auto-guess structure layout (strings, pointers, padding) |
+| `construct_batch_parse_array` | Parse multiple consecutive struct instances (tables) |
+| `construct_extract_protocol_header` | Pre-built parsers: IPv4, TCP, UDP, ICMP, Ethernet, DNS, TLS record |
+| `construct_scan_for_structs` | Scan a region for all occurrences of a struct pattern |
 
-#### `api_cstruct.py` — C-Syntax Binary Structure Parsing (`dissect.cstruct` library)
+##### `api_cstruct.py` — C-Syntax Binary Structure Parsing (`dissect.cstruct` library)
 
 Optional module (`pip install dissect.cstruct`). Uses Fox-IT's `dissect.cstruct 4.x`.
 
@@ -30,11 +37,14 @@ Optional module (`pip install dissect.cstruct`). Uses Fox-IT's `dissect.cstruct 
 | `cstruct_parse_at_address` | Parse an IDA address as a named struct type; returns all field values |
 | `cstruct_to_bytes` | Serialize a field-value dict back to raw bytes for a given struct type |
 | `cstruct_list_defined_structs` | List all non-builtin types in the current registry |
-| `cstruct_reset` | Clear the current registry (drops all user-defined types) |
+| `cstruct_ida_struct_to_c` | Bridge: convert an IDA struct type to a C definition |
+| `cstruct_parse_ida_struct` | Parse memory using an IDA struct converted to cstruct |
 
 Architecture: **per-endian registry isolation** — `dissect.cstruct` stores a live reference to `cs.endian` rather than snapshotting it at load time. Mutating endianness after loading would retroactively change how all previously-loaded types parse. The implementation uses separate `cstruct` instances keyed by `f"{session}_{endian}"` to avoid this. Both `"little"` and `"big"` endian sessions coexist safely without interference.
 
-#### `api_filetype.py` — Magic-Byte File Type Identification (`filetype` library)
+**Pre-defined templates:** `IMAGE_DOS_HEADER`, `IMAGE_FILE_HEADER`, `IMAGE_OPTIONAL_HEADER32/64`, `IMAGE_NT_HEADERS32/64`, `IMAGE_SECTION_HEADER`, `IMAGE_IMPORT_DESCRIPTOR`, `IMAGE_EXPORT_DIRECTORY`, `Elf32/64_Ehdr/Phdr/Shdr`, `ip_header`, `tcp_header`, `udp_header`, `icmp_header`, `ethernet_header`.
+
+##### `api_filetype.py` — Magic-Byte File Type Identification (`filetype` library)
 
 Optional module (`pip install filetype`). Uses `filetype 1.x` for magic-byte detection (261-byte signature window, 79+ formats).
 
@@ -47,11 +57,11 @@ Optional module (`pip install filetype`). Uses `filetype 1.x` for magic-byte det
 
 ---
 
-### Bug Fixes — Comprehensive Quality Audit (2 sessions)
+#### Bug Fixes — Comprehensive Quality Audit
 
-This section documents all bugs found and fixed across the entire codebase during a two-session quality review.
+This section documents all bugs found and fixed across the entire codebase during a multi-session quality review.
 
-#### Critical — Module Load Failures
+##### Critical — Module Load Failures
 
 These bugs prevented entire modules from loading. Because `__init__.py` wraps all imports in `try/except Exception`, the failures were completely silent — all tools in the affected module simply didn't exist at runtime with no log message.
 
@@ -60,11 +70,11 @@ These bugs prevented entire modules from loading. Because `__init__.py` wraps al
 - **`api_debug.py`** — Same `(,` import pattern. Also fixed: f-string `f"tid tid"` never interpolated the `tid` variable (2 places); f-string `f"addr region.get("addr")"` was a `SyntaxError` (nested quotes); dead no-op `if not is_debugger_on(): pass` block removed.
 - **`api_filetype.py`** — `NotRequired` used in TypedDict class body but not imported — `NameError` at class definition time. All `filetype_*` tools were unavailable.
 
-#### Critical — Silent Logic Bug
+##### Critical — Silent Logic Bug
 
 - **`api_cstruct.py` endian registry** — `dissect.cstruct` stores a live reference to `cs.endian`; mutating it after loading retroactively changes all previously-loaded struct parsers. The original code set `reg.endian = ">"`, loaded a struct, then restored `reg.endian = "<"` — making every "big-endian" struct actually parse as little-endian. Fixed by using **separate `cstruct` instances per endian** (`f"{session}_{endian}"` registry key), eliminating all mutation.
 
-#### High — Decorator Order
+##### High — Decorator Order
 
 `@unsafe` must be the outermost decorator (`@unsafe @tool @idasync`) so that it registers the function's `__name__` before `@tool` or `@idasync` can wrap it.
 
@@ -72,12 +82,12 @@ These bugs prevented entire modules from loading. Because `__init__.py` wraps al
 - **`api_recon.py`** — `find_function_prologues` had `@tool @unsafe @idasync` (tool outermost instead of unsafe).
 - **`api_composite.py`** — `diff_before_after` had `@tool @unsafe @idasync`.
 
-#### High — Hardcoded Developer Machine Paths
+##### High — Hardcoded Developer Machine Paths
 
 - **`api_miasm.py`** — `_PY313_SITE_PACKAGES = r"C:\Users\User\..."` and `_MIASM_SOURCE_PATH = r"C:\Dev\IDA_Pro_Plugin\miasm-master"` were unconditionally injected into `sys.path` at module load time on every machine. On any machine other than the developer's these are no-ops at best and could shadow system packages at worst. Removed entirely along with `_ensure_miasm_in_sys_modules()` and the now-unused `import sys`.
 - **`api_construct.py`**, **`api_cstruct.py`**, **`api_filetype.py`** — Same hardcoded `_PY313_SITE_PACKAGES` pattern. Removed from all three.
 
-#### Medium — Error Shape Inconsistencies
+##### Medium — Error Shape Inconsistencies
 
 - **`api_composite.py`** — `analyze_component`: two early-return guards missing `"ok": False`. `diff_before_after` action dispatch: f-string interpolated the exception object directly with no `ok` key.
 - **`api_types.py`** — `enum_upsert` outer `except`: `str(exc)` → `item_error(exc, ...)`.
@@ -85,12 +95,45 @@ These bugs prevented entire modules from loading. Because `__init__.py` wraps al
 - **`api_core.py`** — `item_error(e, f"query query")` — same literal placeholder. Fixed to `f"lookup {query!r}"`.
 - **`api_survey.py`** — `survey_binary` success return missing `"ok": True`; no top-level `try/except`, so any unhandled exception in a sub-call would propagate as an unstructured error. Added both.
 
-#### Low — Minor Bugs
+##### Low — Minor Bugs
 
 - **`api_construct.py`** — `construct_build_struct` unsafe patching guard checked `"construct_build_struct" not in MCP_UNSAFE`. Since the tool was never decorated with `@unsafe`, its name is never in `MCP_UNSAFE`, so `not in MCP_UNSAFE` was always `True` — patching was permanently blocked regardless of `--unsafe` flag. Removed the broken guard; `return_only=False` with an explicit `output_address` is sufficient opt-in.
 - **`api_sigmaker.py`** — `'ea' in dir()` (incorrect idiom for local variable existence) → `'ea' in locals()`.
 - **`api_miasm.py`** — Six success returns missing `"ok": True` (`miasm_lift_function`, `miasm_get_ssa`, `miasm_deobfuscate_cfg`, `miasm_simplify_block`, `miasm_emulate_symbolic`, `miasm_get_function_side_effects`). `"_debug_note": "ok"` placeholder in `miasm_simplify_block` replaced with `"ok": True`. `miasm_init` / `miasm_reset` fallback `except` now use `tool_error(e, ...)` for consistent logging and `error_type` field.
 - **`api_cstruct.py`** — `cstruct_status` struct count used `dir(reg)` (unreliable, includes methods and inherited attributes) — unified to use `reg.typedefs` iteration matching `cstruct_list_defined_structs`. `_prepare_value` in `cstruct_to_bytes` lost enum context when recursing over array elements — added `elem_type` parameter threading.
+
+---
+
+### Phase 3.10 — Stress Test Fixes
+
+**Status: 5/5 bugs fixed, stress-tested against map2dif_plus.exe.i64 (8534 functions, 32-bit x86).**
+
+#### Bug Fixes
+- **Fixed `miasm_simplify_block` / `miasm_emulate_symbolic` crash on `ExprMem`.** Miasm's `Expr` base class has no `.simplify()` method — that was a phantom API that never existed. The correct call is `expr_simp(expr)` from `miasm.expression.simplifications`. All `expr.simplify()` calls replaced with `expr_simp(expr)` + try/except fallback.
+- **Fixed `miasm_assemble` / `miasm_patch_instruction` assembly parse failure.** Miasm's x86 parser doesn't accept `DWORD PTR`, uppercase `0X` hex, or MASM-style syntax. Added `_miasmize()` normalizer that strips size prefixes (`DWORD/WORD/BYTE/QWORD PTR`), lowercases `0X→0x`, and preserves mixed-case registers. Fix requires IDA restart to take effect (module reload needed).
+- **Fixed `miasm_trace_data_flow` silent empty output.** When origins list is empty, now returns a `note` field explaining possible causes instead of a bare empty list.
+- **Fixed `task_submit` missing `addr` parameter error.** `arguments` dict not properly converted to `MCPRequest` in the task backend — fixed in `api_tasks.py`.
+- **Fixed `triton_backward_slice` dead symbolic variable TypeError.** Now returns a clear `{"ok": false, "error": "..."}` dict instead of propagating a raw Triton C++ exception to the MCP client.
+
+---
+
+### Phase 3.9 — Miasm Consolidation
+
+**Status: 8/8 issues fixed.**
+
+#### Critical Bug Fixes
+- **Fixed `miasm_search_instruction_pattern` availability guard in docstring.** The `if not MIASM_AVAILABLE:` check was indented inside the function's docstring, making it dead code for months. Moved the check to be the first line of the actual function body.
+- **Fixed `miasm_get_cfg_dot` / `miasm_find_paths` duplicate definition.** When `miasm_get_cfg_summary` was inserted before `miasm_get_cfg_dot`, a line-shift caused the `miasm_find_paths` function definition to accidentally overwrite `miasm_get_cfg_dot`'s signature. Restored `miasm_get_cfg_dot` with its correct `address` parameter and docstring.
+
+#### Robustness Fixes
+- **`_MiasmManager.get_bytes` now returns `bytes | None`** instead of raising `IDAError`. All 11 call sites updated to check for `None` and return structured error dicts.
+- **`_trace_data_flow_internal` now always returns `dict`** instead of `dict | list[str]`. `miasm_trace_data_flow` no longer needs `isinstance` checks.
+- **Added null checks for `get_bytes` at all 11 call sites.** Every tool now checks for `None` and returns a structured error dict instead of crashing.
+
+#### New Tools
+- **`miasm_get_cfg_summary`** — block count, edge count, cyclomatic complexity (E - N + 2), and loop detection via Tarjan's SCC.
+- **`miasm_annotate_data_flow`** — traces data-flow origins and writes IDA comments at each origin instruction (`@unsafe`). Uses `func.addresses` iteration + `ida_ua.decode_insn` + `idaapi.generate_disasm_line` for reliable IDA-side annotation.
+- **`miasm_solve_path_constraints`** — Miasm CFG path enumeration. Falls back gracefully when Triton is absent (returns path addresses without Z3 model).
 
 ---
 
@@ -177,7 +220,7 @@ All practical features from the enhanced fork were already present in our codeba
 - `search_text` / `decompile(include_addresses=False)` — search and token-saving features
 
 #### Skills (New)
-Added 7 modular workflow skills under `skills/`:
+Added 8 modular workflow skills under `skills/`:
 - `binary-survey` — initial reconnaissance
 - `stripped-binary-recovery` — recover semantics from stripped binaries via FLIRT, string xrefs, constant matching, call-graph analysis
 - `function-deep-dive` — thorough single-function analysis
@@ -185,6 +228,7 @@ Added 7 modular workflow skills under `skills/`:
 - `miasm-ir-analysis` — IR lifting and deobfuscation workflows
 - `hybrid-deobfuscate` — cross-engine obfuscated code analysis
 - `vuln-hunter-static` — static vulnerability hunting
+- `idapython` — IDAPython scripting patterns and common API idioms
 
 #### Tests
 - Added `tests/test_task_backend.py` — 18 unit tests (CRUD, cancellation, TTL expiry, concurrency)
@@ -232,66 +276,6 @@ Added 7 modular workflow skills under `skills/`:
 #### Verified / No Changes Needed
 - `triton://session/constraints` resource — already correctly implemented in `api_resources.py`
 - `miasm_get_cfg_summary` — confirmed O(n) with `collections.deque`
-
----
-
-## [Unreleased] — Phase 3.10 — Stress Test Fixes
-
-**Status: 5/5 bugs fixed, stress-tested against map2dif_plus.exe.i64 (8534 functions, 32-bit x86) at port 13337.**
-
-#### Bug Fixes
-- **Fixed `miasm_simplify_block` / `miasm_emulate_symbolic` crash on `ExprMem`.** Miasm's `Expr` base class has no `.simplify()` method — that was a phantom API that never existed. The correct call is `expr_simp(expr)` from `miasm.expression.simplifications`. All `expr.simplify()` calls replaced with `expr_simp(expr)` + try/except fallback.
-- **Fixed `miasm_assemble` / `miasm_patch_instruction` assembly parse failure.** Miasm's x86 parser doesn't accept `DWORD PTR`, uppercase `0X` hex, or MASM-style syntax. Added `_miasmize()` normalizer that strips size prefixes (`DWORD/WORD/BYTE/QWORD PTR`), lowercases `0X→0x`, and preserves mixed-case registers. Fix requires IDA restart to take effect (module reload needed).
-- **Fixed `miasm_trace_data_flow` silent empty output.** When origins list is empty, now returns a `note` field explaining possible causes instead of a bare empty list.
-- **Fixed `task_submit` missing `addr` parameter error.** `arguments` dict not properly converted to `MCPRequest` in the task backend — fixed in `api_tasks.py`.
-- **Fixed `triton_backward_slice` dead symbolic variable TypeError.** Now returns a clear `{"ok": false, "error": "..."}` dict instead of propagating a raw Triton C++ exception to the MCP client.
-
-#### New Tools (from other development team)
-- **`api_flirt.py`** — FLIRT signature management tools
-- **`api_recon.py`** — Stripped binary reconnaissance tools (sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection)
-- **`api_sigmaker.py`** — Signature creation, scanning, and xref-based signature generation
-
-#### Other Improvements
-- `_sigmaker.py` — Enhanced signature search capabilities
-- `api_analysis.py` — Extended analysis coverage
-- `api_debug.py` — Enhanced debugger support
-- `api_modify.py` — Enhanced database modification tools
-- `compat.py` — Extended IDA 8.3–9.0 compatibility shims
-- `sync.py` — Improved thread-safety decorators
-- `utils.py` — Enhanced utility functions
-
----
-
-## [Unreleased] — Phase 3.9 — Miasm Consolidation
-
-**Status: 8/8 issues fixed.**
-
-#### Critical Bug Fixes
-- **Fixed `miasm_search_instruction_pattern` availability guard in docstring.** The `if not MIASM_AVAILABLE:` check was indented inside the function's docstring, making it dead code for months. Moved the check to be the first line of the actual function body.
-- **Fixed `miasm_get_cfg_dot` / `miasm_find_paths` duplicate definition.** When `miasm_get_cfg_summary` was inserted before `miasm_get_cfg_dot`, a line-shift caused the `miasm_find_paths` function definition to accidentally overwrite `miasm_get_cfg_dot`'s signature. Restored `miasm_get_cfg_dot` with its correct `address` parameter and docstring.
-
-#### Robustness Fixes
-- **`_MiasmManager.get_bytes` now returns `bytes | None`** instead of raising `IDAError`. All 11 call sites updated to check for `None` and return structured error dicts.
-- **`_trace_data_flow_internal` now always returns `dict`** instead of `dict | list[str]`. `miasm_trace_data_flow` no longer needs `isinstance` checks.
-- **Added null checks for `get_bytes` at all 11 call sites.** Every tool now checks for `None` and returns a structured error dict instead of crashing.
-
-#### New Tools
-- **`miasm_get_cfg_summary`** — block count, edge count, cyclomatic complexity (E - N + 2), and loop detection via Tarjan's SCC.
-- **`miasm_annotate_data_flow`** — traces data-flow origins and writes IDA comments at each origin instruction (`@unsafe`). Uses `func.addresses` iteration + `ida_ua.decode_insn` + `idaapi.generate_disasm_line` for reliable IDA-side annotation.
-- **`miasm_solve_path_constraints`** — Miasm CFG path enumeration. Falls back gracefully when Triton is absent (returns path addresses without Z3 model).
-
-#### Tool Inventory (post-Phase 3.9)
-| Tool | Status |
-|------|--------|
-| `miasm_status`, `miasm_sync`, `miasm_init`, `miasm_get_context_info`, `miasm_reset` | ✅ Working |
-| `miasm_lift_to_ir`, `miasm_lift_function`, `miasm_get_ssa` | ✅ Working |
-| `miasm_get_cfg_dot`, `miasm_get_cfg_summary` | ✅ Working (new: cfg_summary) |
-| `miasm_find_paths`, `miasm_deobfuscate_cfg`, `miasm_simplify_block` | ✅ Working |
-| `miasm_emulate_symbolic`, `miasm_get_function_side_effects`, `miasm_trace_data_flow` | ✅ Working |
-| `miasm_annotate_data_flow` | ✅ New — uses `func.addresses` + `ida_ua.decode_insn` + `idaapi.generate_disasm_line` for IDA-native annotation |
-| `miasm_assemble`, `miasm_patch_instruction` | ✅ Working |
-| `miasm_search_instruction_pattern` | ✅ Fixed (was dead code guard in docstring) |
-| `miasm_solve_path_constraints` | ✅ New |
 
 ---
 

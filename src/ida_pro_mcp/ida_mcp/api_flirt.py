@@ -16,6 +16,7 @@ import ida_funcs
 import ida_typeinf
 import idautils
 
+from .utils import tool_error, item_error
 from .rpc import tool
 from .sync import idasync
 
@@ -151,7 +152,7 @@ def apply_flirt_signature(
 
     except Exception as e:
         logger.exception("apply_flirt_signature failed")
-        return {"ok": False, "error": str(e)}
+        return tool_error(e)
 
 
 @tool
@@ -234,7 +235,7 @@ def load_type_library(
 
     except Exception as e:
         logger.exception("load_type_library failed")
-        return {"ok": False, "error": str(e)}
+        return tool_error(e)
 
 
 @tool
@@ -270,4 +271,4 @@ def list_type_libraries() -> ListTilResult:
 
     except Exception as e:
         logger.exception("list_type_libraries failed")
-        return {"ok": False, "error": str(e)}
+        return tool_error(e)

@@ -1,5 +1,6 @@
 import fnmatch
 import json
+import logging
 import os
 import re
 import struct
@@ -596,6 +597,51 @@ class Page(TypedDict, Generic[T]):
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+_log = logging.getLogger(__name__)
+
+
+def _classify_exc(exc: Exception) -> str:
+    """Map an exception to a broad error-type string for structured reporting."""
+    if isinstance(exc, IDAError):
+        return "ida_error"
+    if isinstance(exc, (ValueError, TypeError)):
+        return "invalid_input"
+    msg = str(exc).lower()
+    if any(w in msg for w in ("not found", "no function", "badaddr", "not mapped")):
+        return "not_found"
+    return "internal_error"
+
+
+def tool_error(exc: Exception, context: str = "", hint: str | None = None) -> dict:
+    """Build a top-level structured error dict and log the exception with traceback.
+
+    Returns ``{"ok": False, "error": "<context>: <msg>", "error_type": "..."}``.
+    Call this inside a top-level ``except`` block so ``_log.exception`` captures
+    the active traceback.
+    """
+    msg = str(exc)
+    error_str = f"{context}: {msg}" if (context and msg) else (context or msg)
+    result: dict = {"ok": False, "error": error_str, "error_type": _classify_exc(exc)}
+    if hint:
+        result["hint"] = hint
+    _log.exception("Tool error [%s]: %s", context or type(exc).__name__, msg)
+    return result
+
+
+def item_error(exc: Exception, context: str = "", hint: str | None = None) -> dict:
+    """Build a per-item error dict (no ``ok`` key) and log the exception.
+
+    Use inside batch-operation loops where each item in the result list carries
+    its own error field.  Returns ``{"error": "<context>: <msg>", "error_type": "..."}``.
+    """
+    msg = str(exc)
+    error_str = f"{context}: {msg}" if (context and msg) else (context or msg)
+    result: dict = {"error": error_str, "error_type": _classify_exc(exc)}
+    if hint:
+        result["hint"] = hint
+    _log.exception("Item error [%s]: %s", context or type(exc).__name__, msg)
+    return result
 
 
 def get_image_size() -> int:

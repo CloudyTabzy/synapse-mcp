@@ -32,6 +32,11 @@ except Exception:
     pass
 
 try:
+    from . import test_api_construct
+except Exception:
+    pass
+
+try:
     from . import test_hybrid
 except Exception:
     pass
