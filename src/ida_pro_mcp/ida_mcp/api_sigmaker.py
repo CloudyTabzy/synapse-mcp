@@ -345,3 +345,61 @@ def find_xref_signatures(
                 "error": str(e),
             })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Signature scanning
+# ---------------------------------------------------------------------------
+
+
+class ScanMatch(TypedDict):
+    addr: str
+
+
+class ScanSignatureResult(TypedDict, total=False):
+    ok: bool
+    pattern: str
+    match_count: int
+    truncated: bool
+    matches: list[ScanMatch]
+    error: str
+
+
+@tool
+@idasync
+def scan_signature(
+    pattern: Annotated[
+        str,
+        "Byte pattern to search for. Accepts IDA format ('E8 ? ? ? ? 90'), "
+        "x64dbg format, or hex string. Use ? or ?? as wildcards.",
+    ],
+    max_results: Annotated[int, "Maximum number of match addresses to return (default 200)"] = 200,
+) -> ScanSignatureResult:
+    """Scan the loaded binary for all occurrences of a byte pattern.
+
+    Returns each matching address. Wildcards (? or ??) skip individual bytes.
+
+    Examples:
+      'E8 ? ? ? ? 90'   — call followed by NOP
+      'FF 25 ?? ?? ?? ??' — indirect jump (x64 style)
+    """
+    try:
+        if not pattern.strip():
+            return {"ok": False, "error": "Pattern must not be empty"}
+
+        searcher = _sm.SignatureSearcher.from_signature(pattern.strip())
+        results = searcher.search()
+
+        all_matches = results.matches
+        truncated = len(all_matches) > max_results
+        matches = [{"addr": hex(m.address)} for m in all_matches[:max_results]]
+
+        return {
+            "ok": True,
+            "pattern": pattern.strip(),
+            "match_count": len(all_matches),
+            "truncated": truncated,
+            "matches": matches,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

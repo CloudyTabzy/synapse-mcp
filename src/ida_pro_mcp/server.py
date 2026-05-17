@@ -59,6 +59,14 @@ except ImportError:
 
         sys.path.pop(0)
 
+try:
+    from .ida_mcp.rpc import MCP_SERVER_NAME
+except ImportError:
+    try:
+        from ida_mcp.rpc import MCP_SERVER_NAME
+    except ImportError:
+        MCP_SERVER_NAME = "ida-pro-triton-miasm-mcp"
+
 class ProxyInstanceInfo(TypedDict, total=False):
     host: str
     port: int
@@ -83,7 +91,7 @@ DEFAULT_IDA_PORT = 13337
 IDA_HOST = DEFAULT_IDA_HOST
 IDA_PORT = DEFAULT_IDA_PORT
 
-mcp = McpServer("ida-pro-mcp")
+mcp = McpServer(MCP_SERVER_NAME)
 dispatch_original = mcp.registry.dispatch
 
 LOCAL_TOOLS = {"list_instances", "select_instance"}

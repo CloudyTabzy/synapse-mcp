@@ -31,7 +31,14 @@ except ImportError:
     )
     from installer_tui import interactive_choose, interactive_select
 
-MCP_SERVER_NAME = "ida-pro-mcp"
+try:
+    from .ida_mcp.rpc import MCP_SERVER_NAME
+except ImportError:
+    try:
+        from ida_mcp.rpc import MCP_SERVER_NAME
+    except ImportError:
+        MCP_SERVER_NAME = "ida-pro-triton-miasm-mcp"
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server.py")
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")

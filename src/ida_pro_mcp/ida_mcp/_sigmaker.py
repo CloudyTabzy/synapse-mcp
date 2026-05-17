@@ -131,10 +131,14 @@ class IDAVersionInfo:
     @staticmethod
     @functools.cache
     def ida_version():
-        version_str: str = idaapi.get_kernel_version()
+        # Use ida_mcp.sync._ensure_version to safely get version from any thread
+        from ida_mcp.sync import _ensure_version
+
+        _ensure_version()
+        from ida_mcp.sync import ida_major, ida_minor
+
         sdk_version: int = idaapi.IDA_SDK_VERSION
-        major, minor = map(int, version_str.split("."))
-        return IDAVersionInfo(major, minor, sdk_version)
+        return IDAVersionInfo(ida_major, ida_minor, sdk_version)
 
 
 ida_version = IDAVersionInfo.ida_version

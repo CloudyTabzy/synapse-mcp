@@ -9,9 +9,10 @@ from .zeromcp import (
     get_current_request_external_base_url,
 )
 
+MCP_SERVER_NAME = "ida-pro-triton-miasm-mcp"
 MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
-MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
+MCP_SERVER = McpServer(MCP_SERVER_NAME, extensions=MCP_EXTENSIONS)
 
 # ============================================================================
 # Output Size Limiting

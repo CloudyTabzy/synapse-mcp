@@ -23,6 +23,7 @@ Core API modules (upstream):
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://` MCP resources
 - `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection
+- `api_flirt.py`: FLIRT signature management tools
 
 Optional analysis engine modules (this fork):
 - `api_triton.py`: Triton symbolic execution — 38 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, snapshots, instruction trace replay, IDA annotation, taint highlighting, and backward slicing. Requires `pip install triton-library`.

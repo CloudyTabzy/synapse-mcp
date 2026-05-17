@@ -70,6 +70,19 @@ def _import_zeromcp():
 McpServer = _import_zeromcp()
 
 
+def _import_rpc_name():
+    """Import MCP_SERVER_NAME from ida_mcp.rpc without triggering full plugin load."""
+    pkg_dir = Path(__file__).resolve().parent / "ida_mcp"
+    sys.path.insert(0, str(pkg_dir))
+    try:
+        from rpc import MCP_SERVER_NAME  # type: ignore
+    except ImportError:
+        MCP_SERVER_NAME = "ida-pro-triton-miasm-mcp"
+    finally:
+        sys.path.remove(str(pkg_dir))
+    return MCP_SERVER_NAME
+
+
 def _import_discovery():
     """Import pure-Python GUI instance discovery without importing ida_mcp."""
     path = Path(__file__).resolve().parent / "ida_mcp" / "discovery.py"
@@ -82,6 +95,9 @@ def _import_discovery():
 
 
 _discovery = _import_discovery()
+
+
+MCP_SERVER_NAME = _import_rpc_name()
 
 
 class IdalibContextFields(TypedDict):
@@ -887,7 +903,7 @@ class IdalibSupervisor:
         return copy.deepcopy(items)
 
 
-mcp = McpServer("ida-pro-mcp")
+mcp = McpServer(MCP_SERVER_NAME)
 supervisor: IdalibSupervisor | None = None
 _original_dispatch = mcp.registry.dispatch
 

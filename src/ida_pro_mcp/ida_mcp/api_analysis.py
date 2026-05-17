@@ -2410,3 +2410,94 @@ def callgraph(
             results.append({"root": root, "error": str(e), "nodes": [], "edges": []})
 
     return results
+
+
+# ============================================================================
+# IDA-native CFG export (Graphviz DOT)
+# ============================================================================
+
+
+class CfgDotResult(TypedDict, total=False):
+    ok: bool
+    address: str
+    name: str
+    block_count: int
+    dot: str
+    error: str
+
+
+@tool
+@idasync
+def get_cfg_dot(
+    address: Annotated[str, "Function start address or name"],
+) -> CfgDotResult:
+    """Export a function's control flow graph in Graphviz DOT format.
+
+    Uses IDA's native gen_flow_graph with CHART_GEN_DOT to write a temporary
+    .dot file, then returns the content. The DOT string can be rendered with
+    any Graphviz-compatible tool (dot, xdot, online viewers).
+
+    Does not require Miasm — works on any architecture IDA supports.
+    """
+    import os
+    import tempfile
+    import ida_gdl
+
+    try:
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {address}"}
+
+        name = ida_name.get_ea_name(func.start_ea) or hex(func.start_ea)
+
+        # Count basic blocks via FlowChart for metadata
+        fc = ida_gdl.FlowChart(func)
+        block_count = sum(1 for _ in fc)
+
+        # Write DOT to a temp file; IDA appends .dot automatically on some versions,
+        # so use a path without extension and check both.
+        tmp_fd, tmp_base = tempfile.mkstemp()
+        os.close(tmp_fd)
+        os.unlink(tmp_base)  # gen_flow_graph creates the file itself
+
+        dot_path = tmp_base + ".dot"
+
+        try:
+            ok = ida_gdl.gen_flow_graph(
+                dot_path,
+                f"CFG: {name}",
+                func,
+                func.start_ea,
+                func.end_ea,
+                ida_gdl.CHART_GEN_DOT,
+            )
+            # Some IDA versions write without the .dot extension
+            if not ok or not os.path.isfile(dot_path):
+                if os.path.isfile(tmp_base):
+                    dot_path = tmp_base
+                    ok = True
+
+            if not ok:
+                return {"ok": False, "error": "gen_flow_graph returned False — check IDA version supports CHART_GEN_DOT"}
+
+            with open(dot_path, "r", encoding="utf-8", errors="replace") as f:
+                dot_content = f.read()
+        finally:
+            for p in (tmp_base, dot_path):
+                try:
+                    if os.path.isfile(p):
+                        os.unlink(p)
+                except OSError:
+                    pass
+
+        return {
+            "ok": True,
+            "address": hex(func.start_ea),
+            "name": name,
+            "block_count": block_count,
+            "dot": dot_content,
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

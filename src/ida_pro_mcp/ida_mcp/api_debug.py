@@ -544,23 +544,57 @@ def dbg_bps() -> list[Breakpoint]:
     return list_breakpoints()
 
 
+_BPT_TYPE_MAP: dict[str, tuple[int, int]] = {
+    # (ida_type_constant, size)
+    "software":      (idaapi.BPT_SOFT, 0),
+    "hardware_exec": (idaapi.BPT_EXEC, 1),
+    "hardware_rw":   (idaapi.BPT_RDWR, 1),
+    "hardware_write":(idaapi.BPT_WRITE, 1),
+}
+
+
 @ext("dbg")
 @unsafe
 @tool
 @idasync
 def dbg_add_bp(
     addrs: Annotated[list[str] | str, "Address(es) to add breakpoints at"],
+    bpt_type: Annotated[
+        str,
+        "Breakpoint type: 'software' (default), 'hardware_exec', "
+        "'hardware_rw' (read/write), 'hardware_write'. "
+        "Hardware breakpoints require a running debugger session.",
+    ] = "software",
+    size: Annotated[
+        int,
+        "Size in bytes for hardware breakpoints (1, 2, or 4). "
+        "Ignored for software breakpoints.",
+    ] = 1,
 ) -> list[BreakpointResult]:
-    """Add breakpoints at one or more addresses."""
+    """Add breakpoints at one or more addresses.
+
+    Software breakpoints (default) replace the instruction byte with INT3.
+    Hardware breakpoints use CPU debug registers and do not modify code —
+    useful for read/write monitoring or when code integrity checks are present.
+    """
     addrs = normalize_list_input(addrs)
     results = []
+
+    bpt_key = bpt_type.lower().strip()
+    if bpt_key not in _BPT_TYPE_MAP:
+        valid = list(_BPT_TYPE_MAP)
+        return [{"error": f"Unknown bpt_type '{bpt_type}'. Valid: {valid}"}]
+
+    ida_type, default_size = _BPT_TYPE_MAP[bpt_key]
+    bp_size = size if bpt_key != "software" else 0
 
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            if idaapi.add_bpt(ea, 0, idaapi.BPT_SOFT):
+            if idaapi.add_bpt(ea, bp_size, ida_type):
                 results.append({"addr": addr, "ok": True})
             else:
+                # add_bpt can return False if the bp already exists at that addr
                 breakpoints = list_breakpoints()
                 for bpt in breakpoints:
                     if bpt["addr"] == hex(ea):
@@ -1001,3 +1035,51 @@ def dbg_write(
             results.append({"addr": region.get("addr"), "size": 0, "error": str(e)})
 
     return results
+
+
+# ============================================================================
+# Debugger: attach to running process
+# ============================================================================
+
+_ATTACH_RESULTS = {
+    1:  ("ok", "Attached successfully"),
+    0:  ("cancelled", "User cancelled or no process selected"),
+    -1: ("failed", "Cannot attach (process died, insufficient privileges, or unsupported debugger)"),
+    -2: ("no_process", "No compatible process found for the given PID"),
+    -3: ("not_supported", "Current debugger backend does not support attach"),
+    -4: ("not_initialized", "Debugger not initialized — load a debugger plugin first"),
+}
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_attach_pid(
+    pid: Annotated[int, "Process ID of the running process to attach to"],
+) -> DebugControlResult:
+    """Attach IDA's debugger to an already-running process by PID.
+
+    The appropriate debugger plugin for the target platform must be selected
+    in Debugger → Select debugger before calling this tool.
+
+    Return states: 'attached', 'cancelled', 'failed', 'no_process',
+    'not_supported', 'not_initialized'.
+    """
+    try:
+        if not ida_dbg.is_debugger_on():
+            # Attempt attach — IDA will select the correct backend if one is loaded
+            pass
+
+        rc = ida_dbg.attach_process(pid, -1)
+        state_key, message = _ATTACH_RESULTS.get(rc, ("failed", f"Unexpected return code {rc}"))
+
+        if rc == 1:
+            return {"started": True, "state": "attached", "running": True}
+        elif rc == 0:
+            return {"state": "cancelled", "error": message}
+        else:
+            return {"state": state_key, "error": message}
+
+    except Exception as e:
+        return {"state": "error", "error": str(e)}

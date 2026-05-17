@@ -8,7 +8,8 @@ Architecture:
 - mcp.py: MCP protocol server (HTTP/SSE)
 - sync.py: IDA synchronization decorator (@idasync)
 - utils.py: Shared helpers and TypedDict definitions
-- api_*.py: Modular API implementations (75 tools + 24 resources)
+- api_*.py: Modular API implementations
+- api_flirt.py: FLIRT signature and type library tools
 - api_triton.py: Triton symbolic execution tools (optional, requires triton-library)
 - api_miasm.py: Miasm IR analysis tools (optional, requires miasm)
 """
@@ -41,6 +42,8 @@ from . import api_composite
 from . import api_discovery
 from . import trace as trace
 from . import api_sigmaker
+from . import api_flirt
+from . import api_recon
 from . import api_tasks
 
 # Optional analysis engine modules — load only when dependencies are present.
@@ -85,6 +88,8 @@ __all__ = [
     "api_composite",
     "api_discovery",
     "api_sigmaker",
+    "api_flirt",
+    "api_recon",
     # Optional analysis engines (None when deps absent)
     "api_triton",
     "api_miasm",

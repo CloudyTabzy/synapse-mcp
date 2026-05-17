@@ -143,6 +143,33 @@ Added 7 modular workflow skills under `skills/`:
 
 ---
 
+## [Unreleased] — Phase 3.10 — Stress Test Fixes
+
+**Status: 5/5 bugs fixed, stress-tested against map2dif_plus.exe.i64 (8534 functions, 32-bit x86) at port 13337.**
+
+#### Bug Fixes
+- **Fixed `miasm_simplify_block` / `miasm_emulate_symbolic` crash on `ExprMem`.** Miasm's `Expr` base class has no `.simplify()` method — that was a phantom API that never existed. The correct call is `expr_simp(expr)` from `miasm.expression.simplifications`. All `expr.simplify()` calls replaced with `expr_simp(expr)` + try/except fallback.
+- **Fixed `miasm_assemble` / `miasm_patch_instruction` assembly parse failure.** Miasm's x86 parser doesn't accept `DWORD PTR`, uppercase `0X` hex, or MASM-style syntax. Added `_miasmize()` normalizer that strips size prefixes (`DWORD/WORD/BYTE/QWORD PTR`), lowercases `0X→0x`, and preserves mixed-case registers. Fix requires IDA restart to take effect (module reload needed).
+- **Fixed `miasm_trace_data_flow` silent empty output.** When origins list is empty, now returns a `note` field explaining possible causes instead of a bare empty list.
+- **Fixed `task_submit` missing `addr` parameter error.** `arguments` dict not properly converted to `MCPRequest` in the task backend — fixed in `api_tasks.py`.
+- **Fixed `triton_backward_slice` dead symbolic variable TypeError.** Now returns a clear `{"ok": false, "error": "..."}` dict instead of propagating a raw Triton C++ exception to the MCP client.
+
+#### New Tools (from other development team)
+- **`api_flirt.py`** — FLIRT signature management tools
+- **`api_recon.py`** — Stripped binary reconnaissance tools (sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection)
+- **`api_sigmaker.py`** — Signature creation, scanning, and xref-based signature generation
+
+#### Other Improvements
+- `_sigmaker.py` — Enhanced signature search capabilities
+- `api_analysis.py` — Extended analysis coverage
+- `api_debug.py` — Enhanced debugger support
+- `api_modify.py` — Enhanced database modification tools
+- `compat.py` — Extended IDA 8.3–9.0 compatibility shims
+- `sync.py` — Improved thread-safety decorators
+- `utils.py` — Enhanced utility functions
+
+---
+
 ## [Unreleased] — Phase 3.9 — Miasm Consolidation
 
 **Status: 8/8 issues fixed.**

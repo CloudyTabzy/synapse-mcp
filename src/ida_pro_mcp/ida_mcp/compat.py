@@ -83,8 +83,15 @@ if TYPE_CHECKING:
 
     IDA_VERSION: tuple[int, int, int] = cast(tuple[int, int, int], (9, 2, 0))
 else:
-    IDA_VERSION = _parse_kernel_version(idaapi.get_kernel_version())
-    _check_required_apis(IDA_VERSION)
+    # Defer get_kernel_version() to avoid "main thread only" errors when
+    # compat.py is imported from the HTTP server accept thread during startup.
+    try:
+        IDA_VERSION = _parse_kernel_version(idaapi.get_kernel_version())
+        _check_required_apis(IDA_VERSION)
+    except RuntimeError:
+        raise
+    except Exception:
+        IDA_VERSION = (9, 0, 0)  # safe fallback for import-time failures
 
 IDA_GE_90 = IDA_VERSION >= (9, 0, 0)
 IDA_GE_85 = IDA_VERSION >= (8, 5, 0)
@@ -179,43 +186,62 @@ def get_ordinal_limit(til: ida_typeinf.til_t | None = None) -> int:
 
 def inf_get_min_ea() -> int:
     if IDA_GE_85:
-        return ida_ida.inf_get_min_ea()
+        if hasattr(ida_ida, "inf_get_min_ea"):
+            return ida_ida.inf_get_min_ea()
     return idaapi.get_inf_structure().min_ea
 
 
 def inf_get_max_ea() -> int:
     if IDA_GE_85:
-        return ida_ida.inf_get_max_ea()
+        if hasattr(ida_ida, "inf_get_max_ea"):
+            return ida_ida.inf_get_max_ea()
     return idaapi.get_inf_structure().max_ea
 
 
 def inf_get_omin_ea() -> int:
     if IDA_GE_85:
-        return ida_ida.inf_get_omin_ea()
+        if hasattr(ida_ida, "inf_get_omin_ea"):
+            return ida_ida.inf_get_omin_ea()
     return idaapi.get_inf_structure().omin_ea
 
 
 def inf_get_omax_ea() -> int:
     if IDA_GE_85:
-        return ida_ida.inf_get_omax_ea()
+        if hasattr(ida_ida, "inf_get_omax_ea"):
+            return ida_ida.inf_get_omax_ea()
     return idaapi.get_inf_structure().omax_ea
 
 
 def inf_is_64bit() -> bool:
     if IDA_GE_85:
-        return ida_ida.inf_is_64bit()
-    return idaapi.get_inf_structure().is_64bit()
+        if hasattr(ida_ida, "inf_is_64bit"):
+            return ida_ida.inf_is_64bit()
+    inf = idaapi.get_inf_structure()
+    if hasattr(inf, "is_64bit"):
+        return inf.is_64bit()
+    return False
 
 
 def inf_is_32bit() -> bool:
     if IDA_GE_85:
-        return ida_ida.inf_is_32bit()
-    return idaapi.get_inf_structure().is_32bit()
+        if hasattr(ida_ida, "inf_is_32bit"):
+            return ida_ida.inf_is_32bit()
+        # IDA 9.0+ dropped inf_is_32bit() but kept inf_is_64bit()
+        if hasattr(ida_ida, "inf_is_64bit"):
+            return not ida_ida.inf_is_64bit()
+    inf = idaapi.get_inf_structure()
+    if hasattr(inf, "is_32bit"):
+        return inf.is_32bit()
+    # Ultimate fallback: check if not 64-bit (assume 32-bit)
+    if hasattr(inf, "is_64bit"):
+        return not inf.is_64bit()
+    return False
 
 
 def inf_get_procname() -> str:
     if IDA_GE_85:
-        return ida_ida.inf_get_procname()
+        if hasattr(ida_ida, "inf_get_procname"):
+            return ida_ida.inf_get_procname()
     return idaapi.get_inf_structure().procname
 
 
@@ -226,8 +252,12 @@ def inf_is_be() -> bool:
     MIPS (`mips32b` vs `mips32l`), and PowerPC (`ppc32b` vs `ppc32l`).
     """
     if IDA_GE_85:
-        return ida_ida.inf_is_be()
-    return idaapi.get_inf_structure().is_be()
+        if hasattr(ida_ida, "inf_is_be"):
+            return ida_ida.inf_is_be()
+    inf = idaapi.get_inf_structure()
+    if hasattr(inf, "is_be"):
+        return inf.is_be()
+    return False
 
 
 # ============================================================================

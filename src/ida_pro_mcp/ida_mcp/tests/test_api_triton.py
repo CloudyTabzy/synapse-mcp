@@ -337,8 +337,8 @@ def test_triton_snapshot_save_list_delete():
 
     save_result = triton_snapshot_save("test_snapshot")
     assert isinstance(save_result, dict), f"expected dict, got {type(save_result)}"
-    snap_id = save_result.get("id")
-    assert snap_id is not None, f"Expected snapshot id in {save_result}"
+    snap_id = save_result.get("snapshot_id")
+    assert snap_id is not None, f"Expected snapshot_id in {save_result}"
 
     listing = triton_snapshot_list()
     assert isinstance(listing, dict), f"expected dict, got {type(listing)}"
@@ -358,7 +358,7 @@ def test_triton_snapshot_restore():
     triton_symbolize_register("rcx", "restore_test")
 
     save_result = triton_snapshot_save("restore_snap")
-    snap_id = save_result.get("id")
+    snap_id = save_result.get("snapshot_id")
     assert snap_id is not None
 
     triton_reset()
@@ -368,8 +368,9 @@ def test_triton_snapshot_restore():
     assert restore_result.get("ok") is True, f"Unexpected restore result: {restore_result}"
 
     vars_after = triton_get_symbolic_variables()
-    assert isinstance(vars_after, list)
-    assert len(vars_after) >= 1, "Expected at least one symbolic variable after restore"
+    assert isinstance(vars_after, dict), f"expected dict, got {type(vars_after)}"
+    assert vars_after.get("ok") is True
+    assert vars_after.get("count", 0) >= 1, "Expected at least one symbolic variable after restore"
 
 
 # ============================================================================

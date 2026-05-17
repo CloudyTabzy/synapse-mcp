@@ -12,7 +12,10 @@ import ida_funcs
 import ida_ua
 
 from .compat import tinfo_get_udm
-from .rpc import tool
+import ida_nalt
+import ida_xref
+
+from .rpc import tool, unsafe
 from .sync import idasync, IDAError
 from .utils import (
     parse_address,
@@ -44,9 +47,10 @@ class AppendCommentResult(TypedDict):
     error: NotRequired[str]
 
 
-class PatchAsmResult(TypedDict):
+class PatchAsmResult(TypedDict, total=False):
     addr: str
-    error: NotRequired[str]
+    verified: bool
+    error: str
 
 
 class RenameItemResult(TypedDict, total=False):
@@ -269,31 +273,47 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
     for item in items:
         addr_str = item.get("addr", "")
         instructions = item.get("asm", "")
+        expected_bytes_str: str | None = item.get("expected_bytes")  # type: ignore[assignment]
 
         try:
             ea = parse_address(addr_str)
+
+            # Pre-flight byte verification
+            if expected_bytes_str:
+                expected = bytes(
+                    int(b, 16)
+                    for b in expected_bytes_str.strip().split()
+                )
+                live = ida_bytes.get_bytes(ea, len(expected))
+                if live != expected:
+                    results.append({
+                        "addr": addr_str,
+                        "verified": False,
+                        "error": (
+                            f"Byte mismatch at {hex(ea)}: "
+                            f"expected {expected_bytes_str.upper()}, "
+                            f"found {' '.join(f'{b:02X}' for b in (live or b''))}"
+                        ),
+                    })
+                    continue
+                results_entry: PatchAsmResult = {"addr": addr_str, "verified": True}
+            else:
+                results_entry = {"addr": addr_str}
+
             assembles = instructions.split(";")
             for assemble in assembles:
                 assemble = assemble.strip()
                 try:
                     (check_assemble, bytes_to_patch) = idautils.Assemble(ea, assemble)
                     if not check_assemble:
-                        results.append(
-                            {
-                                "addr": addr_str,
-                                "error": f"Failed to assemble: {assemble}",
-                            }
-                        )
+                        results_entry["error"] = f"Failed to assemble: {assemble}"
                         break
                     ida_bytes.patch_bytes(ea, bytes_to_patch)
                     ea += len(bytes_to_patch)
                 except Exception as e:
-                    results.append(
-                        {"addr": addr_str, "error": f"Failed at {hex(ea)}: {e}"}
-                    )
+                    results_entry["error"] = f"Failed at {hex(ea)}: {e}"
                     break
-            else:
-                results.append({"addr": addr_str})
+            results.append(results_entry)
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
 
@@ -912,3 +932,109 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[DefineResult]:
             results.append({"addr": addr_str, "error": str(e)})
 
     return results
+
+
+# ============================================================================
+# Xref creation
+# ============================================================================
+
+
+class AddXrefResult(TypedDict, total=False):
+    ok: bool
+    from_addr: str
+    to_addr: str
+    xref_type: str
+    error: str
+
+
+_CODE_XREF_TYPES = {
+    "call_near":  ida_xref.fl_CN,
+    "call_far":   ida_xref.fl_CF,
+    "jump_near":  ida_xref.fl_JN,
+    "jump_far":   ida_xref.fl_JF,
+    "flow":       ida_xref.fl_F,
+}
+_DATA_XREF_TYPES = {
+    "data_offset": ida_xref.dr_O,
+    "data_read":   ida_xref.dr_R,
+    "data_write":  ida_xref.dr_W,
+}
+
+
+@unsafe
+@tool
+@idasync
+def add_xref(
+    from_addr: Annotated[str, "Source address of the cross-reference"],
+    to_addr: Annotated[str, "Target address of the cross-reference"],
+    xref_type: Annotated[
+        str,
+        "Reference type. Code: 'call_near', 'call_far', 'jump_near', 'jump_far', 'flow'. "
+        "Data: 'data_offset', 'data_read', 'data_write'. Default: 'call_near'.",
+    ] = "call_near",
+) -> AddXrefResult:
+    """Add a user-defined cross-reference between two addresses.
+
+    User xrefs (XREF_USER flag) persist across IDA reanalysis unlike
+    auto-generated ones. Incorrect xrefs corrupt analysis — use with care.
+    """
+    try:
+        frm = parse_address(from_addr)
+        to  = parse_address(to_addr)
+        xtype = xref_type.lower().strip()
+
+        if xtype in _CODE_XREF_TYPES:
+            ok = ida_xref.add_cref(frm, to, _CODE_XREF_TYPES[xtype] | ida_xref.XREF_USER)
+        elif xtype in _DATA_XREF_TYPES:
+            ok = ida_xref.add_dref(frm, to, _DATA_XREF_TYPES[xtype] | ida_xref.XREF_USER)
+        else:
+            valid = list(_CODE_XREF_TYPES) + list(_DATA_XREF_TYPES)
+            return {"ok": False, "error": f"Unknown xref_type '{xref_type}'. Valid: {valid}"}
+
+        if not ok:
+            return {
+                "ok": False,
+                "from_addr": from_addr,
+                "to_addr": to_addr,
+                "error": "IDA rejected the xref (addresses may be invalid or xref already exists)",
+            }
+
+        return {"ok": True, "from_addr": hex(frm), "to_addr": hex(to), "xref_type": xtype}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ============================================================================
+# Type removal
+# ============================================================================
+
+
+class RemoveTypeResult(TypedDict, total=False):
+    ok: bool
+    addr: str
+    error: str
+
+
+@tool
+@idasync
+def remove_type(
+    addr: Annotated[str, "Address to remove type information from"],
+) -> RemoveTypeResult:
+    """Remove the type annotation applied to an address or function.
+
+    Clears the stored tinfo_t so IDA reverts to auto-inferred type.
+    Useful after applying an incorrect type via set_type or the decompiler.
+    Also invalidates the Hex-Rays decompiler cache for the owning function.
+    """
+    try:
+        ea = parse_address(addr)
+        ida_nalt.del_tinfo(ea)
+        try:
+            if ida_hexrays.init_hexrays_plugin():
+                ida_hexrays.clear_cached_cfuncs()
+        except Exception:
+            pass
+        return {"ok": True, "addr": hex(ea)}
+    except Exception as e:
+        return {"ok": False, "addr": addr, "error": str(e)}

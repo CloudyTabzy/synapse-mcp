@@ -1,0 +1,9 @@
+{
+  "mcp": {
+    "ida-pro-triton-miasm-mcp": {
+      "type": "remote",
+      "url": "http://127.0.0.1:13337/mcp",
+      "enabled": true
+    }
+  }
+}

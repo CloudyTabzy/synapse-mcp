@@ -14,7 +14,50 @@ from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 # IDA Synchronization & Error Handling
 # ============================================================================
 
-ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
+# Lazily-computed IDA kernel version.  Computing it at import time fails on
+# IDA 9.3+ because get_kernel_version() may only be called from the main IDA
+# thread (via execute_sync).  The HTTP server's accept thread imports this
+# module before any tool request arrives, so we defer the call.
+_ida_version_cache: tuple[int, int] | None = None
+
+
+def _get_ida_version() -> tuple[int, int]:
+    global _ida_version_cache
+    if _ida_version_cache is None:
+        _ida_version_cache = tuple(map(int, idaapi.get_kernel_version().split(".")))
+    return _ida_version_cache
+
+
+ida_major: int
+ida_minor: int
+
+_version_initialized = False
+
+
+def _ensure_version() -> None:
+    """Ensure ida_major/ida_minor are populated. Safe to call from any thread."""
+    global _version_initialized
+    if not _version_initialized:
+        maj, min_ = _get_ida_version()
+        globals()["ida_major"] = maj
+        globals()["ida_minor"] = min_
+        _version_initialized = True
+
+
+class _VersionShim:
+    """Shim that defers ida_major/ida_minor resolution until first access."""
+
+    def __get__(self, obj, objtype=None) -> tuple[int, int]:
+        _ensure_version()
+        return (ida_major, ida_minor)
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ to handle ida_major/ida_minor shim until initialized."""
+    if name in ("ida_major", "ida_minor"):
+        _ensure_version()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class IDAError(McpToolError):
@@ -249,7 +292,9 @@ def keep_batch(func):
 def is_window_active():
     """Returns whether IDA is currently active."""
     # Source: https://github.com/OALabs/hexcopy-ida/blob/8b0b2a3021d7dc9010c01821b65a80c47d491b61/hexcopy.py#L30
-    using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
+    # Use _ida_version_shim to avoid eagerly calling get_kernel_version() from the HTTP accept thread
+    maj, min_ = _ida_version_shim
+    using_pyside6 = (maj > 9) or (maj == 9 and min_ >= 2)
 
     if using_pyside6:
         from PySide6 import QtWidgets

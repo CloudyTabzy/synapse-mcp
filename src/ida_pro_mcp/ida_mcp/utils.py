@@ -97,11 +97,17 @@ class CommentAppendOp(TypedDict):
     ]
 
 
-class AsmPatchOp(TypedDict):
+class AsmPatchOp(TypedDict, total=False):
     """Assembly patch operation"""
 
     addr: Annotated[str, "Address (hex or decimal)"]
     asm: Annotated[str, "Assembly instruction(s), semicolon-separated"]
+    expected_bytes: Annotated[
+        str,
+        "Optional hex string of bytes currently at addr (e.g. '48 89 C0'). "
+        "If provided, the patch is only applied when the live bytes match. "
+        "Mismatch returns verified=false and skips the write.",
+    ]
 
 
 class FunctionRename(TypedDict):
@@ -1045,7 +1051,10 @@ def parse_decls_ctypes(decls: str, hti_flags: int) -> tuple[int, list[str]]:
 def get_stack_frame_variables_internal(
     fn_addr: int, raise_error: bool
 ) -> list[StackFrameVariable]:
-    from .sync import ida_major
+    from .sync import _ensure_version
+
+    _ensure_version()
+    from .sync import ida_major  # noqa: F401
 
     if ida_major < 9:
         return []
