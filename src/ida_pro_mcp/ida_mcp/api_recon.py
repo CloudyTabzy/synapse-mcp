@@ -32,7 +32,7 @@ import idc
 
 from .rpc import tool, unsafe
 from .sync import idasync, IDAError
-from .utils import parse_address
+from .utils import parse_address, tool_error
 
 
 # ============================================================================
@@ -204,6 +204,7 @@ class FunctionsRangeResult(TypedDict, total=False):
     functions: list[FunctionEntry]
     count: int
     error: str
+    warnings: list[str]
 
 
 class IndirectCallSite(TypedDict, total=False):
@@ -223,6 +224,7 @@ class IndirectCallsResult(TypedDict, total=False):
     by_offset: dict[str, int]
     count: int
     error: str
+    warnings: list[str]
 
 
 class TraceStep(TypedDict, total=False):
@@ -241,6 +243,7 @@ class TraceResult(TypedDict, total=False):
     chain: list[TraceStep]
     final_source: NotRequired[str]
     error: str
+    warnings: list[str]
 
 
 class ReleaseSite(TypedDict, total=False):
@@ -258,6 +261,7 @@ class CleanupResult(TypedDict, total=False):
     inferred_fields: list[dict]
     count: int
     error: str
+    warnings: list[str]
 
 
 class PrologueHit(TypedDict, total=False):
@@ -276,6 +280,7 @@ class ProloguesResult(TypedDict, total=False):
     candidates_found: int
     functions_created: int
     error: str
+    warnings: list[str]
 
 
 # ============================================================================
@@ -424,7 +429,7 @@ def get_binary_sections() -> SectionsResult:
             )
         return _annotate({"ok": True, "sections": sections, "count": len(sections)})
     except Exception as e:
-        return _annotate({"ok": False, "sections": [], "count": 0, "error": str(e)})
+        return _annotate({**tool_error(e, "enumerate IDB segments"), "sections": [], "count": 0})
 
 
 @tool
@@ -447,7 +452,7 @@ def find_global_writers(
     try:
         target_ea = parse_address(addr)
     except (IDAError, Exception) as e:
-        return {"ok": False, "target": addr, "error": str(e)}
+        return _annotate({**tool_error(e, f"resolve address {addr!r}"), "target": addr})
 
     try:
         writers: list[WriterSite] = []
@@ -479,7 +484,7 @@ def find_global_writers(
             "count": len(writers),
         })
     except Exception as e:
-        return _annotate({"ok": False, "target": hex(target_ea), "error": str(e)})
+        return _annotate({**tool_error(e, f"scan xrefs to {hex(target_ea)}"), "target": hex(target_ea)})
 
 
 @tool
@@ -555,7 +560,7 @@ def find_vtable_candidates(
             "count": len(candidates),
         })
     except Exception as e:
-        return _annotate({"ok": False, "section": section, "error": str(e)})
+        return _annotate({**tool_error(e, f"vtable scan in {section!r}"), "section": section})
 
 
 @tool
@@ -577,7 +582,7 @@ def list_functions_in_range(
         start_ea = parse_address(start)
         end_ea = parse_address(end)
     except (IDAError, Exception) as e:
-        return _annotate({"ok": False, "start": start, "end": end, "error": str(e)})
+        return _annotate({**tool_error(e, f"resolve address range {start!r}-{end!r}"), "start": start, "end": end})
 
     if end_ea <= start_ea:
         return _annotate({
@@ -615,10 +620,9 @@ def list_functions_in_range(
         })
     except Exception as e:
         return _annotate({
-            "ok": False,
+            **tool_error(e, f"list functions {hex(start_ea)}-{hex(end_ea)}"),
             "start": hex(start_ea),
             "end": hex(end_ea),
-            "error": str(e),
         })
 
 
@@ -650,13 +654,13 @@ def find_indirect_calls(
     try:
         start_ea = parse_address(start)
     except (IDAError, Exception) as e:
-        return _annotate({"ok": False, "start": start, "end": end, "error": str(e)})
+        return _annotate({**tool_error(e, f"resolve start address {start!r}"), "start": start, "end": end})
 
     if end:
         try:
             end_ea = parse_address(end)
         except (IDAError, Exception) as e:
-            return _annotate({"ok": False, "start": hex(start_ea), "end": end, "error": str(e)})
+            return _annotate({**tool_error(e, f"resolve end address {end!r}"), "start": hex(start_ea), "end": end})
     else:
         func = ida_funcs.get_func(start_ea)
         if func is None:
@@ -733,10 +737,9 @@ def find_indirect_calls(
         })
     except Exception as e:
         return _annotate({
-            "ok": False,
+            **tool_error(e, f"indirect call scan {hex(start_ea)}-{hex(end_ea)}"),
             "start": hex(start_ea),
             "end": hex(end_ea),
-            "error": str(e),
         })
 
 
@@ -762,7 +765,7 @@ def identify_vtable_call(
     try:
         ea = parse_address(call_addr)
     except (IDAError, Exception) as e:
-        return _annotate({"ok": False, "call_addr": call_addr, "base_reg": "", "chain": [], "error": str(e)})
+        return _annotate({**tool_error(e, f"resolve call address {call_addr!r}"), "call_addr": call_addr, "base_reg": "", "chain": []})
 
     try:
         insn = _decoded_or_none(ea)
@@ -862,11 +865,10 @@ def identify_vtable_call(
         })
     except Exception as e:
         return _annotate({
-            "ok": False,
+            **tool_error(e, f"trace vtable call at {call_addr}"),
             "call_addr": call_addr,
             "base_reg": "",
             "chain": [],
-            "error": str(e),
         })
 
 
@@ -897,7 +899,7 @@ def analyze_cleanup_function(
     try:
         ea = parse_address(addr)
     except (IDAError, Exception) as e:
-        return _annotate({"ok": False, "func": addr, "error": str(e)})
+        return _annotate({**tool_error(e, f"resolve function address {addr!r}"), "func": addr})
 
     func = ida_funcs.get_func(ea)
     if func is None:
@@ -956,7 +958,7 @@ def analyze_cleanup_function(
             "count": len(releases),
         })
     except Exception as e:
-        return _annotate({"ok": False, "func": hex(func.start_ea), "error": str(e)})
+        return _annotate({**tool_error(e, f"analyze cleanup at {hex(func.start_ea)}"), "func": hex(func.start_ea)})
 
 
 def _find_this_load_offset(call_ea: int, base_reg: int, lookback: int) -> int | None:
@@ -1007,8 +1009,8 @@ def _match_with_mask(data: bytes, pattern: bytes, mask: bytes) -> bool:
     return True
 
 
-@tool
 @unsafe
+@tool
 @idasync
 def find_function_prologues(
     start: Annotated[str, "Range start address or section name (e.g. '.text')"],
@@ -1062,14 +1064,13 @@ def find_function_prologues(
                 end_ea = parse_address(end)
     except (IDAError, Exception) as e:
         return _annotate({
-            "ok": False,
+            **tool_error(e, f"parse address for prologue scan (start={start!r})"),
             "start": start,
             "end": end,
             "arch": arch,
             "hits": [],
             "candidates_found": 0,
             "functions_created": 0,
-            "error": str(e),
         })
 
     if end_ea <= start_ea:
@@ -1153,12 +1154,11 @@ def find_function_prologues(
         })
     except Exception as e:
         return _annotate({
-            "ok": False,
+            **tool_error(e, f"prologue scan {hex(start_ea)}-{hex(end_ea)} ({arch})"),
             "start": hex(start_ea),
             "end": hex(end_ea),
             "arch": arch,
             "hits": [],
             "candidates_found": 0,
             "functions_created": 0,
-            "error": str(e),
         })

@@ -2,6 +2,98 @@
 
 All notable changes to this fork of `ida-pro-mcp` are documented in this file.
 
+## [Unreleased] — Phase 5: Binary Format Parsing + Comprehensive Quality Audit
+
+### New Modules
+
+#### `api_construct.py` — Declarative Binary Format Parsing (`construct` library)
+
+Optional module (`pip install construct`). Uses `construct 2.10.x` declarative grammar.
+
+| Tool | Description |
+|------|-------------|
+| `construct_status` | Report availability and construct version (always available) |
+| `construct_parse_binary` | Parse a hex-encoded buffer using any construct template string |
+| `construct_parse_ida_segment` | Parse bytes from an IDA segment by name |
+| `construct_parse_ida_struct` | Parse one or more struct instances starting at an IDA address |
+| `construct_build_struct` | Build binary bytes from a construct template + data dict; optionally patch into IDA (`return_only=False`) |
+
+#### `api_cstruct.py` — C-Syntax Binary Structure Parsing (`dissect.cstruct` library)
+
+Optional module (`pip install dissect.cstruct`). Uses Fox-IT's `dissect.cstruct 4.x`.
+
+| Tool | Description |
+|------|-------------|
+| `cstruct_status` | Report availability and version (always available) |
+| `cstruct_parse_c_definition` | Load a C-syntax struct/enum/typedef block into the registry |
+| `cstruct_define_struct` | Define a single named struct with a list of `{name, type}` field descriptors |
+| `cstruct_parse_at_address` | Parse an IDA address as a named struct type; returns all field values |
+| `cstruct_to_bytes` | Serialize a field-value dict back to raw bytes for a given struct type |
+| `cstruct_list_defined_structs` | List all non-builtin types in the current registry |
+| `cstruct_reset` | Clear the current registry (drops all user-defined types) |
+
+Architecture: **per-endian registry isolation** — `dissect.cstruct` stores a live reference to `cs.endian` rather than snapshotting it at load time. Mutating endianness after loading would retroactively change how all previously-loaded types parse. The implementation uses separate `cstruct` instances keyed by `f"{session}_{endian}"` to avoid this. Both `"little"` and `"big"` endian sessions coexist safely without interference.
+
+#### `api_filetype.py` — Magic-Byte File Type Identification (`filetype` library)
+
+Optional module (`pip install filetype`). Uses `filetype 1.x` for magic-byte detection (261-byte signature window, 79+ formats).
+
+| Tool | Description |
+|------|-------------|
+| `filetype_status` | Report availability and supported-type count (always available) |
+| `filetype_identify_buffer` | Identify a file type from hex-encoded bytes or directly from an IDA address |
+| `filetype_identify_ida_segment` | Identify the file type of the current binary or a named segment |
+| `filetype_list_supported` | List all detectable types; filter by category (image/video/audio/archive/executable/document) |
+
+---
+
+### Bug Fixes — Comprehensive Quality Audit (2 sessions)
+
+This section documents all bugs found and fixed across the entire codebase during a two-session quality review.
+
+#### Critical — Module Load Failures
+
+These bugs prevented entire modules from loading. Because `__init__.py` wraps all imports in `try/except Exception`, the failures were completely silent — all tools in the affected module simply didn't exist at runtime with no log message.
+
+- **`api_stack.py`** — `from .utils import (, tool_error` — leading comma is a Python `SyntaxError`. All three stack tools (`stack_frame`, `declare_stack`, `delete_stack`) were unavailable.
+- **`api_types.py`** — Same `(,` pattern — all type inspection and mutation tools were unavailable.
+- **`api_debug.py`** — Same `(,` import pattern. Also fixed: f-string `f"tid tid"` never interpolated the `tid` variable (2 places); f-string `f"addr region.get("addr")"` was a `SyntaxError` (nested quotes); dead no-op `if not is_debugger_on(): pass` block removed.
+- **`api_filetype.py`** — `NotRequired` used in TypedDict class body but not imported — `NameError` at class definition time. All `filetype_*` tools were unavailable.
+
+#### Critical — Silent Logic Bug
+
+- **`api_cstruct.py` endian registry** — `dissect.cstruct` stores a live reference to `cs.endian`; mutating it after loading retroactively changes all previously-loaded struct parsers. The original code set `reg.endian = ">"`, loaded a struct, then restored `reg.endian = "<"` — making every "big-endian" struct actually parse as little-endian. Fixed by using **separate `cstruct` instances per endian** (`f"{session}_{endian}"` registry key), eliminating all mutation.
+
+#### High — Decorator Order
+
+`@unsafe` must be the outermost decorator (`@unsafe @tool @idasync`) so that it registers the function's `__name__` before `@tool` or `@idasync` can wrap it.
+
+- **`api_python.py`** — `py_eval` and `py_exec_file` had `@tool @idasync @unsafe` (unsafe innermost).
+- **`api_recon.py`** — `find_function_prologues` had `@tool @unsafe @idasync` (tool outermost instead of unsafe).
+- **`api_composite.py`** — `diff_before_after` had `@tool @unsafe @idasync`.
+
+#### High — Hardcoded Developer Machine Paths
+
+- **`api_miasm.py`** — `_PY313_SITE_PACKAGES = r"C:\Users\User\..."` and `_MIASM_SOURCE_PATH = r"C:\Dev\IDA_Pro_Plugin\miasm-master"` were unconditionally injected into `sys.path` at module load time on every machine. On any machine other than the developer's these are no-ops at best and could shadow system packages at worst. Removed entirely along with `_ensure_miasm_in_sys_modules()` and the now-unused `import sys`.
+- **`api_construct.py`**, **`api_cstruct.py`**, **`api_filetype.py`** — Same hardcoded `_PY313_SITE_PACKAGES` pattern. Removed from all three.
+
+#### Medium — Error Shape Inconsistencies
+
+- **`api_composite.py`** — `analyze_component`: two early-return guards missing `"ok": False`. `diff_before_after` action dispatch: f-string interpolated the exception object directly with no `ok` key.
+- **`api_types.py`** — `enum_upsert` outer `except`: `str(exc)` → `item_error(exc, ...)`.
+- **`api_stack.py`** — Three `item_error` calls had literal placeholder strings `f"addr addr"` / `f"addr fn_addr"` instead of interpolating the actual variable.
+- **`api_core.py`** — `item_error(e, f"query query")` — same literal placeholder. Fixed to `f"lookup {query!r}"`.
+- **`api_survey.py`** — `survey_binary` success return missing `"ok": True`; no top-level `try/except`, so any unhandled exception in a sub-call would propagate as an unstructured error. Added both.
+
+#### Low — Minor Bugs
+
+- **`api_construct.py`** — `construct_build_struct` unsafe patching guard checked `"construct_build_struct" not in MCP_UNSAFE`. Since the tool was never decorated with `@unsafe`, its name is never in `MCP_UNSAFE`, so `not in MCP_UNSAFE` was always `True` — patching was permanently blocked regardless of `--unsafe` flag. Removed the broken guard; `return_only=False` with an explicit `output_address` is sufficient opt-in.
+- **`api_sigmaker.py`** — `'ea' in dir()` (incorrect idiom for local variable existence) → `'ea' in locals()`.
+- **`api_miasm.py`** — Six success returns missing `"ok": True` (`miasm_lift_function`, `miasm_get_ssa`, `miasm_deobfuscate_cfg`, `miasm_simplify_block`, `miasm_emulate_symbolic`, `miasm_get_function_side_effects`). `"_debug_note": "ok"` placeholder in `miasm_simplify_block` replaced with `"ok": True`. `miasm_init` / `miasm_reset` fallback `except` now use `tool_error(e, ...)` for consistent logging and `error_type` field.
+- **`api_cstruct.py`** — `cstruct_status` struct count used `dir(reg)` (unreliable, includes methods and inherited attributes) — unified to use `reg.typedefs` iteration matching `cstruct_list_defined_structs`. `_prepare_value` in `cstruct_to_bytes` lost enum context when recursing over array elements — added `elem_type` parameter threading.
+
+---
+
 ## [1.0.0] — 2026-05-16
 
 ### Phase 3 — Advanced Features, Testing & Polish

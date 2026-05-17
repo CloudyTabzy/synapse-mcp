@@ -23,6 +23,8 @@ import idaapi
 from .rpc import tool, unsafe, ext
 from .sync import idasync, keep_batch, get_pre_call_batch, IDAError
 from .utils import (
+    tool_error,
+    item_error,
     RegisterValue,
     ThreadRegisters,
     Breakpoint,
@@ -603,7 +605,7 @@ def dbg_add_bp(
                 else:
                     results.append({"addr": addr, "error": "Failed to set breakpoint"})
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -627,7 +629,7 @@ def dbg_delete_bp(
             else:
                 results.append({"addr": addr, "error": "Failed to delete breakpoint"})
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -660,7 +662,7 @@ def dbg_toggle_bp(
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -758,7 +760,7 @@ def dbg_set_bp_condition(
                 }
             )
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -807,7 +809,7 @@ def dbg_regs_remote(
             regs = _get_registers_for_thread(dbg, tid)
             results.append({"tid": tid, "regs": regs})
         except Exception as e:
-            results.append({"tid": tid, "regs": None, "error": str(e)})
+            results.append({"tid": tid, "regs": None, **item_error(e, f"tid {tid}")})
 
     return results
 
@@ -848,7 +850,7 @@ def dbg_gpregs_remote(
             regs = _get_registers_general_for_thread(dbg, tid)
             results.append({"tid": tid, "regs": regs})
         except Exception as e:
-            results.append({"tid": tid, "regs": None, "error": str(e)})
+            results.append({"tid": tid, "regs": None, **item_error(e, f"tid {tid}")})
 
     return results
 
@@ -997,7 +999,7 @@ def dbg_read(
 
         except Exception as e:
             results.append(
-                {"addr": region.get("addr"), "size": 0, "data": None, "error": str(e)}
+                {"addr": region.get("addr"), "size": 0, "data": None, **item_error(e, "read memory region")}
             )
 
     return results
@@ -1032,7 +1034,7 @@ def dbg_write(
             )
 
         except Exception as e:
-            results.append({"addr": region.get("addr"), "size": 0, "error": str(e)})
+            results.append({"addr": region.get("addr"), "size": 0, **item_error(e, f"dbg_write addr={region.get('addr')}")})
 
     return results
 
@@ -1067,10 +1069,6 @@ def dbg_attach_pid(
     'not_supported', 'not_initialized'.
     """
     try:
-        if not ida_dbg.is_debugger_on():
-            # Attempt attach — IDA will select the correct backend if one is loaded
-            pass
-
         rc = ida_dbg.attach_process(pid, -1)
         state_key, message = _ATTACH_RESULTS.get(rc, ("failed", f"Unexpected return code {rc}"))
 
@@ -1082,4 +1080,4 @@ def dbg_attach_pid(
             return {"state": state_key, "error": message}
 
     except Exception as e:
-        return {"state": "error", "error": str(e)}
+        return {**tool_error(e, "get debug state"), "state": "error"}

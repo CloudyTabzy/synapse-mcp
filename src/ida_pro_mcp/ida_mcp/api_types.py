@@ -11,6 +11,8 @@ import idaapi
 from .rpc import tool
 from .sync import idasync
 from .utils import (
+    tool_error,
+    item_error,
     normalize_list_input,
     normalize_dict_list,
     paginate,
@@ -176,7 +178,7 @@ def declare_type(
             else:
                 results.append({"decl": decl})
         except Exception as e:
-            results.append({"decl": decl, "error": str(e)})
+            results.append({"decl": decl, **item_error(e)})
 
     return results
 
@@ -311,7 +313,7 @@ def enum_upsert(
                 result_dict["error"] = f"{conflict_count} member conflict(s)"
             results.append(result_dict)
         except Exception as exc:
-            results.append({"name": enum_name, "error": str(exc)})
+            results.append({"name": enum_name, **item_error(exc, f"enum_upsert {enum_name!r}")})
 
     return results
 
@@ -461,7 +463,7 @@ def read_struct(
                     "addr": addr_str,
                     "struct": struct_name,
                     "members": None,
-                    "error": str(e),
+                    **item_error(e),
                 }
             )
 
@@ -780,7 +782,7 @@ def type_inspect(
                 {
                     "name": name,
                     "exists": False,
-                    "error": str(e),
+                    **item_error(e),
                 }
             )
 
@@ -1002,7 +1004,7 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
 
         return {"edit": edit, "kind": kind, "error": f"Unknown kind: {kind}"}
     except Exception as e:
-        return {"edit": edit, "error": str(e)}
+        return {"edit": edit, **item_error(e, "apply type edit")}
 
 
 @tool
@@ -1119,7 +1121,7 @@ def infer_types(
                     "inferred_type": None,
                     "method": None,
                     "confidence": "none",
-                    "error": str(e),
+                    **item_error(e),
                 }
             )
 

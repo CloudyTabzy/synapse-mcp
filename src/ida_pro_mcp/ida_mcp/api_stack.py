@@ -13,6 +13,8 @@ from .compat import tinfo_get_udm
 from .rpc import tool
 from .sync import idasync
 from .utils import (
+    tool_error,
+    item_error,
     normalize_list_input,
     normalize_dict_list,
     parse_address,
@@ -56,7 +58,7 @@ def stack_frame(
             vars = get_stack_frame_variables_internal(ea, True)
             results.append({"addr": addr, "vars": vars})
         except Exception as e:
-            results.append({"addr": addr, "vars": None, "error": str(e)})
+            results.append({"addr": addr, "vars": None, **item_error(e, f"stack_frame {addr!r}")})
 
     return results
 
@@ -101,7 +103,7 @@ def declare_stack(
 
             results.append({"addr": fn_addr, "name": var_name})
         except Exception as e:
-            results.append({"addr": fn_addr, "name": var_name, "error": str(e)})
+            results.append({"addr": fn_addr, "name": var_name, **item_error(e, f"declare_stack {fn_addr!r}")})
 
     return results
 
@@ -178,6 +180,6 @@ def delete_stack(
 
             results.append({"addr": fn_addr, "name": var_name})
         except Exception as e:
-            results.append({"addr": fn_addr, "name": var_name, "error": str(e)})
+            results.append({"addr": fn_addr, "name": var_name, **item_error(e, f"delete_stack {fn_addr!r}")})
 
     return results

@@ -14,7 +14,7 @@ import ida_funcs
 
 from .rpc import tool
 from .sync import idasync
-from .utils import parse_address, normalize_list_input
+from .utils import parse_address, normalize_list_input, tool_error, item_error
 
 from . import _sigmaker as _sm
 
@@ -158,10 +158,10 @@ def make_signature(
         except Exception as e:
             results.append({
                 "query": addr_str,
-                "addr": hex(ea) if 'ea' in dir() else None,
+                "addr": hex(ea) if 'ea' in locals() else None,
                 "signature": None,
                 "format": format,
-                "error": str(e),
+                **item_error(e),
             })
     return results
 
@@ -231,7 +231,7 @@ def make_signature_for_function(
                 "name": None,
                 "signature": None,
                 "format": format,
-                "error": str(e),
+                **item_error(e),
             })
     return results
 
@@ -277,7 +277,7 @@ def make_signature_for_range(
             "addr": None,
             "signature": None,
             "format": format,
-            "error": str(e),
+            **item_error(e),
         }
 
 
@@ -342,7 +342,7 @@ def find_xref_signatures(
                 "query": addr_str,
                 "addr": hex(ea) if ea is not None else None,
                 "signatures": None,
-                "error": str(e),
+                **item_error(e),
             })
     return results
 
@@ -402,4 +402,4 @@ def scan_signature(
             "matches": matches,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return tool_error(e)

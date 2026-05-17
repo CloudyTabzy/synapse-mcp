@@ -17,10 +17,13 @@ Architecture:
 # Ignore SIGPIPE to prevent IDA from being killed when an MCP client
 # disconnects while the HTTP server is writing a response. IDA's embedded
 # Python may not preserve CPython's default SIG_IGN for SIGPIPE.
+import logging as _logging
 import signal
 
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+_log = _logging.getLogger(__name__)
 
 # Import infrastructure modules
 from . import rpc
@@ -51,13 +54,53 @@ from . import api_tasks
 # the plugin remains fully operational without them.
 try:
     from . import api_triton
-except Exception:
+except Exception as _e:
+    _log.warning(
+        "api_triton failed to load (%s: %s) — all triton_* tools unavailable. "
+        "Install with: pip install triton-library",
+        type(_e).__name__, _e,
+    )
     api_triton = None  # type: ignore[assignment]
 
 try:
     from . import api_miasm
-except Exception:
+except Exception as _e:
+    _log.warning(
+        "api_miasm failed to load (%s: %s) — all miasm_* tools unavailable. "
+        "Install with: pip install miasm future",
+        type(_e).__name__, _e,
+    )
     api_miasm = None  # type: ignore[assignment]
+
+try:
+    from . import api_construct
+except Exception as _e:
+    _log.warning(
+        "api_construct failed to load (%s: %s) — all construct_* tools unavailable. "
+        "Install with: pip install construct",
+        type(_e).__name__, _e,
+    )
+    api_construct = None  # type: ignore[assignment]
+
+try:
+    from . import api_cstruct
+except Exception as _e:
+    _log.warning(
+        "api_cstruct failed to load (%s: %s) — all cstruct_* tools unavailable. "
+        "Install with: pip install dissect.cstruct",
+        type(_e).__name__, _e,
+    )
+    api_cstruct = None  # type: ignore[assignment]
+
+try:
+    from . import api_filetype
+except Exception as _e:
+    _log.warning(
+        "api_filetype failed to load (%s: %s) — all filetype_* tools unavailable. "
+        "Install with: pip install filetype",
+        type(_e).__name__, _e,
+    )
+    api_filetype = None  # type: ignore[assignment]
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError

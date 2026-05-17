@@ -11,7 +11,7 @@ from .rpc import tool
 from .sync import idasync, tool_timeout
 from . import compat
 from .api_core import _get_strings_cache
-from .utils import get_image_size
+from .utils import get_image_size, tool_error
 
 
 class SurveyMetadata(TypedDict):
@@ -407,38 +407,42 @@ def survey_binary(
     for binaries with >10k functions."""
     import idautils
 
-    minimal = detail_level == "minimal"
+    try:
+        minimal = detail_level == "minimal"
 
-    # Collect all function addresses once, cap at _MAX_FUNC_ITER for large binaries.
-    all_func_eas = list(idautils.Functions())
-    truncated = len(all_func_eas) > _MAX_FUNC_ITER
-    if truncated:
-        func_eas = all_func_eas[:_MAX_FUNC_ITER]
-    else:
-        func_eas = all_func_eas
+        # Collect all function addresses once, cap at _MAX_FUNC_ITER for large binaries.
+        all_func_eas = list(idautils.Functions())
+        truncated = len(all_func_eas) > _MAX_FUNC_ITER
+        if truncated:
+            func_eas = all_func_eas[:_MAX_FUNC_ITER]
+        else:
+            func_eas = all_func_eas
 
-    strings = _get_strings_cache()
-    segments = _build_segments()
+        strings = _get_strings_cache()
+        segments = _build_segments()
 
-    result: dict = {
-        "metadata": _build_metadata(),
-        "statistics": _build_statistics(
-            all_func_eas, len(strings), len(segments)
-        ),
-        "segments": segments,
-        "entrypoints": _build_entrypoints(),
-    }
+        result: dict = {
+            "ok": True,
+            "metadata": _build_metadata(),
+            "statistics": _build_statistics(
+                all_func_eas, len(strings), len(segments)
+            ),
+            "segments": segments,
+            "entrypoints": _build_entrypoints(),
+        }
 
-    if not minimal:
-        result["interesting_strings"] = _build_interesting_strings()
-        result["interesting_functions"] = _build_interesting_functions(func_eas, truncated)
-        result["imports_by_category"] = _build_imports_by_category()
-        result["call_graph_summary"] = _build_call_graph_summary(func_eas)
+        if not minimal:
+            result["interesting_strings"] = _build_interesting_strings()
+            result["interesting_functions"] = _build_interesting_functions(func_eas, truncated)
+            result["imports_by_category"] = _build_imports_by_category()
+            result["call_graph_summary"] = _build_call_graph_summary(func_eas)
 
-    if truncated:
-        result["_note"] = (
-            f"Binary has {len(all_func_eas)} functions; "
-            f"xref analysis was limited to the first {_MAX_FUNC_ITER} for performance."
-        )
+        if truncated:
+            result["_note"] = (
+                f"Binary has {len(all_func_eas)} functions; "
+                f"xref analysis was limited to the first {_MAX_FUNC_ITER} for performance."
+            )
 
-    return result
+        return result
+    except Exception as e:
+        return tool_error(e, "survey_binary")

@@ -28,7 +28,10 @@ Core API modules (upstream):
 Optional analysis engine modules (this fork):
 - `api_triton.py`: Triton symbolic execution — 38 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, snapshots, instruction trace replay, IDA annotation, taint highlighting, and backward slicing. Requires `pip install triton-library`.
 - `api_miasm.py`: Miasm IR analysis — 21 tools covering IR lifting, SSA, CFG analysis, dead-code elimination, symbolic emulation, data-flow tracing, cross-arch assembly/patching, CFG summary, path constraint solving, and IDA annotation. Requires `pip install miasm future`.
-- `api_composite.py`: Hybrid cross-engine workflows — `hybrid_analyze_function` (Miasm deobfuscation + Triton symbolic execution) and `hybrid_deobfuscate_and_patch` (dead-code detection + safe patching).
+- `api_composite.py`: Hybrid cross-engine workflows — `hybrid_analyze_function` (Miasm deobfuscation + Triton symbolic execution), `hybrid_deobfuscate_and_patch` (dead-code detection + safe patching), and `hybrid_iterative_deobfuscate` (iterative Miasm simplification loop with Triton equivalence verification until convergence).
+- `api_construct.py`: Declarative binary format parsing — 5 tools using `construct 2.10.x` grammar to parse/build arbitrary binary structures. Per-endian registry isolation. Requires `pip install construct`.
+- `api_cstruct.py`: C-syntax binary structure parsing — 7 tools using Fox-IT `dissect.cstruct 4.x`. Supports C-style struct/enum/typedef definitions. Uses **per-endian registry isolation** (separate `cstruct` instances keyed by `f"{session}_{endian}"`) to avoid `cs.endian` live-reference mutation bugs. Requires `pip install dissect.cstruct`.
+- `api_filetype.py`: Magic-byte file type identification — 4 tools using `filetype 1.x` (79+ formats, 261-byte window). Can identify formats from hex buffers, IDA addresses, or named segments. Requires `pip install filetype`.
 - `api_tasks.py`: Async task queue — `task_submit`, `task_poll`, `task_list`, `task_cancel`. Submit heavy tools (decompile, Triton/Miasm analysis, callgraph) as background tasks to avoid MCP client timeouts. Worker threads replay the submitter's extension/unsafe context.
 
 **Instruction trace (Triton):** Each session maintains a `deque` of executed instruction addresses (max 10,000). On `triton_snapshot_save`, the trace is stored in the snapshot. On `triton_snapshot_restore`, it is replayed to rebuild the path predicate. The new `triton_replay_instructions` tool gives AI agents manual control over custom instruction sequences.
@@ -155,6 +158,11 @@ uv run ida-pro-mcp --install-deps triton
 uv run ida-pro-mcp --install-deps miasm
 # Both at once
 uv run ida-pro-mcp --install-deps all
+
+# Binary format parsing libraries (install manually into IDA's Python)
+pip install construct          # construct_* tools
+pip install dissect.cstruct    # cstruct_* tools
+pip install filetype           # filetype_* tools
 ```
 
 ### Verify installation

@@ -161,6 +161,47 @@ All tools require `pip install miasm future`. Architecture is auto-detected from
 | `miasm_patch_instruction` | Assemble + patch bytes directly into the IDA database (`@unsafe`) |
 | `miasm_solve_path_constraints` | Enumerate paths to a target; Z3 solving via Triton when available |
 
+### Binary format parsing tools (Phase 5)
+
+Three optional parsing libraries extend IDA's type-reading capabilities. Each is independently optional — install only what you need.
+
+#### `construct` tools (5 tools) — `pip install construct`
+
+Declarative binary format parsing using [construct 2.10.x](https://construct.readthedocs.io/).
+
+| Tool | Description |
+|------|-------------|
+| `construct_status` | Report availability and construct version |
+| `construct_parse_binary` | Parse a hex buffer using any construct template string |
+| `construct_parse_ida_segment` | Parse bytes from a named IDA segment |
+| `construct_parse_ida_struct` | Parse one or more struct instances at an IDA address |
+| `construct_build_struct` | Serialize a data dict to bytes; optionally patch into IDA (`return_only=False`) |
+
+#### `dissect.cstruct` tools (7 tools) — `pip install dissect.cstruct`
+
+C-syntax struct/enum/typedef parsing using [Fox-IT dissect.cstruct 4.x](https://github.com/fox-it/dissect.cstruct).
+
+| Tool | Description |
+|------|-------------|
+| `cstruct_status` | Report availability and version |
+| `cstruct_parse_c_definition` | Load a C-syntax struct/enum/typedef block into the registry |
+| `cstruct_define_struct` | Define a struct from a field-descriptor list |
+| `cstruct_parse_at_address` | Parse an IDA address as a named struct type |
+| `cstruct_to_bytes` | Serialize a field-value dict back to raw bytes |
+| `cstruct_list_defined_structs` | List all non-builtin types in the current session |
+| `cstruct_reset` | Clear all user-defined types from the registry |
+
+#### `filetype` tools (4 tools) — `pip install filetype`
+
+Magic-byte file-type identification using [filetype 1.x](https://github.com/h2non/filetype.py) (79+ formats, 261-byte signature window).
+
+| Tool | Description |
+|------|-------------|
+| `filetype_status` | Report availability and supported-type count |
+| `filetype_identify_buffer` | Identify a file type from hex bytes or an IDA address |
+| `filetype_identify_ida_segment` | Identify the file type of the current binary or a named segment |
+| `filetype_list_supported` | List all detectable types; filter by category |
+
 ### Phase 3.5 refinements (v1.0.0)
 
 - **Uniform address parameters** — all 59 Triton/Miasm tools now accept `str` addresses (hex or symbol name), matching upstream conventions.
@@ -188,12 +229,13 @@ Added `api_recon.py` — 8 tools for stripped binary analysis implementing the B
 | `analyze_cleanup_function` | Mine Release() call offsets to infer struct field layout |
 | `find_function_prologues` | Scan for common x64/x86 prologue patterns (`@unsafe` when `create=True`) |
 
-### Hybrid tools (2 tools)
+### Hybrid tools (3 tools)
 
 | Tool | Description |
 |------|-------------|
 | `hybrid_analyze_function` | **Cross-engine:** Miasm deobfuscation → Triton symbolic execution → Z3 solving, unified report |
 | `hybrid_deobfuscate_and_patch` | **Cross-engine:** Miasm dead-code elimination → identify empty blocks → optionally NOP them out in IDA |
+| `hybrid_iterative_deobfuscate` | **Cross-engine:** Iterative Miasm simplification loop (constant folding + DCE + merge, to fix-point) → optional Triton concrete-equivalence verification → NOP dead blocks → repeat until convergence (`@unsafe`) |
 
 ### Async Task System (4 tools)
 
@@ -438,9 +480,10 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 - Anti-decompilation tricks
 
 **For obfuscated binaries, use the hybrid workflow:**
-1. Run `hybrid_analyze_function` to let Miasm fold constants and eliminate dead code before Triton symbolically executes the simplified path.
-2. Use `miasm_solve_path_constraints` to find concrete inputs that reach a specific block.
-3. Apply `hybrid_deobfuscate_and_patch` (dry_run first) to NOP out dead blocks verified by Miasm.
+1. Run `hybrid_iterative_deobfuscate` (dry_run=True first) to see how many passes Miasm needs to converge and which dead blocks it identifies. Set dry_run=False, confirm=True to apply the NOPs.
+2. If the function still looks complex, run `hybrid_analyze_function` to let Miasm fold constants and eliminate dead code before Triton symbolically executes the simplified path.
+3. Use `miasm_solve_path_constraints` to find concrete inputs that reach a specific block.
+4. For targeted single-pass patching, use `hybrid_deobfuscate_and_patch` (dry_run first).
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
 

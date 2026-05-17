@@ -9,7 +9,7 @@ from the open IDA database — no file path or manual byte feeding required.
 
 import json
 import logging
-import sys
+import re
 import threading
 from typing import Annotated
 
@@ -19,46 +19,7 @@ logger = logging.getLogger(__name__)
 # Optional import guard
 # ============================================================================
 
-# Python 313 path fallback: if running under a different Python (e.g. the
-# hermes-agent venv), prepend Python 313's site-packages so miasm
-# can be found even when IDA loads the plugin from its own embedded Python.
-# The editable-finder hook (_EditableFinder) may fail to route find_spec
-# for namespace packages loaded from a dev-tree, so we also directly
-# insert the known miasm source path and force-load the top-level package.
-_PY313_SITE_PACKAGES = r"C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\site-packages"
-if _PY313_SITE_PACKAGES not in sys.path:
-    sys.path.insert(0, _PY313_SITE_PACKAGES)
-
-_MIASM_SOURCE_PATH = r"C:\Dev\IDA_Pro_Plugin\miasm-master"
-if _MIASM_SOURCE_PATH not in sys.path:
-    sys.path.insert(0, _MIASM_SOURCE_PATH)
-
-# Force-load the miasm top-level package into sys.modules before the
-# standard import machinery tries to find it.  This works around an
-# issue where _EditableFinder.find_spec returns None for 'miasm' even
-# though the package exists on disk — the import loop then exits early
-# without ever reaching PathFinder.
-def _ensure_miasm_in_sys_modules() -> bool:
-    import importlib.util, os
-    if "miasm" in sys.modules:
-        return True
-    init_path = os.path.join(_MIASM_SOURCE_PATH, "miasm", "__init__.py")
-    if not os.path.exists(init_path):
-        return False
-    spec = importlib.util.spec_from_file_location("miasm", init_path)
-    if spec is None or spec.loader is None:
-        return False
-    try:
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["miasm"] = mod
-        spec.loader.exec_module(mod)
-        return True
-    except Exception:
-        sys.modules.pop("miasm", None)
-        return False
-
 try:
-    _ensure_miasm_in_sys_modules()  # populate sys.modules["miasm"] before the std import
     from miasm.analysis.machine import Machine
     from miasm.core.locationdb import LocationDB
     from miasm.core.bin_stream import bin_stream_str
@@ -81,7 +42,7 @@ except ImportError:
 from .rpc import tool, unsafe
 from .sync import idasync, IDAError
 from . import compat
-from .utils import parse_address
+from .utils import parse_address, tool_error
 
 # ============================================================================
 # Lazy manager — syncs architecture from IDA on first use
@@ -372,11 +333,8 @@ def miasm_init(
             "procname": _manager.procname,
             "override_used": bool(arch),
         }
-    except IDAError as e:
-        return {"ok": False, "error": str(e)}
     except Exception as e:
-        logger.exception("miasm_init failed")
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return tool_error(e, "miasm_init")
 
 @tool
 @idasync
@@ -412,12 +370,7 @@ def miasm_get_context_info() -> dict:
                 "note": "Machine not yet built. First Miasm call auto-syncs, or call miasm_init explicitly.",
             }
         except IDAError as e:
-            return {
-                "ok": False,
-                "initialized": False,
-                "miasm_version": miasm_version,
-                "error": str(e),
-            }
+            return {**tool_error(e), "initialized": False, "miasm_version": miasm_version}
 
     machine = _manager.machine
     return {
@@ -456,11 +409,8 @@ def miasm_reset() -> dict:
             "endianness": "big" if _manager.is_big_endian else "little",
             "message": "Miasm Machine rebuilt from current IDA state.",
         }
-    except IDAError as e:
-        return {"ok": False, "error": str(e)}
     except Exception as e:
-        logger.exception("miasm_reset failed")
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return tool_error(e, "miasm_reset")
 
 # ========================================================================
 # IR lifting
@@ -519,6 +469,7 @@ def miasm_lift_function(
 
     edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
     return {
+        "ok": True,
         "function_ea": hex(func.start_ea),
         "blocks": _ir_blocks_to_dict(ircfg),
         "edges": edges,
@@ -568,6 +519,7 @@ def miasm_get_ssa(
 
     edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
     return {
+        "ok": True,
         "function_ea": hex(func.start_ea),
         "form": "ssa",
         "blocks": _ir_blocks_to_dict(ircfg),
@@ -789,6 +741,7 @@ def miasm_deobfuscate_cfg(
 
     edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
     return {
+        "ok": True,
         "function_ea": hex(func.start_ea),
         "simplified": True,
         "blocks": _ir_blocks_to_dict(ircfg),
@@ -834,7 +787,7 @@ def miasm_simplify_block(
         if str(dest) != str(simplified):
             regs[str(dest)] = str(simplified)
 
-    return {"address": hex(ea), "simplified_registers": regs, "_debug_note": "ok"}
+    return {"ok": True, "address": hex(ea), "simplified_registers": regs}
 
 # ========================================================================
 # Symbolic execution
@@ -894,7 +847,7 @@ def miasm_emulate_symbolic(
         except Exception:
             regs[str(dest)] = str(expr)
 
-    return {"address": hex(ea), "registers": regs}
+    return {"ok": True, "address": hex(ea), "registers": regs}
 
 # ========================================================================
 # Data flow / side effects
@@ -941,6 +894,7 @@ def miasm_get_function_side_effects(
                     read.add(str(r))
 
     return {
+        "ok": True,
         "function_ea": hex(func.start_ea),
         "reads": sorted(read),
         "writes": sorted(written),
@@ -1021,6 +975,82 @@ def miasm_trace_data_flow(
 # Assembly / patching
 # ========================================================================
 
+# Maps uppercase register name → Miasm size-prefix string.
+# Used to infer a missing size prefix for a bare [...] memory operand.
+# Sorted descending by name length so longer names match first (R10D before R10).
+_REG_SIZE_PREFIX: dict[str, str] = {
+    **{r: "QWORD PTR" for r in (
+        "RAX", "RBX", "RCX", "RDX", "RBP", "RSP", "RSI", "RDI",
+        "R8",  "R9",  "R10", "R11", "R12", "R13", "R14", "R15",
+    )},
+    **{r: "DWORD PTR" for r in (
+        "EAX", "EBX", "ECX", "EDX", "EBP", "ESP", "ESI", "EDI",
+        "R8D", "R9D", "R10D", "R11D", "R12D", "R13D", "R14D", "R15D",
+    )},
+    **{r: "WORD PTR" for r in (
+        "AX", "BX", "CX", "DX", "BP", "SP", "SI", "DI",
+        "R8W", "R9W", "R10W", "R11W", "R12W", "R13W", "R14W", "R15W",
+    )},
+    **{r: "BYTE PTR" for r in (
+        "AL", "BL", "CL", "DL", "AH", "BH", "CH", "DH",
+        "SPL", "BPL", "SIL", "DIL",
+        "R8B", "R9B", "R10B", "R11B", "R12B", "R13B", "R14B", "R15B",
+    )},
+    **{f"XMM{i}": "XMMWORD PTR" for i in range(16)},
+}
+_SORTED_REGS = sorted(_REG_SIZE_PREFIX, key=len, reverse=True)
+
+
+def _miasmize_asm(s: str, bits: int = 32) -> str:
+    """Normalize IDA/MASM assembly syntax to Miasm-compatible Intel syntax.
+
+    Miasm's x86 parser (miasm/arch/x86/arch.py) requires:
+      - Uppercase mnemonic and registers (EAX, ECX, …)
+      - Uppercase size-prefix keywords (DWORD, WORD, BYTE, QWORD, TBYTE, XMMWORD)
+      - SIZE PTR [...] for every memory operand — the prefix is MANDATORY;
+        grammar rule: deref_mem = mem_size + PTR + deref_mem_ad
+      - Lowercase hex prefix: 0x… (cpu.py uses pyparsing.Literal('0x'))
+
+    Missing size prefixes are added automatically:
+      1. Infer from a non-memory register operand (EAX → DWORD PTR, RAX → QWORD PTR)
+      2. Fall back to architecture bitness (64-bit → QWORD PTR, else DWORD PTR)
+    """
+    s = s.strip()
+    parts = s.split(None, 1)
+    if len(parts) < 2:
+        return s.upper()
+    mnemonic, rest = parts
+    # Uppercase everything: registers, size keywords, brackets
+    rest = rest.upper()
+    # Fix hex prefix: pyparsing.Literal('0x') requires lowercase 'x'
+    rest = re.sub(r"\b0X([0-9A-F]+)\b", lambda m: "0x" + m.group(1).lower(), rest)
+
+    # Add missing size prefix to bare [...] memory operands
+    if "[" in rest:
+        operands = rest.split(",")
+        # Scan non-memory operands for a register whose width tells us the size
+        inferred: str | None = None
+        for op in operands:
+            if "[" not in op:
+                for reg in _SORTED_REGS:
+                    if re.search(r"\b" + re.escape(reg) + r"\b", op.strip()):
+                        inferred = _REG_SIZE_PREFIX[reg]
+                        break
+            if inferred:
+                break
+        size_prefix = inferred or ("QWORD PTR" if bits == 64 else "DWORD PTR")
+        fixed = []
+        for op in operands:
+            stripped = op.strip()
+            # Only patch operands that have [ but no PTR keyword yet
+            if "[" in stripped and not re.search(r"\bPTR\b", stripped):
+                stripped = stripped.replace("[", size_prefix + " [", 1)
+            fixed.append(stripped)
+        rest = ", ".join(fixed)
+
+    return mnemonic.upper() + " " + rest
+
+
 @tool
 @idasync
 def miasm_assemble(
@@ -1035,60 +1065,42 @@ def miasm_assemble(
     if not MIASM_AVAILABLE:
         return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
 
-    def _miasmize(s: str) -> str:
-        """Normalize IDA/MASM assembly syntax to Miasm-compatible form.
-
-        Miasm's x86 parser expects:
-          - lowercase hex literals (0x..., not 0X...)
-          - registers in uppercase (EAX, ECX, ...)
-          - no size prefixes on memory operands (no DWORD PTR, etc.)
-          - '[' ']' for memory, not '(' ')'
-        """
-        s = s.strip()
-        parts = s.split(None, 1)
-        if len(parts) == 2:
-            mnemonic, rest = parts
-            s = mnemonic.upper() + " " + _normalize_mem_operand(rest)
-        else:
-            s = s.upper()
-        return s
-
-    def _normalize_mem_operand(s: str) -> str:
-        s = s.strip()
-        s = s.replace("PTR ", "")
-        s = s.replace("BYTE ", "")
-        s = s.replace("WORD ", "")
-        s = s.replace("DWORD ", "")
-        s = s.replace("QWORD ", "")
-        s = s.replace("( ", "[").replace(" )", "]")
-        s = re.sub(r"0X([0-9A-Fa-f]+)", lambda m: "0x" + m.group(1).lower(), s)
-        if any(c.isupper() and c not in "0123456789ABCDEF" for c in s):
-            return s.upper()
-        return s
-
-    import re
-    asm_normalized = _miasmize(asm_string)
+    # Resolve machine and bitness first — needed by _miasmize_asm for size-prefix inference
     if arch:
-        machine = Machine(arch)
+        try:
+            machine = Machine(arch)
+        except Exception as e:
+            return {"ok": False, "error": f"Unknown architecture {arch!r}: {e}. "
+                    f"Valid examples: x86_32, x86_64, arml, armb, aarch64l, mips32l, ppc32b"}
         bits = int(arch.split("_")[-1]) if "_" in arch else _manager.bitness
     else:
         machine = _manager.machine
         bits = _manager.bitness
 
+    asm_normalized = _miasmize_asm(asm_string, bits)
     loc_db = LocationDB()
     mn = machine.mn
     try:
         instr = mn.fromstring(asm_normalized, loc_db, bits)
     except Exception as e:
-        return {"ok": False, "error": f"Miasm parser error: {type(e).__name__}: {e}. "
-                               f"Try 'MOV EAX, [EBX+0x10]' instead of 'MOV EAX, DWORD PTR [EBX+0x10]'."}
+        hint = ("Miasm requires Intel syntax with uppercase registers and explicit size prefixes "
+                "for memory operands: 'MOV EAX, DWORD PTR [EBX+0x10]'. "
+                "Hex must use lowercase 0x prefix.")
+        return {
+            "ok": False,
+            "error": f"Miasm parser error: {type(e).__name__}: {e}. {hint}",
+            "normalized_to": asm_normalized,
+        }
     encodings = mn.asm(instr)
 
     if not encodings:
-        return {"ok": False, "error": f"No encodings found for: {asm_string!r}"}
+        return {"ok": False, "error": f"No encodings found for: {asm_string!r}",
+                "normalized_to": asm_normalized}
 
     return {
+        "ok": True,
         "instruction": str(instr),
+        "normalized_to": asm_normalized,
         "encodings": [enc.hex() for enc in encodings],
         "shortest": min(encodings, key=len).hex(),
         "longest": max(encodings, key=len).hex(),
@@ -1131,17 +1143,19 @@ def miasm_annotate_data_flow(
 
     import idaapi
     import ida_bytes
-    import ida_comments
+    import ida_ua
 
     func = idaapi.get_func(ea)
     if not func:
         return {"ok": False, "error": f"No function found at {hex(ea)}"}
 
+    import idautils
+
     commented: list[str] = []
     skipped: list[str] = []
 
     for origin_expr in origins:
-        for item_ea in func.addresses:
+        for item_ea in idautils.Heads(func.start_ea, func.end_ea):
             if not ida_bytes.is_code(ida_bytes.get_flags(item_ea)):
                 continue
             from ida_ua import insn_t
@@ -1151,11 +1165,11 @@ def miasm_annotate_data_flow(
             insn_str = idaapi.generate_disasm_line(item_ea, 0)
             if origin_expr in insn_str:
                 if not overwrite:
-                    cmt = ida_comments.get_cmt(item_ea, 0)
+                    cmt = idaapi.get_cmt(item_ea, 0)
                     if cmt:
                         skipped.append(hex(item_ea))
                         continue
-                ida_comments.set_cmt(item_ea, f"[DF] {register} <- {origin_expr}", 0)
+                idaapi.set_cmt(item_ea, f"[DF] {register} <- {origin_expr}", 0)
                 commented.append(hex(item_ea))
 
     return {
@@ -1290,33 +1304,48 @@ def miasm_patch_instruction(
     if not MIASM_AVAILABLE:
         return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
 
-    def _miasmize(s: str) -> str:
-        s = s.strip()
-        parts = s.split(None, 1)
-        if len(parts) == 2:
-            mnemonic, rest = parts
-            rest = re.sub(r"\b(DWORD|WORD|BYTE|QWORD)\s+PTR\s*", "", rest, flags=re.IGNORECASE)
-            rest = re.sub(r"0X([0-9A-Fa-f]+)", lambda m: "0x" + m.group(1).lower(), rest)
-            return mnemonic.upper() + " " + rest.replace("[", "[").replace("]", "]").upper()
-        return s.upper()
-
-    import re
     import ida_bytes
+    import ida_segment
 
     ea = parse_address(address)
+
+    # Pre-flight: verify the target segment is writable before attempting assembly
+    seg = ida_segment.getseg(ea)
+    if seg is not None and not (seg.perm & ida_segment.SEGPERM_WRITE):
+        perm_chars = (
+            ("r" if seg.perm & ida_segment.SEGPERM_READ  else "-") +
+            ("w" if seg.perm & ida_segment.SEGPERM_WRITE else "-") +
+            ("x" if seg.perm & ida_segment.SEGPERM_EXEC  else "-")
+        )
+        seg_name = ida_segment.get_segm_name(seg) or "unknown"
+        return {
+            "ok": False,
+            "error": (
+                f"Segment '{seg_name}' at {hex(ea)} is not writable "
+                f"(permissions: {perm_chars}). "
+                "IDA will not patch read-only or execute-only segments. "
+                "Apply the patch to a writable copy or change segment permissions first."
+            ),
+        }
+
     machine = _manager.machine
     bits = _manager.bitness
+    asm_normalized = _miasmize_asm(asm_string, bits)
     loc_db = LocationDB()
     mn = machine.mn
     try:
-        instr = mn.fromstring(_miasmize(asm_string), loc_db, bits)
+        instr = mn.fromstring(asm_normalized, loc_db, bits)
     except Exception as e:
-        return {"ok": False, "error": f"Miasm parser error: {type(e).__name__}: {e}. "
-                               f"Try 'MOV ECX, [0x5D43F0]' instead of 'MOV ECX, DWORD PTR [0x5D43F0]'."}
+        hint = ("Miasm requires Intel syntax with uppercase registers and explicit size prefixes "
+                "for memory operands: 'MOV DWORD PTR [EBX+0x10], ECX'. "
+                "Hex must use lowercase 0x prefix.")
+        return {"ok": False, "error": f"Miasm parser error: {type(e).__name__}: {e}. {hint}",
+                "normalized_to": asm_normalized}
     encodings = mn.asm(instr)
 
     if not encodings:
-        return {"ok": False, "error": f"No encodings found for: {asm_string!r}"}
+        return {"ok": False, "error": f"No encodings found for: {asm_string!r}",
+                "normalized_to": asm_normalized}
 
     shortest = min(encodings, key=len)
 
@@ -1329,6 +1358,7 @@ def miasm_patch_instruction(
         "bytes_patched": len(shortest),
         "hex": shortest.hex(),
         "instruction": asm_string,
+        "normalized_to": asm_normalized,
     }
 
 # ========================================================================

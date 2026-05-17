@@ -107,9 +107,9 @@ class PythonExecResult(TypedDict):
 # ============================================================================
 
 
+@unsafe
 @tool
 @idasync
-@unsafe
 def py_eval(
     code: Annotated[str, "Python code"],
 ) -> PythonExecResult:
@@ -199,9 +199,9 @@ def py_eval(
         sys.stderr = old_stderr
 
 
+@unsafe
 @tool
 @idasync
-@unsafe
 def py_exec_file(
     file_path: Annotated[str, "Absolute path to a Python script to execute"],
 ) -> PythonExecResult:

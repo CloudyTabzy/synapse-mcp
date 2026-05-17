@@ -22,6 +22,8 @@ import idc
 from .rpc import tool
 from .sync import idasync
 from .utils import (
+    tool_error,
+    item_error,
     ConvertedNumber,
     EntityQuery,
     Function,
@@ -468,7 +470,7 @@ def lookup_funcs(
             else:
                 results.append({"query": query, "fn": None, "error": "Not found"})
         except Exception as e:
-            results.append({"query": query, "fn": None, "error": str(e)})
+            results.append({"query": query, "fn": None, **item_error(e, f"lookup {query!r}")})
 
     return results
 
@@ -847,7 +849,7 @@ def idb_save(
             result["error"] = "save_database returned false"
         return result
     except Exception as e:
-        return {"ok": False, "path": path or None, "error": str(e)}
+        return {**tool_error(e), "path": path or None}
 
 
 @tool

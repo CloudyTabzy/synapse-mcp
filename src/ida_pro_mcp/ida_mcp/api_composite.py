@@ -281,7 +281,7 @@ def analyze_function(
     try:
         ea = _resolve_addr(addr)
     except IDAError as exc:
-        return {"addr": addr, "error": str(exc)}
+        return {"addr": addr, "ok": False, "error": str(exc)}
 
     return _analyze_function_internal(ea, include_asm=include_asm)
 
@@ -304,14 +304,14 @@ def analyze_component(
 
     raw = normalize_list_input(addrs)
     if not raw:
-        return {"error": "Empty address list"}
+        return {"ok": False, "error": "Empty address list"}
 
     ea_map: dict[int, str] = {}
     for a in raw:
         try:
             ea_map[_resolve_addr(a)] = a
         except IDAError:
-            return {"error": f"Cannot resolve address: {a!r}"}
+            return {"ok": False, "error": f"Cannot resolve address: {a!r}"}
 
     ea_set = set(ea_map.keys())
 
@@ -443,8 +443,8 @@ _VALID_ACTIONS = frozenset({"rename_func", "set_type", "set_comment"})
 
 
 
-@tool
 @unsafe
+@tool
 @idasync
 @tool_timeout(120.0)
 def diff_before_after(
@@ -515,7 +515,7 @@ def diff_before_after(
         else:
             return {"error": f"Unhandled action {action!r}"}
     except Exception as exc:
-        return {"error": f"Action {action!r} failed: {exc}"}
+        return {"ok": False, "error": f"Action {action!r} failed: {type(exc).__name__}: {exc}"}
 
     # --- After (invalidate Hex-Rays cache so we see the change) ---
     ida_hexrays.mark_cfunc_dirty(ea)
@@ -988,6 +988,505 @@ def hybrid_deobfuscate_and_patch(
             "dry_run": dry_run,
             "candidates": candidates,
             "patches_applied": patches_applied,
+        }
+
+    except IDAError as exc:
+        return {"ok": False, "error": exc.message}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ============================================================================
+# hybrid_iterative_deobfuscate
+# ============================================================================
+
+class IterativeDeobfuscateIteration(TypedDict, total=False):
+    iteration: int
+    block_count_before: int
+    block_count_after: int
+    ir_statements_before: int
+    ir_statements_after: int
+    candidates: list[HybridPatchCandidate]
+    patches_applied: int
+    verified: bool | None
+    verification_mismatches: list[str]
+    converged: bool
+    note: str
+
+
+class IterativeDeobfuscateResult(TypedDict, total=False):
+    ok: bool
+    function_ea: str
+    iterations: list[IterativeDeobfuscateIteration]
+    total_patches: int
+    converged: bool
+    aborted_reason: str | None
+    dry_run: bool
+    error: str
+
+
+# Calling-convention registers per arch. Used by the Triton verification
+# pass to seed random concrete inputs and to read output registers.
+#
+# For x86_64: caller-saved registers for both Windows (rcx/rdx/r8/r9 + rax/r10/r11)
+# and SysV (rdi/rsi/rdx/rcx/r8/r9 + rax/r10/r11). r10/r11 are always available
+# as scratch registers and are used as input parameters in the SysV ABI.
+_ARCH_INPUT_REGS: dict[str, tuple[list[str], list[str]]] = {
+    "x86_64": (
+        ["rcx", "rdx", "r8", "r9", "rdi", "rsi", "r10", "r11"],
+        ["rax", "rcx", "rdx", "rdi", "rsi", "r8", "r9", "r10", "r11"],
+    ),
+    "x86_32": (
+        ["eax", "ecx", "edx"],
+        ["eax", "ecx", "edx"],
+    ),
+    "aarch64": (
+        ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+        ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+    ),
+}
+
+
+def _arch_input_regs(arch_str: str) -> tuple[list[str], list[str]]:
+    if arch_str.startswith("x86_64"):
+        return _ARCH_INPUT_REGS["x86_64"]
+    if arch_str.startswith("aarch64"):
+        return _ARCH_INPUT_REGS["aarch64"]
+    if arch_str.startswith("x86"):
+        return _ARCH_INPUT_REGS["x86_32"]
+    return ([], [])
+
+
+def _build_arch_nop(bits: int) -> bytes:
+    """Return a single NOP encoding for the current Miasm machine. Raises
+    RuntimeError if assembly fails — callers must handle this rather than
+    silently fall back to a wrong-architecture NOP byte."""
+    from .api_miasm import _manager
+    from miasm.core.locationdb import LocationDB
+    loc_db = LocationDB()
+    mn = _manager.machine.mn
+    nop_instr = mn.fromstring("NOP", loc_db, bits)
+    encodings = mn.asm(nop_instr)
+    if not encodings:
+        raise RuntimeError(
+            f"miasm assembler returned no encodings for NOP (bits={bits}, "
+            f"mn={mn.__class__.__name__}). Cannot build NOP sled for this architecture."
+        )
+    return encodings[0]
+
+
+def _nop_sled(nop_bytes: bytes, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    nlen = len(nop_bytes) or 1
+    if nlen == 1:
+        return nop_bytes * size
+    full = size // nlen
+    rem = size - full * nlen
+    if rem:
+        raise RuntimeError(
+            f"NOP sled size {size} is not a multiple of the NOP encoding "
+            f"length {nlen}. Cannot pad with x86 NOPs on a fixed-width architecture."
+        )
+    return nop_bytes * full
+
+
+def _build_patched_bytes(orig_bytes: bytes, func_start: int,
+                         candidates: list[HybridPatchCandidate],
+                         nop_bytes: bytes) -> bytes:
+    out = bytearray(orig_bytes)
+    for cand in candidates:
+        addr = int(cand["address"], 16)
+        size = cand["size"]
+        rel = addr - func_start
+        if rel < 0 or rel + size > len(out) or size <= 0:
+            continue
+        out[rel:rel + size] = _nop_sled(nop_bytes, size)
+    return bytes(out)
+
+
+def _triton_concrete_run(arch, code_bytes: bytes, func_start: int,
+                         input_regs: dict[str, int], read_regs: list[str],
+                         max_insns: int) -> dict[str, int] | None:
+    """Fresh Triton context, run code_bytes linearly, return {reg: value} or None.
+
+    Uses Triton's own disassembly (ctx.disassembly) to decode instruction lengths
+    from the loaded concrete memory — not IDA's decode_insn — so that patched
+    NOP bytes are decoded correctly (1 byte each) rather than using the original
+    instruction boundaries from the IDA database.
+    """
+    try:
+        from .api_triton import _build_ctx
+
+        ctx = _build_ctx(arch)
+        ctx.setConcreteMemoryAreaValue(func_start, code_bytes)
+        for reg_name, val in input_regs.items():
+            try:
+                reg = ctx.getRegister(reg_name)
+                ctx.setConcreteRegisterValue(reg, val)
+            except Exception:
+                continue
+
+        end_ea = func_start + len(code_bytes)
+        curr = func_start
+        count = 0
+        while curr < end_ea and count < max_insns:
+            try:
+                # Decode from Triton's concrete memory view (correct for both
+                # original and NOP-patched byte sequences).
+                insns = ctx.disassembly(curr, 1)
+                if not insns:
+                    break
+                insn = insns[0]
+                ctx.processing(insn)
+                size = insn.getSize()
+                if size == 0:
+                    break
+                curr += size
+                count += 1
+            except Exception:
+                break
+
+        out: dict[str, int] = {}
+        for reg_name in read_regs:
+            try:
+                reg = ctx.getRegister(reg_name)
+                out[reg_name] = int(ctx.getConcreteRegisterValue(reg))
+            except Exception:
+                continue
+        return out
+    except Exception as exc:
+        import sys
+        print(f"[hybrid_iterative_deobfuscate] _triton_concrete_run failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _verify_patches_with_triton(orig_bytes: bytes, func_start: int,
+                                candidates: list[HybridPatchCandidate],
+                                nop_bytes: bytes, samples: int,
+                                max_insns: int) -> tuple[bool | None, list[str]]:
+    """Compare concrete return-register values for original vs would-be-patched
+    code across `samples` random inputs. Returns (verified, mismatched_regs).
+    verified=None means the comparison was inconclusive (Triton unavailable,
+    every run errored, or no candidates would alter the bytes)."""
+    try:
+        from .api_triton import TRITON_AVAILABLE, _detect_arch_from_ida, _arch_to_str
+    except ImportError:
+        return None, []
+    if not TRITON_AVAILABLE:
+        return None, []
+
+    try:
+        arch = _detect_arch_from_ida()
+        arch_str = _arch_to_str(arch)
+    except Exception:
+        return None, []
+
+    input_reg_names, output_regs = _arch_input_regs(arch_str)
+    if not output_regs:
+        return None, []
+    read_regs = output_regs
+
+    patched_bytes = _build_patched_bytes(orig_bytes, func_start, candidates, nop_bytes)
+    if patched_bytes == orig_bytes:
+        return True, []
+
+    import random
+    rng = random.Random(0xC0FFEE)
+    mismatches: set[str] = set()
+    matched_samples = 0
+
+    for _ in range(max(1, samples)):
+        inputs = {name: rng.randrange(0, 1 << 32) for name in input_reg_names}
+        out_orig = _triton_concrete_run(arch, orig_bytes, func_start, inputs, read_regs, max_insns)
+        out_patched = _triton_concrete_run(arch, patched_bytes, func_start, inputs, read_regs, max_insns)
+        if out_orig is None or out_patched is None:
+            continue
+        matched_samples += 1
+        for reg in read_regs:
+            if out_orig.get(reg) != out_patched.get(reg):
+                mismatches.add(reg)
+
+    if matched_samples == 0:
+        return None, []
+    return (len(mismatches) == 0), sorted(mismatches)
+
+
+def _ir_statement_count(ircfg) -> int:
+    from .api_miasm import _iter_ircfg_blocks
+    total = 0
+    for _, irblock in _iter_ircfg_blocks(ircfg):
+        total += len(irblock)
+    return total
+
+
+def _is_jmp_only_irblock(irblock, lifter) -> bool:
+    """Return True if the irblock contains only a bare IRDst assignment with a
+    constant target (a dead unconditional jump stub left by opaque predicate
+    elimination).  This is distinct from live sequential blocks merged by
+    merge_blocks, which produce IRBlocks with real assignments."""
+    if len(irblock) != 1:
+        return False
+    assignblk = next(iter(irblock))  # single AssignBlk
+    if len(assignblk) != 1:
+        return False
+    for lval, rval in assignblk.items():
+        try:
+            if lval != lifter.IRDst:
+                return False
+            # Target must be a constant loc_key expression — a compile-time
+            # unconditional branch, not a symbolic/computed jump.
+            return rval.is_loc()
+        except Exception:
+            return False
+    return False
+
+
+def _identify_dead_candidates(asmcfg, ircfg, lifter) -> list[HybridPatchCandidate]:
+    """Return asmcfg blocks that are safe to NOP out after simplification.
+
+    Two conservative signals used (the Triton verification pass acts as the
+    outer safety net for any false positives):
+
+    1. irblock is empty (len == 0) — all assignments dead, block is unreachable.
+    2. irblock is a bare unconditional jump to a constant (jmp-only) — the sole
+       remaining artifact of an opaque predicate that simplified to a constant
+       branch; the original assembly for this block is dead.
+
+    Blocks merged into their predecessor by merge_blocks (live sequential code)
+    are NOT flagged here because they retain real assignments in the merged block.
+    """
+    from .api_miasm import _iter_ircfg_blocks
+
+    dead_loc_keys: set = set()
+    for loc_key, irblock in _iter_ircfg_blocks(ircfg):
+        if len(irblock) == 0 or _is_jmp_only_irblock(irblock, lifter):
+            dead_loc_keys.add(loc_key)
+
+    candidates: list[HybridPatchCandidate] = []
+    for block in asmcfg.blocks:
+        if not block.lines:
+            continue
+        if block.loc_key not in dead_loc_keys:
+            continue
+        start = block.lines[0].offset
+        last = block.lines[-1]
+        end = last.offset + last.l
+        size = end - start
+        if size <= 0:
+            continue
+        candidates.append({
+            "address": hex(start),
+            "size": size,
+            "reason": "Block dead/removed after iterative simplification",
+        })
+    return candidates
+
+
+@unsafe
+@tool
+@idasync
+@tool_timeout(300.0)
+def hybrid_iterative_deobfuscate(
+    address: Annotated[str, "Function address (hex or symbol name)."],
+    max_iterations: Annotated[int, "Maximum simplification passes (default 10)."] = 10,
+    verify_with_triton: Annotated[
+        bool,
+        "When True (default), verify each iteration's proposed patches by running "
+        "Triton concretely on the original and would-be-patched bytes and comparing "
+        "return-register outputs across random inputs. Skip patching on mismatch.",
+    ] = True,
+    verify_samples: Annotated[int, "Random input samples for Triton verification (default 5)."] = 5,
+    dry_run: Annotated[
+        bool,
+        "When True (default), only report proposed patches per iteration without "
+        "writing to the IDB. The full Miasm + verification pipeline still runs.",
+    ] = True,
+    confirm: Annotated[
+        bool,
+        "Must be True when dry_run=False to confirm destructive patching.",
+    ] = False,
+    max_insns: Annotated[int, "Triton per-run instruction cap during verification (default 500)."] = 500,
+) -> IterativeDeobfuscateResult:
+    """Iteratively deobfuscate a function: Miasm IRCFGSimplifierCommon → optional
+    Triton equivalence check → NOP patch → repeat until convergence.
+
+    Each iteration re-lifts the (possibly patched) function bytes, runs Miasm's
+    full common simplifier (expr_simp constant folding + dead-code elimination +
+    merge_blocks to fix-point), and identifies basic blocks that became empty
+    or were removed entirely. When `verify_with_triton=True`, the proposed
+    patches are first validated by running Triton concretely on the original
+    versus a hypothetically-NOP-patched version across random inputs; mismatches
+    abort that iteration's patch (the simplifier may have over-eliminated for
+    that particular control flow).
+
+    Convergence is reached when both block_count and total IR statement count
+    are unchanged versus the previous iteration. Returns a per-iteration log
+    plus aggregated stats.
+
+    `dry_run=True` (default) makes this safe to call exploratorily — the full
+    Miasm pipeline runs and reports proposed patches without modifying the IDB.
+    """
+    import idaapi
+    import ida_funcs
+    import ida_bytes
+
+    try:
+        from .api_miasm import MIASM_AVAILABLE, _manager, _iter_ircfg_blocks
+    except ImportError as exc:
+        return {"ok": False, "error": f"Import error: {exc}"}
+
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "Miasm not available. Install: pip install miasm future"}
+
+    if not dry_run and not confirm:
+        return {
+            "ok": False,
+            "error": "confirm=True is required when dry_run=False. Set dry_run=True to preview patches.",
+        }
+
+    try:
+        from miasm.analysis.simplifier import IRCFGSimplifierCommon
+    except ImportError as exc:
+        return {"ok": False, "error": f"miasm.analysis.simplifier unavailable: {exc}"}
+
+    try:
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "error": f"No function at {hex(ea)}"}
+        func_start = func.start_ea
+
+        nop_bytes = _build_arch_nop(_manager.bitness)
+
+        iterations: list[IterativeDeobfuscateIteration] = []
+        total_patches = 0
+        converged = False
+        aborted_reason: str | None = None
+        prev_signature: tuple[int, int] | None = None
+
+        for iter_idx in range(1, max_iterations + 1):
+            # Re-fetch bounds each iteration; patches may shift IDA analysis.
+            func = ida_funcs.get_func(func_start) or func
+            data = _manager.get_bytes(func.start_ea, func.end_ea)
+            if data is None:
+                aborted_reason = f"could not read bytes at {hex(func.start_ea)}"
+                break
+
+            mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+            asmcfg = mdis.dis_multiblock(func.start_ea)
+            lifter = _manager.machine.lifter_model_call(loc_db)
+            ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+
+            head = loc_db.get_offset_location(func.start_ea)
+            if head is None:
+                aborted_reason = "no head location key for function entry"
+                break
+
+            block_count_before = sum(1 for _ in _iter_ircfg_blocks(ircfg))
+            ir_stmt_before = _ir_statement_count(ircfg)
+
+            try:
+                simplifier = IRCFGSimplifierCommon(lifter)
+                simplifier(ircfg, head)
+            except Exception as exc:
+                iterations.append({
+                    "iteration": iter_idx,
+                    "block_count_before": block_count_before,
+                    "block_count_after": block_count_before,
+                    "ir_statements_before": ir_stmt_before,
+                    "ir_statements_after": ir_stmt_before,
+                    "candidates": [],
+                    "patches_applied": 0,
+                    "verified": None,
+                    "verification_mismatches": [],
+                    "converged": False,
+                    "note": f"simplifier raised: {type(exc).__name__}: {exc}",
+                })
+                aborted_reason = "simplifier exception"
+                break
+
+            block_count_after = sum(1 for _ in _iter_ircfg_blocks(ircfg))
+            ir_stmt_after = _ir_statement_count(ircfg)
+            signature = (block_count_after, ir_stmt_after)
+
+            if prev_signature is not None and signature == prev_signature:
+                iterations.append({
+                    "iteration": iter_idx,
+                    "block_count_before": block_count_before,
+                    "block_count_after": block_count_after,
+                    "ir_statements_before": ir_stmt_before,
+                    "ir_statements_after": ir_stmt_after,
+                    "candidates": [],
+                    "patches_applied": 0,
+                    "verified": None,
+                    "verification_mismatches": [],
+                    "converged": True,
+                })
+                converged = True
+                break
+            prev_signature = signature
+
+            candidates = _identify_dead_candidates(asmcfg, ircfg, lifter)
+
+            verified: bool | None = None
+            mismatches: list[str] = []
+            if candidates and verify_with_triton:
+                verified, mismatches = _verify_patches_with_triton(
+                    data, func.start_ea, candidates, nop_bytes,
+                    verify_samples, max_insns,
+                )
+
+            patches_applied = 0
+            note = ""
+            if candidates and not dry_run:
+                if verify_with_triton and verified is False:
+                    note = "patches skipped: Triton verification mismatch"
+                else:
+                    for cand in candidates:
+                        try:
+                            addr = int(cand["address"], 16)
+                            size = cand["size"]
+                            if size <= 0:
+                                continue
+                            sled = _nop_sled(nop_bytes, size)
+                            if ida_bytes.patch_bytes(addr, sled):
+                                patches_applied += 1
+                        except Exception:
+                            continue
+                    if patches_applied:
+                        idaapi.auto_wait()
+                    total_patches += patches_applied
+
+            iterations.append({
+                "iteration": iter_idx,
+                "block_count_before": block_count_before,
+                "block_count_after": block_count_after,
+                "ir_statements_before": ir_stmt_before,
+                "ir_statements_after": ir_stmt_after,
+                "candidates": candidates,
+                "patches_applied": patches_applied,
+                "verified": verified,
+                "verification_mismatches": mismatches,
+                "converged": False,
+                "note": note,
+            })
+
+            # No candidates AND structurally unchanged → converged.
+            if not candidates and block_count_after == block_count_before \
+                    and ir_stmt_after == ir_stmt_before:
+                converged = True
+                iterations[-1]["converged"] = True
+                break
+
+        return {
+            "ok": True,
+            "function_ea": hex(func_start),
+            "iterations": iterations,
+            "total_patches": total_patches,
+            "converged": converged,
+            "aborted_reason": aborted_reason,
+            "dry_run": dry_run,
         }
 
     except IDAError as exc:
