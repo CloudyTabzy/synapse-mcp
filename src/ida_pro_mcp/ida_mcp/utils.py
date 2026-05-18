@@ -468,7 +468,7 @@ class Global(TypedDict):
     name: str
 
 
-class Import(TypedDict):
+class Import(TypedDict, total=False):
     addr: str
     imported_name: str
     module: str

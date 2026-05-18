@@ -1251,11 +1251,15 @@ def _decompile_func(func_ea: int) -> ida_hexrays.cfunc_t | None:
 
 
 def _find_lvar_by_name(cfunc: ida_hexrays.cfunc_t, name: str):
-    """Find a local variable by name (case-insensitive)."""
-    for lvar in cfunc.get_lvars():
+    """Find a local variable by name (case-insensitive).
+
+    Returns ``(lvar, idx)`` so callers can use the canonical index
+    (``expr.v.idx``) without relying on the undocumented ``lvar.idx``.
+    """
+    for idx, lvar in enumerate(cfunc.get_lvars()):
         if lvar.name and lvar.name.lower() == name.lower():
-            return lvar
-    return None
+            return lvar, idx
+    return None, None
 
 
 def _expr_is_target(expr, target_lvar_idx: int | None = None, target_ea: int | None = None) -> bool:
