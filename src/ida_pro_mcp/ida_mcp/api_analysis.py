@@ -3125,8 +3125,9 @@ def trace_data_chain(
             depth_reached = depth
 
         if len(nodes) >= _MAX_CHAIN_NODES:
-            terminated_reason = "node_limit"
-            terminated_addr = hex(ea)
+            if not terminated_reason:
+                terminated_reason = "node_limit"
+                terminated_addr = hex(ea)
             break
 
         func = idaapi.get_func(ea)
@@ -3152,7 +3153,6 @@ def trace_data_chain(
         if depth >= max_depth:
             terminated_reason = "depth_limit"
             terminated_addr = hex(ea)
-            continue
 
         xref_list: list[Any] = []
         if direction == "forward":
@@ -3161,14 +3161,16 @@ def trace_data_chain(
             xref_list = list(idautils.XrefsTo(ea, 0))
 
         if not xref_list:
-            terminated_reason = "no_more_xrefs"
-            terminated_addr = hex(ea)
+            if not terminated_reason:
+                terminated_reason = "no_more_xrefs"
+                terminated_addr = hex(ea)
 
         next_nodes_to_queue: list[tuple[int, int]] = []
         for xref in xref_list:
             if len(edges) >= _MAX_CHAIN_EDGES:
-                terminated_reason = "edge_limit"
-                terminated_addr = hex(ea)
+                if not terminated_reason:
+                    terminated_reason = "edge_limit"
+                    terminated_addr = hex(ea)
                 break
 
             if direction == "forward":

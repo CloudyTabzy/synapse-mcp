@@ -355,12 +355,17 @@ def _build_imports_by_category() -> dict[str, list[dict]]:
 
 
 def _build_call_graph_summary(func_eas: list[int]) -> dict:
+    import collections
     import idaapi
     import idautils
 
     total_edges = 0
     root_functions: list[str] = []
     leaf_count = 0
+
+    # Build adjacency list: func_ea -> set of called func_eas
+    func_ea_set = set(func_eas)
+    adj: dict[int, set[int]] = {ea: set() for ea in func_eas}
 
     for ea in func_eas:
         has_callers = False
@@ -376,6 +381,10 @@ def _build_call_graph_summary(func_eas: list[int]) -> dict:
         for item_ea in idautils.FuncItems(ea):
             for xref in idautils.XrefsFrom(item_ea, 0):
                 if xref.type in (idaapi.fl_CF, idaapi.fl_CN):
+                    target = idaapi.get_func(xref.to)
+                    if target:
+                        tgt_ea = target.start_ea
+                        adj[ea].add(tgt_ea)
                     total_edges += 1
                     has_callees = True
 
@@ -385,10 +394,53 @@ def _build_call_graph_summary(func_eas: list[int]) -> dict:
         if not has_callees:
             leaf_count += 1
 
+    # BFS from all roots concurrently to find maximum call-chain depth.
+    max_depth_estimate: int | None = None
+    if adj:
+        try:
+            # Only track visited separately; depth dict starts empty.
+            visited: set[int] = set()
+            depth: dict[int, int] = {}
+            queue: collections.deque[tuple[int, int]] = collections.deque()
+            max_depth = 0
+
+            # Seed queue with all root functions at depth 0.
+            for ea in func_eas:
+                has_callers = any(
+                    xref.type in (idaapi.fl_CF, idaapi.fl_CN)
+                    for xref in idautils.XrefsTo(ea, 0)
+                )
+                if not has_callers:
+                    depth[ea] = 0
+                    queue.append((ea, 0))
+
+            while queue:
+                node, d = queue.popleft()
+                if node in visited:
+                    continue
+                visited.add(node)
+                if len(visited) > 50000:
+                    break
+                for neighbor in adj.get(node, ()):
+                    if neighbor in visited:
+                        continue
+                    nd = d + 1
+                    # Re-assign if shorter path found (multiple parents).
+                    existing = depth.get(neighbor, None)
+                    if existing is None or nd < existing:
+                        depth[neighbor] = nd
+                    queue.append((neighbor, nd))
+                    if nd > max_depth:
+                        max_depth = nd
+
+            max_depth_estimate = max_depth
+        except Exception:
+            max_depth_estimate = None
+
     return {
         "total_edges": total_edges,
-        "max_depth_estimate": None,  # would require full DFS; omitted for performance
-        "root_functions": root_functions[:100],  # cap to avoid massive output
+        "max_depth_estimate": max_depth_estimate,
+        "root_functions": root_functions[:100],
         "leaf_functions_count": leaf_count,
     }
 

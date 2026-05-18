@@ -16,7 +16,7 @@ Core API modules (upstream + enhanced):
 - `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries
 - `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling
 - `api_memory.py`: bytes/ints/strings read and patch, typed integer I/O
-- `api_types.py`: structs, type inference, type application, enum management
+- `api_types.py`: structs, type inference, type application, enum management, decompiler-based type propagation (`type_propagate` — infers struct layouts from field access patterns across functions)
 - `api_modify.py`: comments, renaming, asm patching, function definition, forced range analysis (`analyze_range`), bulk function creation (`scan_and_define_funcs`), user xref creation (`add_xref`)
 - `api_stack.py`: stack frame operations
 - `api_sigmaker.py`: signature creation, scanning, xref-based signature generation

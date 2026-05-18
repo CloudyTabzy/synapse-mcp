@@ -134,6 +134,15 @@ wheels = [
 ]
 
 [[package]]
+name = "construct"
+version = "2.10.70"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/02/77/8c84b98eca70d245a2a956452f21d57930d22ab88cbeed9290ca630cf03f/construct-2.10.70.tar.gz", hash = "sha256:4d2472f9684731e58cc9c56c463be63baa1447d674e0d66aeb5627b22f512c29", size = 86337, upload-time = "2023-11-29T08:44:49.545Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/fb/08b3f4bf05da99aba8ffea52a558758def16e8516bc75ca94ff73587e7d3/construct-2.10.70-py3-none-any.whl", hash = "sha256:c80be81ef595a1a821ec69dc16099550ed22197615f4320b57cc9ce2a672cb30", size = 63020, upload-time = "2023-11-29T08:44:46.876Z" },
+]
+
+[[package]]
 name = "coverage"
 version = "7.13.4"
 source = { registry = "https://pypi.org/simple" }
@@ -292,6 +301,24 @@ wheels = [
 ]
 
 [[package]]
+name = "dissect-cstruct"
+version = "4.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/fe/17aa5abfc62017918e11c8f40d1f936cd9d84a4b72b0a5e99c1c75b26c64/dissect_cstruct-4.7.tar.gz", hash = "sha256:4bf821a381312b9b2fdefea307f7e33548158d39d7d154f1b3007472c51a1fc4", size = 85324, upload-time = "2025-11-20T12:44:41.209Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/1c/dc626b1b0e477546c8e80d8cb028442ef4602af276c405f7a5ccc85b0b5a/dissect_cstruct-4.7-py3-none-any.whl", hash = "sha256:0427621ce67baa3106df2dc63a320d0a7f5c2da88ba3faf2ef5886a1a6b458fd", size = 54225, upload-time = "2025-11-20T12:44:39.748Z" },
+]
+
+[[package]]
+name = "filetype"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bb/29/745f7d30d47fe0f251d3ad3dc2978a23141917661998763bebb6da007eb1/filetype-1.2.0.tar.gz", hash = "sha256:66b56cd6474bf41d8c54660347d37afcc3f7d1970648de365c102ef77548aadb", size = 998020, upload-time = "2022-11-02T17:34:04.141Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/79/1b8fa1bb3568781e84c9200f951c735f3f157429f44be0495da55894d620/filetype-1.2.0-py2.py3-none-any.whl", hash = "sha256:7ce71b6880181241cf7ac8697a2f1eb6a8bd9b429f7ad6d27b8db9ba5f1c2d25", size = 19970, upload-time = "2022-11-02T17:34:01.425Z" },
+]
+
+[[package]]
 name = "future"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -357,9 +384,19 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "construct" },
+    { name = "dissect-cstruct" },
+    { name = "filetype" },
     { name = "future" },
     { name = "miasm" },
     { name = "triton-library" },
+]
+construct = [
+    { name = "construct" },
+]
+cstruct = [
+    { name = "dissect-cstruct" },
+    { name = "filetype" },
 ]
 miasm = [
     { name = "future" },
@@ -378,6 +415,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "construct", marker = "extra == 'all'", specifier = ">=2.10.68" },
+    { name = "construct", marker = "extra == 'construct'", specifier = ">=2.10.68" },
+    { name = "dissect-cstruct", marker = "extra == 'all'", specifier = ">=4.0" },
+    { name = "dissect-cstruct", marker = "extra == 'cstruct'", specifier = ">=4.0" },
+    { name = "filetype", marker = "extra == 'all'", specifier = ">=1.2.0" },
+    { name = "filetype", marker = "extra == 'cstruct'", specifier = ">=1.2.0" },
     { name = "future", marker = "extra == 'all'", specifier = ">=0.18.0" },
     { name = "future", marker = "extra == 'miasm'", specifier = ">=0.18.0" },
     { name = "idapro", specifier = ">=0.0.9" },
@@ -387,7 +430,7 @@ requires-dist = [
     { name = "triton-library", marker = "extra == 'all'", specifier = ">=0.10.0" },
     { name = "triton-library", marker = "extra == 'triton'", specifier = ">=0.10.0" },
 ]
-provides-extras = ["triton", "miasm", "all"]
+provides-extras = ["triton", "miasm", "construct", "cstruct", "all"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -1,5 +1,7 @@
 from typing import Annotated, Any, TypedDict
 
+import logging
+
 import idc
 import ida_typeinf
 import ida_hexrays
@@ -7,9 +9,12 @@ import ida_nalt
 import ida_bytes
 import ida_frame
 import idaapi
+import ida_funcs
+import idautils
+import ida_name
 
 from .rpc import tool
-from .sync import idasync
+from .sync import idasync, tool_timeout
 from .utils import (
     tool_error,
     item_error,
@@ -32,6 +37,8 @@ from .utils import (
 )
 from . import compat
 from .compat import tinfo_get_udm
+
+logger = logging.getLogger(__name__)
 
 
 class DeclareTypeResult(TypedDict, total=False):
@@ -1138,3 +1145,660 @@ def infer_types(
             )
 
     return results
+
+
+# ============================================================================
+# Type Propagation — Phase 4.2
+# ============================================================================
+
+
+class FieldAccess(TypedDict):
+    offset: int
+    access_size: int
+    is_write: bool
+    ea: str
+    func_ea: str
+    func_name: str
+    disasm: str
+
+
+class CallUsage(TypedDict):
+    func_ea: str
+    func_name: str
+    call_ea: str
+    arg_index: int
+    callee_name: str
+
+
+class PropagationStep(TypedDict):
+    ea: str
+    func_ea: str
+    func_name: str
+    kind: str
+    detail: str
+
+
+class TypePropagateResult(TypedDict, total=False):
+    ok: bool
+    address: str
+    inferred_type: str
+    confidence: float
+    field_accesses: list[FieldAccess]
+    call_usages: list[CallUsage]
+    propagation_path: list[PropagationStep]
+    functions_analyzed: list[dict]
+    suggested_struct_name: str | None
+    suggested_struct_definition: str | None
+    applied: bool
+    error: str
+    error_type: str
+    hint: str
+
+
+# Known API signatures for type inference from call arguments
+_KNOWN_API_TYPES: dict[str, str] = {
+    "strlen": "char*",
+    "strcmp": "char*",
+    "strncmp": "char*",
+    "strcpy": "char*",
+    "strncpy": "char*",
+    "strdup": "char*",
+    "memcpy": "void*",
+    "memmove": "void*",
+    "memset": "void*",
+    "memcmp": "void*",
+    "malloc": "void*",
+    "calloc": "void*",
+    "realloc": "void*",
+    "free": "void*",
+    "fopen": "FILE*",
+    "fclose": "FILE*",
+    "fread": "FILE*",
+    "fwrite": "FILE*",
+    "fprintf": "FILE*",
+    "sprintf": "char*",
+    "snprintf": "char*",
+    "printf": "const char*",
+    "puts": "const char*",
+    "atoi": "const char*",
+    "atol": "const char*",
+    "atof": "const char*",
+    "strtol": "char*",
+    "strtoul": "char*",
+    "strtod": "char*",
+    "sscanf": "const char*",
+    "qsort": "void*",
+    "bsearch": "void*",
+}
+
+
+_MALLOC_LIKE: set[str] = {"malloc", "calloc", "realloc"}
+
+
+def _decompile_func(func_ea: int) -> ida_hexrays.cfunc_t | None:
+    """Decompile a function; return None on failure."""
+    try:
+        hf = ida_hexrays.hexrays_failure_t()
+        cfunc = ida_hexrays.decompile(func_ea, hf)
+        if cfunc:
+            return cfunc
+        logger.debug("decompile 0x%x failed: %s", func_ea, hf.str)
+    except Exception as e:
+        logger.debug("decompile 0x%x exception: %s", func_ea, e)
+    return None
+
+
+def _find_lvar_by_name(cfunc: ida_hexrays.cfunc_t, name: str):
+    """Find a local variable by name (case-insensitive)."""
+    for lvar in cfunc.get_lvars():
+        if lvar.name and lvar.name.lower() == name.lower():
+            return lvar
+    return None
+
+
+def _expr_is_target(expr, cfunc, target_lvar_idx: int | None = None, target_ea: int | None = None) -> bool:
+    """Check if a ctree expression is the target variable/global."""
+    if expr is None:
+        return False
+    if target_lvar_idx is not None and expr.op == ida_hexrays.cot_var:
+        return expr.v.idx == target_lvar_idx
+    if target_ea is not None and expr.op == ida_hexrays.cot_obj:
+        return expr.obj_ea == target_ea
+    return False
+
+
+def _get_expr_text(expr, cfunc) -> str:
+    """Best-effort text representation of a ctree expression."""
+    try:
+        if expr.op == ida_hexrays.cot_var:
+            lvars = cfunc.get_lvars()
+            if 0 <= expr.v.idx < len(lvars):
+                return lvars[expr.v.idx].name
+            return f"v{expr.v.idx}"
+        if expr.op == ida_hexrays.cot_obj:
+            name = ida_name.get_func_name(expr.obj_ea) or ida_name.get_name(expr.obj_ea)
+            return name or hex(expr.obj_ea)
+        if expr.op == ida_hexrays.cot_num:
+            return str(expr.n._value)
+    except Exception:
+        pass
+    return f"expr_{expr.op}"
+
+
+class _UsageCollector(ida_hexrays.ctree_visitor_t):
+    """Collect field accesses, call usages, and malloc origins for a target variable."""
+
+    def __init__(self, cfunc: ida_hexrays.cfunc_t, target_lvar_idx: int | None = None, target_ea: int | None = None):
+        super().__init__(ida_hexrays.CV_FAST)
+        self.cfunc = cfunc
+        self.target_lvar_idx = target_lvar_idx
+        self.target_ea = target_ea
+        self.field_accesses: list[dict] = []
+        self.call_usages: list[dict] = []
+        self.malloc_origin: dict | None = None
+        self.assignments: list[dict] = []
+        self._found_vars: set[int] = set()
+        if target_lvar_idx is not None:
+            self._found_vars.add(target_lvar_idx)
+
+    def _is_target_expr(self, expr) -> bool:
+        return _expr_is_target(expr, self.cfunc, self.target_lvar_idx, self.target_ea)
+
+    def _track_var_assignment(self, lhs, rhs):
+        """Track assignments: if rhs is target, lhs var is now also tracked."""
+        if lhs is None or rhs is None:
+            return
+        if lhs.op == ida_hexrays.cot_var and self._is_target_expr(rhs):
+            self._found_vars.add(lhs.v.idx)
+
+    def _record_field_access(self, expr, is_write: bool):
+        """Record a memptr/memref access on the target."""
+        try:
+            offset_bytes = expr.m // 8
+            access_size = getattr(expr, "ptrsize", 8)
+            if access_size == 0:
+                access_size = 8
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.field_accesses.append({
+                "offset": offset_bytes,
+                "access_size": access_size,
+                "is_write": is_write,
+                "ea": hex(expr.ea),
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "disasm": _get_expr_text(expr, self.cfunc),
+            })
+        except Exception as e:
+            logger.debug("_record_field_access failed: %s", e)
+
+    def _record_call_usage(self, call_expr, arg_index: int):
+        """Record that target is passed as argument to a call."""
+        try:
+            callee = call_expr.x
+            callee_ea = callee.obj_ea if callee.op == ida_hexrays.cot_obj else idaapi.BADADDR
+            callee_name = ida_name.get_func_name(callee_ea) or ida_name.get_name(callee_ea) or ""
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.call_usages.append({
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "call_ea": hex(call_expr.ea),
+                "arg_index": arg_index,
+                "callee_name": callee_name,
+            })
+        except Exception as e:
+            logger.debug("_record_call_usage failed: %s", e)
+
+    def _check_malloc_origin(self, rhs):
+        """Check if rhs is a malloc-like call."""
+        if rhs.op != ida_hexrays.cot_call:
+            return False
+        callee = rhs.x
+        if callee.op != ida_hexrays.cot_obj:
+            return False
+        callee_name = ida_name.get_func_name(callee.obj_ea) or ""
+        if any(m in callee_name for m in _MALLOC_LIKE):
+            self.malloc_origin = {
+                "ea": hex(rhs.ea),
+                "func_ea": hex(self.cfunc.entry_ea),
+                "func_name": ida_funcs.get_func_name(self.cfunc.entry_ea) or "",
+                "allocator": callee_name,
+            }
+            return True
+        return False
+
+    def visit_expr(self, expr):
+        try:
+            # --- Assignment tracking ---
+            if expr.op == ida_hexrays.cot_asg:
+                lhs, rhs = expr.x, expr.y
+                self._track_var_assignment(lhs, rhs)
+                # Field write: target->field = value
+                if lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                    if self._is_target_expr(lhs.x) or _expr_is_target(lhs.x, self.cfunc, None, self.target_ea) or (lhs.x.op == ida_hexrays.cot_var and lhs.x.v.idx in self._found_vars):
+                        self._record_field_access(lhs, is_write=True)
+                # Malloc origin: var = malloc(...)
+                if self._is_target_expr(lhs) or (lhs.op == ida_hexrays.cot_var and lhs.v.idx in self._found_vars):
+                    self._check_malloc_origin(rhs)
+
+            # --- Field reads ---
+            if expr.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                base = expr.x
+                if self._is_target_expr(base) or (base.op == ida_hexrays.cot_var and base.v.idx in self._found_vars):
+                    self._record_field_access(expr, is_write=False)
+
+            # --- Call arguments ---
+            if expr.op == ida_hexrays.cot_call:
+                args = expr.a
+                if args:
+                    for idx, arg in enumerate(args):
+                        if self._is_target_expr(arg) or (arg.op == ida_hexrays.cot_var and arg.v.idx in self._found_vars):
+                            self._record_call_usage(expr, idx)
+
+        except Exception as e:
+            logger.debug("_UsageCollector.visit_expr failed: %s", e)
+        return 0
+
+
+def _resolve_target(address: str) -> tuple[int | None, str | None, str | None]:
+    """Parse address string. Returns (func_ea, var_name, error)."""
+    if "::" in address:
+        parts = address.rsplit("::", 1)
+        func_spec = parts[0].strip()
+        var_name = parts[1].strip()
+        try:
+            func_ea = parse_address(func_spec)
+        except Exception:
+            func_ea = ida_name.get_name_ea(idaapi.BADADDR, func_spec)
+            if func_ea == idaapi.BADADDR:
+                return None, None, f"Function '{func_spec}' not found"
+        return func_ea, var_name, None
+    return None, None, None
+
+
+def _guess_field_type(access_size: int) -> str:
+    return {1: "char", 2: "short", 4: "int", 8: "__int64"}.get(access_size, "void*")
+
+
+def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[str, str] | None:
+    """Create a struct tinfo_t from (offset, access_size) pairs. Returns (name, c_def) or None."""
+    if not fields:
+        return None
+    try:
+        # Deduplicate offsets, keep max access size
+        offset_map: dict[int, int] = {}
+        for off, sz in fields:
+            offset_map[off] = max(offset_map.get(off, 0), sz)
+
+        sorted_offsets = sorted(offset_map.items())
+        max_off = sorted_offsets[-1][0]
+        max_size = sorted_offsets[-1][1]
+        struct_size = max_off + max(max_size, 8)
+
+        tif = ida_typeinf.tinfo_t()
+        tif.create_udt(ida_typeinf.BTF_STRUCT)
+
+        # Add fields at observed offsets
+        for off, sz in sorted_offsets:
+            fname = f"field_{off:X}"
+            ftype_str = _guess_field_type(sz)
+            tif.add_udm(fname, ftype_str, offset=off * 8)
+
+        # Pad to struct size if needed
+        tif.set_udt_align(8)
+
+        til = ida_typeinf.get_idati()
+        # Ensure unique name
+        struct_name = base_name
+        counter = 0
+        while True:
+            existing = ida_typeinf.tinfo_t()
+            if not existing.get_named_type(til, struct_name, ida_typeinf.BTF_STRUCT):
+                break
+            counter += 1
+            struct_name = f"{base_name}_{counter}"
+
+        res = tif.set_named_type(til, struct_name, ida_typeinf.NTF_TYPE)
+        if res != ida_typeinf.TERR_OK:
+            logger.debug("set_named_type failed for %s: %d", struct_name, res)
+            return None
+
+        # Build C-like definition string
+        lines = [f"struct {struct_name} {{"]
+        for off, sz in sorted_offsets:
+            lines.append(f"    {_guess_field_type(sz)} field_{off:X}; // +0x{off:X}")
+        lines.append("};")
+        c_def = "\n".join(lines)
+
+        return struct_name, c_def
+    except Exception as e:
+        logger.debug("_build_struct_type failed: %s", e)
+        return None
+
+
+def _infer_type_and_confidence(evidence: dict) -> tuple[str, float]:
+    """Infer type string and confidence from collected evidence."""
+    field_accesses = evidence.get("field_accesses", [])
+    call_usages = evidence.get("call_usages", [])
+    malloc_origin = evidence.get("malloc_origin")
+
+    # Check known API calls first
+    for cu in call_usages:
+        callee = cu.get("callee_name", "")
+        for api_name, api_type in _KNOWN_API_TYPES.items():
+            if api_name in callee.lower():
+                return api_type, 0.90
+
+    # Struct inference from field accesses
+    if field_accesses:
+        offsets = {fa["offset"] for fa in field_accesses}
+        num_offsets = len(offsets)
+        max_offset = max(offsets)
+        # Confidence based on field count and offset coverage
+        coverage = max_offset / (max_offset + 8) if max_offset > 0 else 1.0
+        base_conf = min(0.50 + num_offsets * 0.12, 0.95)
+        confidence = base_conf * (0.5 + 0.5 * coverage)
+        if malloc_origin:
+            confidence = min(confidence + 0.10, 0.95)
+            return "struct_inferred*", confidence
+        return "struct_inferred*", confidence
+
+    if malloc_origin:
+        return "void*", 0.50
+
+    return "void*", 0.20
+
+
+def _collect_xref_functions(target_ea: int, direction: str, max_depth: int, max_funcs: int) -> set[int]:
+    """Collect function EAs that xref target_ea, up to max_depth hops."""
+    result: set[int] = set()
+    if target_ea == idaapi.BADADDR:
+        return result
+
+    # BFS over xref graph
+    visited: set[int] = set()
+    queue: list[tuple[int, int]] = [(target_ea, 0)]
+
+    while queue and len(result) < max_funcs:
+        ea, depth = queue.pop(0)
+        if ea in visited or depth > max_depth:
+            continue
+        visited.add(ea)
+
+        if direction in ("backward", "both"):
+            try:
+                for xref in idautils.XrefsTo(ea, 0):
+                    func = ida_funcs.get_func(xref.frm)
+                    if func:
+                        result.add(func.start_ea)
+                    if depth < max_depth:
+                        queue.append((xref.frm, depth + 1))
+            except Exception:
+                pass
+
+        if direction in ("forward", "both"):
+            try:
+                for xref in idautils.XrefsFrom(ea, 0):
+                    func = ida_funcs.get_func(xref.to)
+                    if func:
+                        result.add(func.start_ea)
+                    if depth < max_depth:
+                        queue.append((xref.to, depth + 1))
+            except Exception:
+                pass
+
+    return result
+
+
+@tool
+@idasync
+@tool_timeout(120.0)
+def type_propagate(
+    address: Annotated[
+        str,
+        "Starting point: global address (hex or symbol), or 'function::variable' syntax "
+        "(e.g. 'main::ptr' or '0x401000::ptr') to target a local variable.",
+    ],
+    direction: Annotated[
+        str,
+        "Propagation direction: 'forward' (where value flows), 'backward' (where it comes from), "
+        "or 'both' (default).",
+    ] = "both",
+    max_depth: Annotated[int, "Max xref hop depth for cross-function propagation (default 3)"] = 3,
+    max_functions: Annotated[int, "Cap on functions to decompile (default 10)"] = 10,
+    infer_struct: Annotated[bool, "Auto-create struct in TIL from observed field accesses (default True)"] = True,
+    apply_type: Annotated[bool, "Apply inferred type to target address/variable (default False)"] = False,
+) -> TypePropagateResult:
+    """Propagate and infer types across data-flow chains using decompiler analysis.
+
+    Analyzes how a variable or global address is used across decompiled functions to infer
+    its most likely type. The primary use case is struct layout inference from field access
+    patterns — when you see ptr->field_0x18 = value across multiple functions, this tool
+    collects all observed offsets, deduces field types from access sizes, and optionally
+    creates a struct type in the IDA type library.
+
+    Two input modes:
+    - Global/stack address: pass a hex address or symbol name (e.g. "0x401000")
+    - Function variable: use "func_name::var_name" syntax (e.g. "main::ptr")
+
+    Direction:
+    - "backward": trace where the value originates (assignments TO target)
+    - "forward": trace where the value flows (assignments FROM target, call arguments)
+    - "both": collect evidence from both directions
+
+    Evidence collected:
+    - Field accesses (cot_memptr / cot_memref): offset, access size, read/write
+    - Call arguments: which known API functions receive the target
+    - Malloc origins: whether target is assigned from malloc/calloc/realloc
+
+    Confidence is derived from the diversity and strength of evidence.
+    """
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return {
+                "ok": False,
+                "error": "Hex-Rays decompiler is not available",
+                "hint": "Ensure Hex-Rays is installed and licensed. Use infer_types for address-local type guessing without decompiler.",
+            }
+
+        direction = direction.lower().strip()
+        if direction not in ("forward", "backward", "both"):
+            return {
+                "ok": False,
+                "error": f"Invalid direction '{direction}'. Use 'forward', 'backward', or 'both'.",
+            }
+
+        # Parse input address
+        func_ea, var_name, parse_err = _resolve_target(address)
+        target_global_ea: int | None = None
+        containing_func_ea: int | None = None
+
+        if parse_err:
+            return {"ok": False, "error": parse_err, "address": address}
+
+        if func_ea is not None and var_name is not None:
+            # Function::variable mode
+            containing_func_ea = func_ea
+            target_global_ea = None
+        else:
+            # Raw address mode
+            try:
+                target_global_ea = parse_address(address)
+            except Exception:
+                target_global_ea = ida_name.get_name_ea(idaapi.BADADDR, address)
+                if target_global_ea == idaapi.BADADDR:
+                    return {"ok": False, "error": f"Address '{address}' not found", "address": address}
+
+            # Find containing function
+            func = ida_funcs.get_func(target_global_ea)
+            if func:
+                containing_func_ea = func.start_ea
+            else:
+                # Try to find a function that references this global
+                for xref in idautils.XrefsTo(target_global_ea, 0):
+                    func = ida_funcs.get_func(xref.frm)
+                    if func:
+                        containing_func_ea = func.start_ea
+                        break
+
+        # Build list of functions to analyze
+        func_eas: set[int] = set()
+        if containing_func_ea is not None:
+            func_eas.add(containing_func_ea)
+
+        if target_global_ea is not None and max_depth > 0:
+            xref_funcs = _collect_xref_functions(target_global_ea, direction, max_depth, max_functions)
+            func_eas.update(xref_funcs)
+
+        # Cap
+        func_eas = set(list(func_eas)[:max_functions])
+
+        if not func_eas:
+            return {
+                "ok": True,
+                "address": address,
+                "inferred_type": "unknown",
+                "confidence": 0.0,
+                "field_accesses": [],
+                "call_usages": [],
+                "propagation_path": [],
+                "functions_analyzed": [],
+                "suggested_struct_name": None,
+                "suggested_struct_definition": None,
+                "applied": False,
+            }
+
+        all_evidence = {
+            "field_accesses": [],
+            "call_usages": [],
+            "malloc_origin": None,
+            "assignments": [],
+        }
+        functions_analyzed: list[dict] = []
+        propagation_path: list[PropagationStep] = []
+
+        for fea in func_eas:
+            func_name = ida_funcs.get_func_name(fea) or hex(fea)
+            cfunc = _decompile_func(fea)
+            if not cfunc:
+                functions_analyzed.append({
+                    "func_ea": hex(fea),
+                    "func_name": func_name,
+                    "decompiled": False,
+                })
+                continue
+
+            # Resolve target in this function
+            target_lvar_idx: int | None = None
+            if var_name is not None and containing_func_ea == fea:
+                lvar = _find_lvar_by_name(cfunc, var_name)
+                if lvar:
+                    target_lvar_idx = lvar.idx
+                else:
+                    functions_analyzed.append({
+                        "func_ea": hex(fea),
+                        "func_name": func_name,
+                        "decompiled": True,
+                        "note": f"Variable '{var_name}' not found in decompiled locals",
+                    })
+                    continue
+
+            collector = _UsageCollector(cfunc, target_lvar_idx=target_lvar_idx, target_ea=target_global_ea)
+            collector.apply_to(cfunc.body, None)
+
+            all_evidence["field_accesses"].extend(collector.field_accesses)
+            all_evidence["call_usages"].extend(collector.call_usages)
+            if collector.malloc_origin and all_evidence["malloc_origin"] is None:
+                all_evidence["malloc_origin"] = collector.malloc_origin
+            all_evidence["assignments"].extend(collector.assignments)
+
+            # Build propagation path entries
+            for fa in collector.field_accesses:
+                propagation_path.append({
+                    "ea": fa["ea"],
+                    "func_ea": fa["func_ea"],
+                    "func_name": fa["func_name"],
+                    "kind": "field_write" if fa["is_write"] else "field_read",
+                    "detail": f"offset=0x{fa['offset']:X}, size={fa['access_size']}",
+                })
+            for cu in collector.call_usages:
+                propagation_path.append({
+                    "ea": cu["call_ea"],
+                    "func_ea": cu["func_ea"],
+                    "func_name": cu["func_name"],
+                    "kind": "call_arg",
+                    "detail": f"arg[{cu['arg_index']}] -> {cu['callee_name']}",
+                })
+            if collector.malloc_origin:
+                propagation_path.append({
+                    "ea": collector.malloc_origin["ea"],
+                    "func_ea": collector.malloc_origin["func_ea"],
+                    "func_name": collector.malloc_origin["func_name"],
+                    "kind": "malloc",
+                    "detail": f"assigned from {collector.malloc_origin['allocator']}",
+                })
+
+            functions_analyzed.append({
+                "func_ea": hex(fea),
+                "func_name": func_name,
+                "decompiled": True,
+                "field_access_count": len(collector.field_accesses),
+                "call_usage_count": len(collector.call_usages),
+            })
+
+        # Deduplicate propagation path by (ea, kind, detail)
+        seen_path = set()
+        deduped_path = []
+        for step in propagation_path:
+            key = (step["ea"], step["kind"], step["detail"])
+            if key not in seen_path:
+                seen_path.add(key)
+                deduped_path.append(step)
+        propagation_path = deduped_path
+
+        # Infer type
+        inferred_type, confidence = _infer_type_and_confidence(all_evidence)
+
+        # Build struct if requested
+        suggested_struct_name = None
+        suggested_struct_definition = None
+        applied = False
+
+        if infer_struct and all_evidence["field_accesses"]:
+            fields = [(fa["offset"], fa["access_size"]) for fa in all_evidence["field_accesses"]]
+            base_name = f"inferred_struct_{target_global_ea:X}" if target_global_ea else f"inferred_struct_{containing_func_ea:X}"
+            struct_result = _build_struct_type(fields, base_name)
+            if struct_result:
+                suggested_struct_name, suggested_struct_definition = struct_result
+                # If the inferred type was generic "struct_inferred*", make it specific
+                if inferred_type == "struct_inferred*":
+                    inferred_type = f"{suggested_struct_name}*"
+
+        # Apply type if requested
+        if apply_type and target_global_ea is not None and inferred_type != "unknown":
+            try:
+                tif = _parse_type_tinfo(inferred_type)
+                if tif:
+                    ida_typeinf.apply_tinfo(target_global_ea, tif, ida_typeinf.TINFO_DEFINITE)
+                    applied = True
+            except Exception as e:
+                logger.debug("apply_type failed: %s", e)
+
+        return {
+            "ok": True,
+            "address": address,
+            "inferred_type": inferred_type,
+            "confidence": round(confidence, 3),
+            "field_accesses": all_evidence["field_accesses"],
+            "call_usages": all_evidence["call_usages"],
+            "propagation_path": propagation_path,
+            "functions_analyzed": functions_analyzed,
+            "suggested_struct_name": suggested_struct_name,
+            "suggested_struct_definition": suggested_struct_definition,
+            "applied": applied,
+        }
+
+    except Exception as e:
+        logger.exception("type_propagate failed")
+        return tool_error(e)

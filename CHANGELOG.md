@@ -48,6 +48,12 @@ Based on a field test report from an AI agent (MiniMax-M2.7) conducting real rev
 - **`api_analysis.py` / multiple modules — `error_type` + `hint` missing from TypedDicts** — `item_error()` spreads `error_type` (and optionally `hint`) into result dicts, but ~38 TypedDicts declared `additionalProperties: false` via MCP schema derivation without these fields. Added `error_type: NotRequired[str]` and `hint: NotRequired[str]` to all affected TypedDicts across `api_analysis.py`, `api_core.py`, `api_debug.py`, `api_memory.py`, `api_modify.py`, `api_sigmaker.py`, `api_stack.py`, `api_types.py`.
 - **`utils.py` — `Page` missing `total`** — `list_funcs` returned `next_offset: null` with no way for callers to know the total count. Added `total: int` to `Page` TypedDict and `paginate()` return.
 
+##### `api_types.py`
+
+| Tool | Description |
+|------|-------------|
+| `type_propagate(address, direction, max_depth, max_functions, infer_struct, apply_type)` | Decompiler-based type propagation and struct inference. Analyzes how a variable or global is used across decompiled functions to infer its type. Primary use case: infer struct layouts from field access patterns (e.g., `ptr->field_0x18 = value`). Supports two input modes — raw address (`"0x401000"`) or scoped variable (`"main::ptr"`). Collects `cot_memptr`/`cot_memref` field accesses, call-argument patterns (strlen→`char*`, fopen→`FILE*`, malloc→`void*`), and malloc origins. Cross-function expansion via xref BFS (`max_depth` hops, `max_functions` cap). Auto-creates `inferred_struct_*` types in the TIL when `infer_struct=True`. Confidence score (0.0–1.0) derived from field count, offset coverage, and API evidence. |
+
 #### Post-Review Fixes (sig_suggest_candidates)
 
 - **`api_flirt.py` — `_get_named_callees` collected jumps as well as calls** — `CodeRefsFrom(head, 0)` returns all code references (including jumps and tail calls). Added `idc.is_call_insn(head)` filter so only true `call` instructions contribute to the callee Jaccard signal, matching the spec.

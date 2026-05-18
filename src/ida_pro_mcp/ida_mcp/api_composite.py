@@ -1446,18 +1446,26 @@ def hybrid_iterative_deobfuscate(
                 (ir_stmt_before - ir_stmt_after) / ir_stmt_before * 100, 1
             ) if ir_stmt_before > 0 else 0.0
 
+            block_count_final = block_count_after
+            edge_count_final = edge_count_after
+            ir_stmt_final = ir_stmt_after
+
             # Convergence: all three structural metrics unchanged.
-            signature = (block_count_after, ir_stmt_after, edge_count_after)
+            signature = (block_count_final, ir_stmt_final, edge_count_final)
 
             if prev_signature is not None and signature == prev_signature:
+                # Use the previous iteration's post-simplification counts as
+                # the "before" values for the convergence record, since
+                # block_count_before would be re-computed from the (unchanged)
+                # post-simplification state at the start of this iteration.
                 iterations.append({
                     "iteration": iter_idx,
-                    "block_count_before": block_count_before,
-                    "block_count_after": block_count_after,
-                    "edge_count_before": edge_count_before,
-                    "edge_count_after": edge_count_after,
-                    "ir_statements_before": ir_stmt_before,
-                    "ir_statements_after": ir_stmt_after,
+                    "block_count_before": prev_signature[0],
+                    "block_count_after": block_count_final,
+                    "edge_count_before": prev_signature[2],
+                    "edge_count_after": edge_count_final,
+                    "ir_statements_before": prev_signature[1],
+                    "ir_statements_after": ir_stmt_final,
                     "ir_reduction_pct": ir_reduction_pct,
                     "candidates": [],
                     "blocks_removed": 0,
@@ -1472,8 +1480,14 @@ def hybrid_iterative_deobfuscate(
                 converged = True
                 break
             prev_signature = signature
+            block_count_final = block_count_after
+            edge_count_final = edge_count_after
+            ir_stmt_final = ir_stmt_after
 
             candidates = _identify_dead_candidates(asmcfg, ircfg, lifter)
+
+            # Convergence: all three structural metrics unchanged.
+            signature = (block_count_final, ir_stmt_final, edge_count_final)
 
             verified: bool | None = None
             mismatches: list[str] = []
@@ -1556,6 +1570,8 @@ def hybrid_iterative_deobfuscate(
                 converged = True
                 iterations[-1]["converged"] = True
                 break
+
+            prev_signature = (block_count_final, ir_stmt_final, edge_count_final)
 
         if converged:
             final_state = "converged"
