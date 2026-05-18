@@ -1152,7 +1152,7 @@ def infer_types(
 # ============================================================================
 
 
-class FieldAccess(TypedDict):
+class FieldAccess(TypedDict, total=False):
     offset: int
     access_size: int
     is_write: bool
@@ -1162,7 +1162,7 @@ class FieldAccess(TypedDict):
     disasm: str
 
 
-class CallUsage(TypedDict):
+class CallUsage(TypedDict, total=False):
     func_ea: str
     func_name: str
     call_ea: str
@@ -1170,7 +1170,7 @@ class CallUsage(TypedDict):
     callee_name: str
 
 
-class PropagationStep(TypedDict):
+class PropagationStep(TypedDict, total=False):
     ea: str
     func_ea: str
     func_name: str
@@ -1256,7 +1256,7 @@ def _find_lvar_by_name(cfunc: ida_hexrays.cfunc_t, name: str):
     return None
 
 
-def _expr_is_target(expr, cfunc, target_lvar_idx: int | None = None, target_ea: int | None = None) -> bool:
+def _expr_is_target(expr, target_lvar_idx: int | None = None, target_ea: int | None = None) -> bool:
     """Check if a ctree expression is the target variable/global."""
     if expr is None:
         return False
@@ -1298,11 +1298,12 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
         self.malloc_origin: dict | None = None
         self.assignments: list[dict] = []
         self._found_vars: set[int] = set()
+        self._seen_field_writes: set[tuple[str, int]] = set()  # (ea_hex, offset)
         if target_lvar_idx is not None:
             self._found_vars.add(target_lvar_idx)
 
     def _is_target_expr(self, expr) -> bool:
-        return _expr_is_target(expr, self.cfunc, self.target_lvar_idx, self.target_ea)
+        return _expr_is_target(expr, self.target_lvar_idx, self.target_ea)
 
     def _track_var_assignment(self, lhs, rhs):
         """Track assignments: if rhs is target, lhs var is now also tracked."""
@@ -1318,13 +1319,20 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
             access_size = getattr(expr, "ptrsize", 8)
             if access_size == 0:
                 access_size = 8
+            ea_hex = hex(expr.ea)
+            # Deduplicate writes to avoid double-counting (cot_asg + cot_memptr)
+            if is_write:
+                self._seen_field_writes.add((ea_hex, offset_bytes))
+            else:
+                if (ea_hex, offset_bytes) in self._seen_field_writes:
+                    return  # skip read that was already recorded as write
             func_ea = self.cfunc.entry_ea
             func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
             self.field_accesses.append({
                 "offset": offset_bytes,
                 "access_size": access_size,
                 "is_write": is_write,
-                "ea": hex(expr.ea),
+                "ea": ea_hex,
                 "func_ea": hex(func_ea),
                 "func_name": func_name,
                 "disasm": _get_expr_text(expr, self.cfunc),
@@ -1336,6 +1344,8 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
         """Record that target is passed as argument to a call."""
         try:
             callee = call_expr.x
+            if callee is None:
+                return
             callee_ea = callee.obj_ea if callee.op == ida_hexrays.cot_obj else idaapi.BADADDR
             callee_name = ida_name.get_func_name(callee_ea) or ida_name.get_name(callee_ea) or ""
             func_ea = self.cfunc.entry_ea
@@ -1376,7 +1386,7 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
                 self._track_var_assignment(lhs, rhs)
                 # Field write: target->field = value
                 if lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
-                    if self._is_target_expr(lhs.x) or _expr_is_target(lhs.x, self.cfunc, None, self.target_ea) or (lhs.x.op == ida_hexrays.cot_var and lhs.x.v.idx in self._found_vars):
+                    if self._is_target_expr(lhs.x) or _expr_is_target(lhs.x, None, self.target_ea) or (lhs.x.op == ida_hexrays.cot_var and lhs.x.v.idx in self._found_vars):
                         self._record_field_access(lhs, is_write=True)
                 # Malloc origin: var = malloc(...)
                 if self._is_target_expr(lhs) or (lhs.op == ida_hexrays.cot_var and lhs.v.idx in self._found_vars):
@@ -1407,6 +1417,8 @@ def _resolve_target(address: str) -> tuple[int | None, str | None, str | None]:
         parts = address.rsplit("::", 1)
         func_spec = parts[0].strip()
         var_name = parts[1].strip()
+        if not var_name:
+            return None, None, "Variable name must not be empty after '::'"
         try:
             func_ea = parse_address(func_spec)
         except Exception:
@@ -1432,9 +1444,6 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
             offset_map[off] = max(offset_map.get(off, 0), sz)
 
         sorted_offsets = sorted(offset_map.items())
-        max_off = sorted_offsets[-1][0]
-        max_size = sorted_offsets[-1][1]
-        struct_size = max_off + max(max_size, 8)
 
         tif = ida_typeinf.tinfo_t()
         tif.create_udt(ida_typeinf.BTF_STRUCT)
@@ -1445,7 +1454,7 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
             ftype_str = _guess_field_type(sz)
             tif.add_udm(fname, ftype_str, offset=off * 8)
 
-        # Pad to struct size if needed
+        # Set alignment; IDA auto-computes struct size from UDT layout
         tif.set_udt_align(8)
 
         til = ida_typeinf.get_idati()
@@ -1651,8 +1660,8 @@ def type_propagate(
             xref_funcs = _collect_xref_functions(target_global_ea, direction, max_depth, max_functions)
             func_eas.update(xref_funcs)
 
-        # Cap
-        func_eas = set(list(func_eas)[:max_functions])
+        # Cap — sort for determinism, then limit
+        func_eas = set(sorted(func_eas)[:max_functions])
 
         if not func_eas:
             return {
@@ -1766,7 +1775,12 @@ def type_propagate(
         applied = False
 
         if infer_struct and all_evidence["field_accesses"]:
-            fields = [(fa["offset"], fa["access_size"]) for fa in all_evidence["field_accesses"]]
+            # Dedupe field accesses by (offset, access_size) keeping max size per offset
+            field_map: dict[int, int] = {}
+            for fa in all_evidence["field_accesses"]:
+                off = fa["offset"]
+                field_map[off] = max(field_map.get(off, 0), fa["access_size"])
+            fields = list(field_map.items())
             base_name = f"inferred_struct_{target_global_ea:X}" if target_global_ea else f"inferred_struct_{containing_func_ea:X}"
             struct_result = _build_struct_type(fields, base_name)
             if struct_result:

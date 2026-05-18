@@ -54,6 +54,17 @@ Based on a field test report from an AI agent (MiniMax-M2.7) conducting real rev
 |------|-------------|
 | `type_propagate(address, direction, max_depth, max_functions, infer_struct, apply_type)` | Decompiler-based type propagation and struct inference. Analyzes how a variable or global is used across decompiled functions to infer its type. Primary use case: infer struct layouts from field access patterns (e.g., `ptr->field_0x18 = value`). Supports two input modes — raw address (`"0x401000"`) or scoped variable (`"main::ptr"`). Collects `cot_memptr`/`cot_memref` field accesses, call-argument patterns (strlen→`char*`, fopen→`FILE*`, malloc→`void*`), and malloc origins. Cross-function expansion via xref BFS (`max_depth` hops, `max_functions` cap). Auto-creates `inferred_struct_*` types in the TIL when `infer_struct=True`. Confidence score (0.0–1.0) derived from field count, offset coverage, and API evidence. |
 
+#### Post-Review Fixes (type_propagate)
+
+- **`api_types.py` — field writes recorded twice** — `cot_asg` handler recorded field writes, then the independent `cot_memptr` visit recorded the same access as a read. Added `_seen_field_writes` dedup set to skip reads that were already recorded as writes at the same EA+offset.
+- **`api_types.py` — `_build_struct_type` incorrect struct size + potential `AttributeError`** — Removed bogus `struct_size = max_off + max(max_size, 8)` calculation and non-existent `set_struct_size()` call. IDA auto-computes struct size from UDT layout.
+- **`api_types.py` — `_expr_is_target` had unused `cfunc` parameter** — Removed dead parameter.
+- **`api_types.py` — `_resolve_target` didn't validate empty var_name** — `"func::"` would silently fail. Now returns explicit error.
+- **`api_types.py` — `max_functions` cap was non-deterministic** — `set(list(...))` relies on hash iteration order. Changed to `set(sorted(...))` for reproducible results.
+- **`api_types.py` — field access deduplication missing** — 50 accesses to the same field in a loop produced 50 entries. Now deduped by offset with max access_size before struct creation.
+- **`api_types.py` — `FieldAccess`/`CallUsage` TypedDicts lacked `total=False`** — Added for consistency with all other TypedDicts in the module.
+- **`api_types.py` — `_record_call_usage` didn't guard against missing callee** — Indirect calls (`call [reg]`) can have `call_expr.x == None`. Added `if callee is None: return` guard.
+
 #### Post-Review Fixes (sig_suggest_candidates)
 
 - **`api_flirt.py` — `_get_named_callees` collected jumps as well as calls** — `CodeRefsFrom(head, 0)` returns all code references (including jumps and tail calls). Added `idc.is_call_insn(head)` filter so only true `call` instructions contribute to the callee Jaccard signal, matching the spec.
