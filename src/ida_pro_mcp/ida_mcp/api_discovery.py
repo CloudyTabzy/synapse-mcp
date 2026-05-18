@@ -24,6 +24,16 @@ class InstanceSelectionResult(TypedDict, total=False):
     error: str
 
 
+class ActiveInstanceResult(TypedDict, total=False):
+    host: str
+    port: int
+    pid: int
+    binary: str
+    idb_path: str
+    is_local: bool        # True when this instance is handling requests itself
+    reachable: bool
+
+
 class InstanceListItem(TypedDict, total=False):
     host: str
     port: int
@@ -49,7 +59,7 @@ _redirect_targets: dict[str, tuple[str, int]] = {}
 _redirect_lock = threading.Lock()
 
 # Tools that are always handled locally, never proxied
-_LOCAL_TOOL_NAMES = {"list_instances", "select_instance"}
+_LOCAL_TOOL_NAMES = {"list_instances", "select_instance", "get_active_instance"}
 
 
 def set_local_instance(host: str, port: int):
@@ -375,5 +385,42 @@ def select_instance(
 
     _set_redirect_target(host, port)
     return {"success": True, "host": host, "port": port}
+
+
+@tool
+def get_active_instance() -> ActiveInstanceResult:
+    """Return the IDA instance currently handling tool calls.
+
+    When no select_instance has been called, this is the local instance.
+    After select_instance(port), it is the redirected remote instance.
+
+    Use this to confirm which binary is active before running analysis —
+    avoids the classic mistake of querying the wrong IDB after switching
+    instances.
+    """
+    redirect = get_redirect_target()
+    if redirect:
+        host, port = redirect
+        is_local = False
+    else:
+        host, port = _LOCAL_HOST, _LOCAL_PORT or 0
+        is_local = True
+
+    instances = discover_instances()
+    for inst in instances:
+        if inst.get("host") == host and inst.get("port") == port:
+            return {
+                **inst,
+                "is_local": is_local,
+                "reachable": probe_instance(host, port),
+            }
+
+    # Instance not in discovery list (possible if it just started or is remote).
+    return {
+        "host": host,
+        "port": port,
+        "is_local": is_local,
+        "reachable": probe_instance(host, port),
+    }
 
 

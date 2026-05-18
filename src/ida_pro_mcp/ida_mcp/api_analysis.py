@@ -51,10 +51,17 @@ from .utils import (
 from . import compat
 
 
+class DecompileWarning(TypedDict, total=False):
+    id: int
+    ea: str
+    text: str
+
+
 class DecompileResult(TypedDict):
     addr: str
     code: str | None
     refs: NotRequired[list[Ref]]
+    warnings: NotRequired[list[DecompileWarning]]
     error: NotRequired[str]
     error_type: NotRequired[str]
     hint: NotRequired[str]
@@ -782,22 +789,60 @@ def decompile(
         bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
     ] = True,
 ) -> DecompileResult:
-    """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    """Decompile function(s) at address(es); returns pseudocode and per-item errors.
+
+    On success, a ``warnings`` list is included when the decompiler emits
+    advisory messages (e.g. "bad sp value at call").  Each entry has ``id``,
+    ``text``, and optionally ``ea``.
+
+    On failure, ``error`` contains the structured Hex-Rays failure description
+    rather than the generic "Decompilation failed" string.
+    """
     try:
         start = parse_address(addr)
         code = decompile_function_safe(start, include_addresses=include_addresses)
         if code is None:
-            return {"addr": addr, "code": None, "error": "Decompilation failed"}
+            decompile_error = "Decompilation failed"
+            try:
+                import ida_hexrays as _hr
+                if _hr.init_hexrays_plugin():
+                    hf = _hr.hexrays_failure_t()
+                    try:
+                        _hr.decompile(start, hf)
+                    except _hr.DecompilationFailure:
+                        desc = hf.desc()
+                        if desc:
+                            decompile_error = desc
+            except Exception:
+                pass
+            return {"addr": addr, "code": None, "error": decompile_error}
+
         result: DecompileResult = {"addr": addr, "code": code}
         try:
-            import ida_hexrays
+            import ida_hexrays as _hr
 
-            if ida_hexrays.init_hexrays_plugin():
-                cfunc = ida_hexrays.decompile(start)
+            if _hr.init_hexrays_plugin():
+                cfunc = _hr.decompile(start)
                 if cfunc:
                     refs = _collect_decompile_refs(cfunc)
                     if refs:
                         result["refs"] = refs
+                    # Collect advisory decompiler warnings
+                    warns: list[DecompileWarning] = []
+                    try:
+                        import idaapi as _idaapi
+                        for w in cfunc.warnings:
+                            entry: DecompileWarning = {
+                                "id": int(w.id),
+                                "text": str(w.text),
+                            }
+                            if w.ea != _idaapi.BADADDR:
+                                entry["ea"] = hex(w.ea)
+                            warns.append(entry)
+                    except Exception:
+                        pass
+                    if warns:
+                        result["warnings"] = warns
         except Exception:
             pass
         return result

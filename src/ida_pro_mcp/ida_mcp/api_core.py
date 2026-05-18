@@ -122,6 +122,7 @@ class IdbSaveResult(TypedDict):
 
 class FindRegexResult(TypedDict, total=False):
     n: int
+    total: int            # total candidates before pagination
     matches: list[dict[str, Any]]
     cursor: dict[str, Any]
     error: str | None
@@ -866,34 +867,54 @@ def idb_save(
 @idasync
 def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
-    limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
+    limit: Annotated[int, "Max matches (default: 50, max: 500)"] = 50,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    search_strings: Annotated[bool, "Search string literals (default: true)"] = True,
+    search_names: Annotated[bool, "Search function and symbol names (default: true)"] = True,
 ) -> FindRegexResult:
-    """Search strings by case-insensitive regex with offset/limit pagination."""
+    """Search by case-insensitive regex across string literals and symbol names.
+
+    By default searches both the string table (literal char* data) and all named
+    symbols (functions, globals, labels). Use search_strings/search_names to narrow
+    the scope. For searching the disassembly listing or comments, use search_text.
+    """
     if limit <= 0:
-        limit = 30
+        limit = 50
     if limit > 500:
         limit = 500
 
-    matches = []
-    regex = re.compile(pattern, re.IGNORECASE)
-    strings = _get_strings_cache()
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"Invalid regex: {e}"}
 
-    skipped = 0
-    more = False
-    for ea, text in strings:
-        if regex.search(text):
-            if skipped < offset:
-                skipped += 1
-                continue
-            if len(matches) >= limit:
-                more = True
-                break
-            matches.append({"addr": hex(ea), "string": text})
+    # Collect all candidates in a single ordered pass, then paginate.
+    # Each entry: {"addr": hex, "text": str, "kind": "string"|"name"}
+    candidates: list[dict] = []
+
+    if search_strings:
+        for ea, text in _get_strings_cache():
+            if regex.search(text):
+                candidates.append({"addr": hex(ea), "text": text, "kind": "string"})
+
+    if search_names:
+        for name_ea, name in idautils.Names():
+            if name and regex.search(name):
+                candidates.append({"addr": hex(name_ea), "text": name, "kind": "name"})
+
+    # Stable sort: strings first, then names, preserving address order within each kind
+    candidates.sort(key=lambda c: (0 if c["kind"] == "string" else 1, int(c["addr"], 16)))
+
+    total = len(candidates)
+    page = candidates[offset: offset + limit]
+    more = (offset + limit) < total
+
+    matches = [{"addr": c["addr"], "string": c["text"], "kind": c["kind"]} for c in page]
 
     return {
         "n": len(matches),
         "matches": matches,
+        "total": total,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
 

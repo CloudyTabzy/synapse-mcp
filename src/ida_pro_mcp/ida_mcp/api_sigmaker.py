@@ -105,6 +105,8 @@ class XrefSigResult(TypedDict):
     addr: str | None
     signatures: list[dict] | None
     total_xrefs: NotRequired[int]
+    xrefs_sampled: NotRequired[int]
+    truncated: NotRequired[bool]
     error: NotRequired[str]
     error_type: NotRequired[str]
     hint: NotRequired[str]
@@ -307,17 +309,27 @@ def find_xref_signatures(
         int,
         "Maximum signature length in bytes (default: 250)",
     ] = 250,
+    max_xrefs: Annotated[
+        int,
+        "Maximum number of callers to sample when generating signatures (default: 50). "
+        "High-traffic functions (e.g. malloc, operator new) can have hundreds of callers; "
+        "this cap keeps the call fast. Callers are sorted by function size before sampling "
+        "so the most likely short-signature sites are tried first. Increase if truncated=true "
+        "and the returned signatures are longer than expected.",
+    ] = 50,
 ) -> list[XrefSigResult]:
     """Find signatures for code locations that reference an address. For each
     input address, finds all code cross-references TO it, generates a unique
     signature at each xref site, and returns the shortest ones. Ideal for
     creating signatures for data addresses, vtable entries, or string
-    references that can't be signatured directly."""
+    references that can't be signatured directly.
+
+    When a target has many callers the search is capped at max_xrefs to stay
+    fast. The result includes total_xrefs (all callers IDA knows), xrefs_sampled
+    (how many were tried), and truncated (true when the cap was hit)."""
     sm = _sm
     fmt = _resolve_format(format)
     cfg = _make_config(fmt, max_length=max_length)
-    import dataclasses
-    cfg = dataclasses.replace(cfg, print_top_x=top)
     finder = sm.XrefFinder()
     addrs_list = normalize_list_input(addrs)
 
@@ -326,10 +338,10 @@ def find_xref_signatures(
         ea = None
         try:
             ea = _resolve_addr(addr_str)
-            xref_result = finder.find_xrefs(ea, cfg)
+            xref_result = finder.find_xrefs(ea, cfg, max_xrefs=max_xrefs, top=top)
 
             sigs = []
-            for gs in xref_result.signatures[:top]:
+            for gs in xref_result.signatures:
                 sig_str = _format_sig(gs.signature, fmt)
                 sigs.append({
                     "xref_addr": hex(int(gs.address)) if gs.address else None,
@@ -337,12 +349,16 @@ def find_xref_signatures(
                     "length": len(gs.signature),
                 })
 
-            results.append({
+            entry: XrefSigResult = {
                 "query": addr_str,
                 "addr": hex(ea),
                 "signatures": sigs,
-                "total_xrefs": len(xref_result.signatures),
-            })
+                "total_xrefs": xref_result.total_xrefs,
+                "xrefs_sampled": xref_result.xrefs_sampled,
+            }
+            if xref_result.truncated:
+                entry["truncated"] = True
+            results.append(entry)
         except Exception as e:
             results.append({
                 "query": addr_str,

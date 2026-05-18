@@ -214,6 +214,7 @@ class TritonInitResult(TypedDict):
     ok: bool
     architecture: str
     version: str
+    already_initialized: NotRequired[bool]
     error: NotRequired[str]
 
 
@@ -369,17 +370,41 @@ def triton_init(
         "Architecture override: x86, x86_64, arm32, aarch64, rv32, rv64. "
         "Leave blank to auto-detect from the open IDA database.",
     ] = "",
+    skip_if_initialized: Annotated[
+        bool,
+        "When True, skip re-initialization if a context already exists and return "
+        "its current state. Useful at the top of analysis scripts that may be "
+        "called multiple times. Default False (always reinitialize).",
+    ] = False,
 ) -> TritonInitResult:
     """Initialise (or re-initialise) a Triton context for the current binary.
 
     Automatically detects architecture from IDA unless overridden.
     Re-calling resets all symbolic state — use triton_snapshot_save first
     if you want to preserve the current context.
+
+    Pass ``skip_if_initialized=True`` for idempotent calls: if a context is
+    already active the tool returns immediately with ``already_initialized=true``
+    rather than wiping existing symbolic state.
     """
     if not TRITON_AVAILABLE:
         return {"ok": False, "architecture": "", "version": "", "error": "triton-library not installed"}
 
     try:
+        # Idempotent path: return current context info without reinitialising
+        if skip_if_initialized:
+            with _contexts_lock:
+                existing = _contexts.get(_CTX_KEY)
+            if existing is not None:
+                version = str(getattr(_triton_lib, "VERSION", "installed"))
+                arch_str = _arch_to_str(existing.getArchitecture())
+                return {
+                    "ok": True,
+                    "architecture": arch_str,
+                    "version": version,
+                    "already_initialized": True,
+                }
+
         if architecture:
             arch = _str_to_arch(architecture)
         else:

@@ -133,7 +133,8 @@ class TypeInspectResult(TypedDict, total=False):
     name: str
     exists: bool
     declaration: str
-    size: int
+    size: int | None      # None when type is forward-declared without definition
+    size_note: str        # present only when size is None
     is_func: bool
     is_ptr: bool
     is_enum: bool
@@ -171,6 +172,455 @@ class InferTypeResult(TypedDict, total=False):
     error_type: str
     hint: str
 
+
+
+def _find_lvar_by_name(cfunc: ida_hexrays.cfunc_t, name: str):
+    """Find a local variable by name (case-insensitive).
+
+    Returns ``(lvar, idx)`` so callers can use the canonical index
+    (``expr.v.idx``) without relying on the undocumented ``lvar.idx``.
+    """
+    for idx, lvar in enumerate(cfunc.get_lvars()):
+        if lvar.name and lvar.name.lower() == name.lower():
+            return lvar, idx
+    return None, None
+
+
+def _expr_is_target(expr, target_lvar_idx: int | None = None, target_ea: int | None = None) -> bool:
+    """Check if a ctree expression is the target variable/global."""
+    if expr is None:
+        return False
+    if target_lvar_idx is not None and expr.op == ida_hexrays.cot_var:
+        return expr.v.idx == target_lvar_idx
+    if target_ea is not None and expr.op == ida_hexrays.cot_obj:
+        return expr.obj_ea == target_ea
+    return False
+
+class _UsageCollector(ida_hexrays.ctree_visitor_t):
+    """Collect field accesses, call usages, and malloc origins for a target variable."""
+
+    def __init__(self, cfunc: ida_hexrays.cfunc_t, target_lvar_idx: int | None = None, target_ea: int | None = None):
+        super().__init__(ida_hexrays.CV_FAST)
+        self.cfunc = cfunc
+        self.target_lvar_idx = target_lvar_idx
+        self.target_ea = target_ea
+        self.field_accesses: list[dict] = []
+        self.call_usages: list[dict] = []
+        self.stored_in: list[dict] = []         # NEW: target stored INTO another struct's field
+        self.malloc_origin: dict | None = None
+        self.assignments: list[dict] = []
+        self._found_vars: set[int] = set()
+        self._seen_field_writes: set[tuple[str, int]] = set()  # (ea_hex, offset)
+        self._seen_stored_in: set[tuple[str, int]] = set()
+        if target_lvar_idx is not None:
+            self._found_vars.add(target_lvar_idx)
+        # Diagnostic counters — surfaced in `functions_analyzed[*].diag` so
+        # callers can tell *why* no field accesses were found (visitor never
+        # saw a memptr at all? saw one but rejected the base? rejected because
+        # of a cast we don't unwrap?). These are essential for debugging
+        # zero-field-access mysteries on real binaries.
+        self._diag: dict[str, int] = {
+            "asg_memptr_seen": 0,            # cot_asg with cot_memptr LHS encountered
+            "asg_memptr_base_mismatch": 0,   # ...but the base wasn't the target
+            "read_memptr_seen": 0,           # standalone cot_memptr / cot_memref reads
+            "read_memptr_base_mismatch": 0,
+            "read_ptr_seen": 0,              # cot_ptr / cot_idx reads
+            "read_ptr_base_mismatch": 0,
+            "read_ptr_decompose_failed": 0,  # cot_ptr that didn't decompose to (target, offset, size)
+            "stored_in_count": 0,            # target appeared as RHS of `other_struct.field = target`
+        }
+        # Up to 3 sample base expressions we rejected — helps identify
+        # unexpected wrapping (e.g. `cot_ref(cot_obj(...))`).
+        self._base_mismatch_samples: list[str] = []
+
+    def _is_target_expr(self, expr) -> bool:
+        return _expr_is_target(expr, self.target_lvar_idx, self.target_ea)
+
+    def _track_var_assignment(self, lhs, rhs):
+        """Track assignments: if rhs resolves to the target (or to another
+        tracked alias), the lhs local is added to ``_found_vars`` so later
+        accesses through it are attributed correctly. Casts are stripped on
+        both sides because Hex-Rays inserts ``(T*)`` wrappers liberally."""
+        if lhs is None or rhs is None:
+            return
+        if lhs.op != ida_hexrays.cot_var:
+            return
+        rhs_unwrapped = _unwrap_casts(rhs)
+        if rhs_unwrapped is None:
+            return
+        # Direct target → alias
+        if self._is_target_expr(rhs_unwrapped):
+            self._found_vars.add(lhs.v.idx)
+            return
+        # Alias chain: v_new = v_known
+        if rhs_unwrapped.op == ida_hexrays.cot_var and rhs_unwrapped.v.idx in self._found_vars:
+            self._found_vars.add(lhs.v.idx)
+
+    def _record_field_access(self, expr, is_write: bool):
+        """Record a memptr/memref access on the target."""
+        try:
+            offset_bytes = expr.m // 8
+            access_size = getattr(expr, "ptrsize", 8)
+            if access_size == 0:
+                access_size = 8
+            ea_hex = hex(expr.ea)
+            # Deduplicate writes to avoid double-counting (cot_asg + cot_memptr)
+            if is_write:
+                self._seen_field_writes.add((ea_hex, offset_bytes))
+            else:
+                if (ea_hex, offset_bytes) in self._seen_field_writes:
+                    return  # skip read that was already recorded as write
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.field_accesses.append({
+                "offset": offset_bytes,
+                "access_size": access_size,
+                "is_write": is_write,
+                "ea": ea_hex,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "disasm": _get_expr_text(expr, self.cfunc),
+            })
+        except Exception as e:
+            logger.debug("_record_field_access failed: %s", e)
+
+    def _record_raw_field_access(self, expr, offset_bytes: int, access_size: int, is_write: bool):
+        """Record a field access detected via raw pointer arithmetic.
+
+        Distinct from ``_record_field_access`` (which handles ``cot_memptr``/
+        ``cot_memref`` nodes from already-typed struct pointers) — this handles
+        the ``*(T*)(ptr+N)`` shape Hex-Rays emits for *untyped* struct pointers,
+        which is exactly what ``type_propagate`` is trying to identify.
+        """
+        try:
+            if offset_bytes < 0:
+                # Sign-extended negative offset — skip; struct fields don't
+                # live at negative offsets, and this is usually base-pointer
+                # arithmetic the caller doesn't want surfaced as a field.
+                return
+            ea_hex = hex(expr.ea)
+            if is_write:
+                self._seen_field_writes.add((ea_hex, offset_bytes))
+            else:
+                if (ea_hex, offset_bytes) in self._seen_field_writes:
+                    return
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.field_accesses.append({
+                "offset": offset_bytes,
+                "access_size": access_size,
+                "is_write": is_write,
+                "ea": ea_hex,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "disasm": f"*(uint{access_size*8}_t*)(target+0x{offset_bytes:X})",
+            })
+        except Exception as e:
+            logger.debug("_record_raw_field_access failed: %s", e)
+
+    def _record_stored_in(self, lhs_memptr):
+        """Record that target appeared as the RHS of an assignment whose LHS
+        is a struct-field access. Distinguishes "target is stored at offset N
+        of another struct" from "target is a struct with a field at offset N".
+
+        This is the inverse direction of ``_record_field_access`` and is
+        critical for analyzing value-type globals (``char*``, ``int``, etc.)
+        that are *held by* other structs rather than being struct bases
+        themselves.
+        """
+        try:
+            offset_bytes = lhs_memptr.m // 8
+            access_size = getattr(lhs_memptr, "ptrsize", 8) or 8
+            ea_hex = hex(lhs_memptr.ea)
+            key = (ea_hex, offset_bytes)
+            if key in self._seen_stored_in:
+                return
+            self._seen_stored_in.add(key)
+            container_expr = _get_expr_text(lhs_memptr.x, self.cfunc)
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.stored_in.append({
+                "offset": offset_bytes,
+                "access_size": access_size,
+                "ea": ea_hex,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "container_expr": container_expr,
+            })
+            self._diag["stored_in_count"] += 1
+        except Exception as e:
+            logger.debug("_record_stored_in failed: %s", e)
+
+    def _is_tracked_base(self, base) -> bool:
+        """Whether ``base`` resolves to the propagation target.
+
+        A base is "tracked" if it is the target global/lvar directly, or if it
+        is a local variable that has been assigned from the target (a derived
+        alias collected in ``_found_vars``). Casts are stripped before checks.
+        """
+        base = _unwrap_casts(base)
+        if base is None:
+            return False
+        if self._is_target_expr(base):
+            return True
+        if base.op == ida_hexrays.cot_var and base.v.idx in self._found_vars:
+            return True
+        return False
+
+    def _record_base_mismatch_sample(self, base) -> None:
+        """Save up to 3 string samples of bases we rejected for diagnostics.
+
+        Helps distinguish "ctree shape we don't recognize" (unexpected node
+        op like ``cot_ref``) from "wrong target_ea" (cot_obj with non-matching
+        obj_ea) from "untracked local" (cot_var not in _found_vars).
+        """
+        if len(self._base_mismatch_samples) >= 3:
+            return
+        try:
+            unwrapped = _unwrap_casts(base)
+            if unwrapped is None:
+                self._base_mismatch_samples.append("None")
+                return
+            op_name = f"op={unwrapped.op}"
+            if unwrapped.op == ida_hexrays.cot_var:
+                detail = f"var.idx={unwrapped.v.idx}"
+            elif unwrapped.op == ida_hexrays.cot_obj:
+                detail = f"obj_ea={hex(unwrapped.obj_ea)}"
+            else:
+                detail = _get_expr_text(unwrapped, self.cfunc)
+            self._base_mismatch_samples.append(f"{op_name} {detail}")
+        except Exception:
+            self._base_mismatch_samples.append("<exception extracting sample>")
+
+    def _record_call_usage(self, call_expr, arg_index: int):
+        """Record that target is passed as argument to a call."""
+        try:
+            callee = call_expr.x
+            if callee is None:
+                return
+            callee_ea = callee.obj_ea if callee.op == ida_hexrays.cot_obj else idaapi.BADADDR
+            callee_name = ida_name.get_func_name(callee_ea) or ida_name.get_name(callee_ea) or ""
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.call_usages.append({
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "call_ea": hex(call_expr.ea),
+                "arg_index": arg_index,
+                "callee_name": callee_name,
+            })
+        except Exception as e:
+            logger.debug("_record_call_usage failed: %s", e)
+
+    def _check_malloc_origin(self, rhs):
+        """Check if rhs is a malloc-like call."""
+        if rhs.op != ida_hexrays.cot_call:
+            return False
+        callee = rhs.x
+        if callee.op != ida_hexrays.cot_obj:
+            return False
+        callee_name = ida_name.get_func_name(callee.obj_ea) or ""
+        if any(m in callee_name for m in _MALLOC_LIKE):
+            self.malloc_origin = {
+                "ea": hex(rhs.ea),
+                "func_ea": hex(self.cfunc.entry_ea),
+                "func_name": ida_funcs.get_func_name(self.cfunc.entry_ea) or "",
+                "allocator": callee_name,
+            }
+            return True
+        return False
+
+    def visit_expr(self, expr):
+        try:
+            # --- Assignment tracking ---
+            if expr.op == ida_hexrays.cot_asg:
+                lhs, rhs = expr.x, expr.y
+                self._track_var_assignment(lhs, rhs)
+                # Field write: target->field = value
+                #
+                # Modern Hex-Rays normalizes ``*(T*)(ptr + N) = value`` into
+                # ``cot_asg(cot_memptr(ptr, m=N*8), value)`` regardless of
+                # whether ``ptr`` has an applied struct type — the
+                # memory-dereference *is* the LHS, never a ``cot_ptr``. So we
+                # don't need a separate ``cot_ptr``/``cot_idx`` write branch
+                # here; the read-side handler below catches those shapes when
+                # they appear in rvalue contexts.
+                if lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                    self._diag["asg_memptr_seen"] += 1
+                    if self._is_tracked_base(lhs.x):
+                        self._record_field_access(lhs, is_write=True)
+                    else:
+                        self._diag["asg_memptr_base_mismatch"] += 1
+                        self._record_base_mismatch_sample(lhs.x)
+                        # Stored-in: if the RHS is the target, the LHS struct
+                        # has the target as a field VALUE — record where.
+                        # Only meaningful when the LHS base wasn't the target
+                        # itself, otherwise it's just a self-field write.
+                        rhs_uw = _unwrap_casts(rhs)
+                        if rhs_uw is not None and self._is_target_expr(rhs_uw):
+                            self._record_stored_in(lhs)
+                # Malloc origin: var = malloc(...)
+                if self._is_target_expr(lhs) or (lhs.op == ida_hexrays.cot_var and lhs.v.idx in self._found_vars):
+                    self._check_malloc_origin(rhs)
+
+            # --- Field reads (already-typed struct ptr) ---
+            if expr.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                self._diag["read_memptr_seen"] += 1
+                if self._is_tracked_base(expr.x):
+                    self._record_field_access(expr, is_write=False)
+                else:
+                    self._diag["read_memptr_base_mismatch"] += 1
+                    self._record_base_mismatch_sample(expr.x)
+
+            # --- Field reads (raw pointer arithmetic on untyped ptr) ---
+            # When Hex-Rays does *not* fold the access into a ``cot_memptr``
+            # (typically because the cast type is one-off or the base is a
+            # local), the rvalue appears as ``cot_ptr(cot_cast(cot_add(...)))``.
+            elif expr.op in (ida_hexrays.cot_ptr, ida_hexrays.cot_idx):
+                self._diag["read_ptr_seen"] += 1
+                decomp = _decompose_ptr_access(expr)
+                if decomp is None:
+                    self._diag["read_ptr_decompose_failed"] += 1
+                else:
+                    target_expr, offset, access_size = decomp
+                    if self._is_tracked_base(target_expr):
+                        self._record_raw_field_access(expr, offset, access_size, is_write=False)
+                    else:
+                        self._diag["read_ptr_base_mismatch"] += 1
+                        self._record_base_mismatch_sample(target_expr)
+
+            # --- Call arguments ---
+            if expr.op == ida_hexrays.cot_call:
+                args = expr.a
+                if args:
+                    for idx, arg in enumerate(args):
+                        arg_unwrapped = _unwrap_casts(arg)
+                        if arg_unwrapped is not None and (
+                            self._is_target_expr(arg_unwrapped)
+                            or (arg_unwrapped.op == ida_hexrays.cot_var
+                                and arg_unwrapped.v.idx in self._found_vars)
+                        ):
+                            self._record_call_usage(expr, idx)
+
+        except Exception as e:
+            logger.debug("_UsageCollector.visit_expr failed: %s", e)
+        return 0
+
+
+
+
+
+class FieldAccess(TypedDict, total=False):
+    offset: int
+    access_size: int
+    is_write: bool
+    ea: str
+    func_ea: str
+    func_name: str
+    disasm: str
+
+
+class CallUsage(TypedDict, total=False):
+    func_ea: str
+    func_name: str
+    call_ea: str
+    arg_index: int
+    callee_name: str
+
+
+class StoredIn(TypedDict, total=False):
+    """Records target being *stored into* another struct's field.
+
+    Distinct from ``FieldAccess`` (which records target's *own* fields being
+    accessed). This is the "the target is a value held by something else" case
+    — e.g. ``some_struct->member = target`` makes target the rvalue, not the
+    base. Crucial for analyzing char*/value-type globals like ``String1``.
+    """
+    offset: int                # offset within the containing struct
+    access_size: int           # size of the slot the target occupies
+    ea: str
+    func_ea: str
+    func_name: str
+    container_expr: str        # text of the base expression (e.g. "v8")
+
+
+class PropagationStep(TypedDict, total=False):
+    ea: str
+    func_ea: str
+    func_name: str
+    kind: str
+    detail: str
+
+
+class FieldProfileEntry(TypedDict, total=False):
+    reads: int
+    writes: int
+    max_size: int
+    min_size: int
+    function_count: int        # how many distinct functions accessed this offset
+
+
+class ConfidenceFactor(TypedDict, total=False):
+    kind: str                  # "api_match" | "field_accesses" | "malloc_origin" | "no_evidence"
+    detail: str
+    contribution: float
+
+
+class TypePropagateResult(TypedDict, total=False):
+    ok: bool
+    address: str
+    inferred_type: str
+    confidence: float
+    field_accesses: list[FieldAccess]
+    field_profile: dict[str, FieldProfileEntry]    # offset (hex) -> stats
+    call_usages: list[CallUsage]
+    stored_in: list[StoredIn]
+    propagation_path: list[PropagationStep]
+    functions_analyzed: list[dict]
+    suggested_struct_name: str | None
+    suggested_struct_definition: str | None
+    applied: bool
+    confidence_breakdown: list[ConfidenceFactor]
+    error: str
+    error_type: str
+    hint: str
+
+
+# Known API signatures for type inference from call arguments
+_KNOWN_API_TYPES: dict[str, str] = {
+    "strlen": "char*",
+    "strcmp": "char*",
+    "strncmp": "char*",
+    "strcpy": "char*",
+    "strncpy": "char*",
+    "strdup": "char*",
+    "memcpy": "void*",
+    "memmove": "void*",
+    "memset": "void*",
+    "memcmp": "void*",
+    "malloc": "void*",
+    "calloc": "void*",
+    "realloc": "void*",
+    "free": "void*",
+    "fopen": "FILE*",
+    "fclose": "FILE*",
+    "fread": "FILE*",
+    "fwrite": "FILE*",
+    "fprintf": "FILE*",
+    "sprintf": "char*",
+    "snprintf": "char*",
+    "printf": "const char*",
+    "puts": "const char*",
+    "atoi": "const char*",
+    "atol": "const char*",
+    "atof": "const char*",
+    "strtol": "char*",
+    "strtoul": "char*",
+    "strtod": "char*",
+    "sscanf": "const char*",
+    "qsort": "void*",
+    "bsearch": "void*",
+}
 
 # ============================================================================
 # Type Declaration
@@ -766,11 +1216,17 @@ def type_inspect(
                 )
                 continue
 
+            raw_size = tif.get_size()
+            # get_size() returns BADSIZE (0xFFFFFFFFFFFFFFFF) when the type's
+            # layout hasn't been resolved yet.  Expose None so callers can
+            # distinguish "size unknown" from "size zero".
+            resolved_size: int | None = None if raw_size == 0xFFFFFFFFFFFFFFFF else raw_size
+
             info = {
                 "name": name,
                 "exists": True,
                 "declaration": str(tif),
-                "size": tif.get_size(),
+                "size": resolved_size,
                 "is_func": tif.is_func(),
                 "is_ptr": tif.is_ptr(),
                 "is_enum": tif.is_enum(),
@@ -778,6 +1234,8 @@ def type_inspect(
                 "members": None,
                 "member_count": 0,
             }
+            if resolved_size is None:
+                info["size_note"] = "size unknown — type declared but not fully defined in this IDB"
 
             if include_members and tif.is_udt():
                 udt = ida_typeinf.udt_type_data_t()
@@ -787,11 +1245,12 @@ def type_inspect(
                     for idx, member in enumerate(udt):
                         if idx >= max_members:
                             break
+                        raw_member_size = member.type.get_size()
                         members.append(
                             {
                                 "name": member.name,
                                 "offset": hex(member.begin() // 8),
-                                "size": member.type.get_size(),
+                                "size": None if raw_member_size == 0xFFFFFFFFFFFFFFFF else raw_member_size,
                                 "type": member.type._print(),
                             }
                         )
@@ -1149,127 +1608,6 @@ def infer_types(
     return results
 
 
-# ============================================================================
-# Type Propagation — Phase 4.2
-# ============================================================================
-
-
-class FieldAccess(TypedDict, total=False):
-    offset: int
-    access_size: int
-    is_write: bool
-    ea: str
-    func_ea: str
-    func_name: str
-    disasm: str
-
-
-class CallUsage(TypedDict, total=False):
-    func_ea: str
-    func_name: str
-    call_ea: str
-    arg_index: int
-    callee_name: str
-
-
-class StoredIn(TypedDict, total=False):
-    """Records target being *stored into* another struct's field.
-
-    Distinct from ``FieldAccess`` (which records target's *own* fields being
-    accessed). This is the "the target is a value held by something else" case
-    — e.g. ``some_struct->member = target`` makes target the rvalue, not the
-    base. Crucial for analyzing char*/value-type globals like ``String1``.
-    """
-    offset: int                # offset within the containing struct
-    access_size: int           # size of the slot the target occupies
-    ea: str
-    func_ea: str
-    func_name: str
-    container_expr: str        # text of the base expression (e.g. "v8")
-
-
-class PropagationStep(TypedDict, total=False):
-    ea: str
-    func_ea: str
-    func_name: str
-    kind: str
-    detail: str
-
-
-class FieldProfileEntry(TypedDict, total=False):
-    reads: int
-    writes: int
-    max_size: int
-    min_size: int
-    function_count: int        # how many distinct functions accessed this offset
-
-
-class ConfidenceFactor(TypedDict, total=False):
-    kind: str                  # "api_match" | "field_accesses" | "malloc_origin" | "no_evidence"
-    detail: str
-    contribution: float
-
-
-class TypePropagateResult(TypedDict, total=False):
-    ok: bool
-    address: str
-    inferred_type: str
-    confidence: float
-    field_accesses: list[FieldAccess]
-    field_profile: dict[str, FieldProfileEntry]    # offset (hex) -> stats
-    call_usages: list[CallUsage]
-    stored_in: list[StoredIn]
-    propagation_path: list[PropagationStep]
-    functions_analyzed: list[dict]
-    suggested_struct_name: str | None
-    suggested_struct_definition: str | None
-    applied: bool
-    confidence_breakdown: list[ConfidenceFactor]
-    error: str
-    error_type: str
-    hint: str
-
-
-# Known API signatures for type inference from call arguments
-_KNOWN_API_TYPES: dict[str, str] = {
-    "strlen": "char*",
-    "strcmp": "char*",
-    "strncmp": "char*",
-    "strcpy": "char*",
-    "strncpy": "char*",
-    "strdup": "char*",
-    "memcpy": "void*",
-    "memmove": "void*",
-    "memset": "void*",
-    "memcmp": "void*",
-    "malloc": "void*",
-    "calloc": "void*",
-    "realloc": "void*",
-    "free": "void*",
-    "fopen": "FILE*",
-    "fclose": "FILE*",
-    "fread": "FILE*",
-    "fwrite": "FILE*",
-    "fprintf": "FILE*",
-    "sprintf": "char*",
-    "snprintf": "char*",
-    "printf": "const char*",
-    "puts": "const char*",
-    "atoi": "const char*",
-    "atol": "const char*",
-    "atof": "const char*",
-    "strtol": "char*",
-    "strtoul": "char*",
-    "strtod": "char*",
-    "sscanf": "const char*",
-    "qsort": "void*",
-    "bsearch": "void*",
-}
-
-
-_MALLOC_LIKE: set[str] = {"malloc", "calloc", "realloc"}
-
-
 def _decompile_func(func_ea: int) -> ida_hexrays.cfunc_t | None:
     """Decompile a function; return None on failure."""
     try:
@@ -1281,29 +1619,6 @@ def _decompile_func(func_ea: int) -> ida_hexrays.cfunc_t | None:
     except Exception as e:
         logger.debug("decompile 0x%x exception: %s", func_ea, e)
     return None
-
-
-def _find_lvar_by_name(cfunc: ida_hexrays.cfunc_t, name: str):
-    """Find a local variable by name (case-insensitive).
-
-    Returns ``(lvar, idx)`` so callers can use the canonical index
-    (``expr.v.idx``) without relying on the undocumented ``lvar.idx``.
-    """
-    for idx, lvar in enumerate(cfunc.get_lvars()):
-        if lvar.name and lvar.name.lower() == name.lower():
-            return lvar, idx
-    return None, None
-
-
-def _expr_is_target(expr, target_lvar_idx: int | None = None, target_ea: int | None = None) -> bool:
-    """Check if a ctree expression is the target variable/global."""
-    if expr is None:
-        return False
-    if target_lvar_idx is not None and expr.op == ida_hexrays.cot_var:
-        return expr.v.idx == target_lvar_idx
-    if target_ea is not None and expr.op == ida_hexrays.cot_obj:
-        return expr.obj_ea == target_ea
-    return False
 
 
 def _get_expr_text(expr, cfunc) -> str:
@@ -1363,8 +1678,8 @@ def _decompose_ptr_access(expr) -> tuple | None:
     """Decompose a raw-pointer-arithmetic dereference into ``(target_expr, offset_bytes, access_size)``.
 
     Handles these untyped-pointer field-access patterns Hex-Rays emits when a
-    pointer has no struct type applied yet — the exact patterns ``type_propagate``
-    is supposed to *recognize* in order to infer that struct type:
+    pointer has no struct type applied yet — patterns the constructor visitor
+    recognises in order to record field writes:
 
     - ``*(T*)(ptr + N)`` → ``cot_ptr(cot_cast(cot_add(ptr, N)))``  (most common)
     - ``*(T*)ptr``       → ``cot_ptr(cot_cast(ptr))``               (offset = 0)
@@ -1410,335 +1725,6 @@ def _decompose_ptr_access(expr) -> tuple | None:
 
     # *(T*)ptr — plain dereference (offset = 0)
     return (inner, 0, access_size)
-
-
-class _UsageCollector(ida_hexrays.ctree_visitor_t):
-    """Collect field accesses, call usages, and malloc origins for a target variable."""
-
-    def __init__(self, cfunc: ida_hexrays.cfunc_t, target_lvar_idx: int | None = None, target_ea: int | None = None):
-        super().__init__(ida_hexrays.CV_FAST)
-        self.cfunc = cfunc
-        self.target_lvar_idx = target_lvar_idx
-        self.target_ea = target_ea
-        self.field_accesses: list[dict] = []
-        self.call_usages: list[dict] = []
-        self.stored_in: list[dict] = []         # NEW: target stored INTO another struct's field
-        self.malloc_origin: dict | None = None
-        self.assignments: list[dict] = []
-        self._found_vars: set[int] = set()
-        self._seen_field_writes: set[tuple[str, int]] = set()  # (ea_hex, offset)
-        self._seen_stored_in: set[tuple[str, int]] = set()
-        if target_lvar_idx is not None:
-            self._found_vars.add(target_lvar_idx)
-        # Diagnostic counters — surfaced in `functions_analyzed[*].diag` so
-        # callers can tell *why* no field accesses were found (visitor never
-        # saw a memptr at all? saw one but rejected the base? rejected because
-        # of a cast we don't unwrap?). These are essential for debugging
-        # zero-field-access mysteries on real binaries.
-        self._diag: dict[str, int] = {
-            "asg_memptr_seen": 0,            # cot_asg with cot_memptr LHS encountered
-            "asg_memptr_base_mismatch": 0,   # ...but the base wasn't the target
-            "read_memptr_seen": 0,           # standalone cot_memptr / cot_memref reads
-            "read_memptr_base_mismatch": 0,
-            "read_ptr_seen": 0,              # cot_ptr / cot_idx reads
-            "read_ptr_base_mismatch": 0,
-            "read_ptr_decompose_failed": 0,  # cot_ptr that didn't decompose to (target, offset, size)
-            "stored_in_count": 0,            # target appeared as RHS of `other_struct.field = target`
-        }
-        # Up to 3 sample base expressions we rejected — helps identify
-        # unexpected wrapping (e.g. `cot_ref(cot_obj(...))`).
-        self._base_mismatch_samples: list[str] = []
-
-    def _is_target_expr(self, expr) -> bool:
-        return _expr_is_target(expr, self.target_lvar_idx, self.target_ea)
-
-    def _track_var_assignment(self, lhs, rhs):
-        """Track assignments: if rhs resolves to the target (or to another
-        tracked alias), the lhs local is added to ``_found_vars`` so later
-        accesses through it are attributed correctly. Casts are stripped on
-        both sides because Hex-Rays inserts ``(T*)`` wrappers liberally."""
-        if lhs is None or rhs is None:
-            return
-        if lhs.op != ida_hexrays.cot_var:
-            return
-        rhs_unwrapped = _unwrap_casts(rhs)
-        if rhs_unwrapped is None:
-            return
-        # Direct target → alias
-        if self._is_target_expr(rhs_unwrapped):
-            self._found_vars.add(lhs.v.idx)
-            return
-        # Alias chain: v_new = v_known
-        if rhs_unwrapped.op == ida_hexrays.cot_var and rhs_unwrapped.v.idx in self._found_vars:
-            self._found_vars.add(lhs.v.idx)
-
-    def _record_field_access(self, expr, is_write: bool):
-        """Record a memptr/memref access on the target."""
-        try:
-            offset_bytes = expr.m // 8
-            access_size = getattr(expr, "ptrsize", 8)
-            if access_size == 0:
-                access_size = 8
-            ea_hex = hex(expr.ea)
-            # Deduplicate writes to avoid double-counting (cot_asg + cot_memptr)
-            if is_write:
-                self._seen_field_writes.add((ea_hex, offset_bytes))
-            else:
-                if (ea_hex, offset_bytes) in self._seen_field_writes:
-                    return  # skip read that was already recorded as write
-            func_ea = self.cfunc.entry_ea
-            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
-            self.field_accesses.append({
-                "offset": offset_bytes,
-                "access_size": access_size,
-                "is_write": is_write,
-                "ea": ea_hex,
-                "func_ea": hex(func_ea),
-                "func_name": func_name,
-                "disasm": _get_expr_text(expr, self.cfunc),
-            })
-        except Exception as e:
-            logger.debug("_record_field_access failed: %s", e)
-
-    def _record_raw_field_access(self, expr, offset_bytes: int, access_size: int, is_write: bool):
-        """Record a field access detected via raw pointer arithmetic.
-
-        Distinct from ``_record_field_access`` (which handles ``cot_memptr``/
-        ``cot_memref`` nodes from already-typed struct pointers) — this handles
-        the ``*(T*)(ptr+N)`` shape Hex-Rays emits for *untyped* struct pointers,
-        which is exactly what ``type_propagate`` is trying to identify.
-        """
-        try:
-            if offset_bytes < 0:
-                # Sign-extended negative offset — skip; struct fields don't
-                # live at negative offsets, and this is usually base-pointer
-                # arithmetic the caller doesn't want surfaced as a field.
-                return
-            ea_hex = hex(expr.ea)
-            if is_write:
-                self._seen_field_writes.add((ea_hex, offset_bytes))
-            else:
-                if (ea_hex, offset_bytes) in self._seen_field_writes:
-                    return
-            func_ea = self.cfunc.entry_ea
-            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
-            self.field_accesses.append({
-                "offset": offset_bytes,
-                "access_size": access_size,
-                "is_write": is_write,
-                "ea": ea_hex,
-                "func_ea": hex(func_ea),
-                "func_name": func_name,
-                "disasm": f"*(uint{access_size*8}_t*)(target+0x{offset_bytes:X})",
-            })
-        except Exception as e:
-            logger.debug("_record_raw_field_access failed: %s", e)
-
-    def _record_stored_in(self, lhs_memptr):
-        """Record that target appeared as the RHS of an assignment whose LHS
-        is a struct-field access. Distinguishes "target is stored at offset N
-        of another struct" from "target is a struct with a field at offset N".
-
-        This is the inverse direction of ``_record_field_access`` and is
-        critical for analyzing value-type globals (``char*``, ``int``, etc.)
-        that are *held by* other structs rather than being struct bases
-        themselves.
-        """
-        try:
-            offset_bytes = lhs_memptr.m // 8
-            access_size = getattr(lhs_memptr, "ptrsize", 8) or 8
-            ea_hex = hex(lhs_memptr.ea)
-            key = (ea_hex, offset_bytes)
-            if key in self._seen_stored_in:
-                return
-            self._seen_stored_in.add(key)
-            container_expr = _get_expr_text(lhs_memptr.x, self.cfunc)
-            func_ea = self.cfunc.entry_ea
-            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
-            self.stored_in.append({
-                "offset": offset_bytes,
-                "access_size": access_size,
-                "ea": ea_hex,
-                "func_ea": hex(func_ea),
-                "func_name": func_name,
-                "container_expr": container_expr,
-            })
-            self._diag["stored_in_count"] += 1
-        except Exception as e:
-            logger.debug("_record_stored_in failed: %s", e)
-
-    def _is_tracked_base(self, base) -> bool:
-        """Whether ``base`` resolves to the propagation target.
-
-        A base is "tracked" if it is the target global/lvar directly, or if it
-        is a local variable that has been assigned from the target (a derived
-        alias collected in ``_found_vars``). Casts are stripped before checks.
-        """
-        base = _unwrap_casts(base)
-        if base is None:
-            return False
-        if self._is_target_expr(base):
-            return True
-        if base.op == ida_hexrays.cot_var and base.v.idx in self._found_vars:
-            return True
-        return False
-
-    def _record_base_mismatch_sample(self, base) -> None:
-        """Save up to 3 string samples of bases we rejected for diagnostics.
-
-        Helps distinguish "ctree shape we don't recognize" (unexpected node
-        op like ``cot_ref``) from "wrong target_ea" (cot_obj with non-matching
-        obj_ea) from "untracked local" (cot_var not in _found_vars).
-        """
-        if len(self._base_mismatch_samples) >= 3:
-            return
-        try:
-            unwrapped = _unwrap_casts(base)
-            if unwrapped is None:
-                self._base_mismatch_samples.append("None")
-                return
-            op_name = f"op={unwrapped.op}"
-            if unwrapped.op == ida_hexrays.cot_var:
-                detail = f"var.idx={unwrapped.v.idx}"
-            elif unwrapped.op == ida_hexrays.cot_obj:
-                detail = f"obj_ea={hex(unwrapped.obj_ea)}"
-            else:
-                detail = _get_expr_text(unwrapped, self.cfunc)
-            self._base_mismatch_samples.append(f"{op_name} {detail}")
-        except Exception:
-            self._base_mismatch_samples.append("<exception extracting sample>")
-
-    def _record_call_usage(self, call_expr, arg_index: int):
-        """Record that target is passed as argument to a call."""
-        try:
-            callee = call_expr.x
-            if callee is None:
-                return
-            callee_ea = callee.obj_ea if callee.op == ida_hexrays.cot_obj else idaapi.BADADDR
-            callee_name = ida_name.get_func_name(callee_ea) or ida_name.get_name(callee_ea) or ""
-            func_ea = self.cfunc.entry_ea
-            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
-            self.call_usages.append({
-                "func_ea": hex(func_ea),
-                "func_name": func_name,
-                "call_ea": hex(call_expr.ea),
-                "arg_index": arg_index,
-                "callee_name": callee_name,
-            })
-        except Exception as e:
-            logger.debug("_record_call_usage failed: %s", e)
-
-    def _check_malloc_origin(self, rhs):
-        """Check if rhs is a malloc-like call."""
-        if rhs.op != ida_hexrays.cot_call:
-            return False
-        callee = rhs.x
-        if callee.op != ida_hexrays.cot_obj:
-            return False
-        callee_name = ida_name.get_func_name(callee.obj_ea) or ""
-        if any(m in callee_name for m in _MALLOC_LIKE):
-            self.malloc_origin = {
-                "ea": hex(rhs.ea),
-                "func_ea": hex(self.cfunc.entry_ea),
-                "func_name": ida_funcs.get_func_name(self.cfunc.entry_ea) or "",
-                "allocator": callee_name,
-            }
-            return True
-        return False
-
-    def visit_expr(self, expr):
-        try:
-            # --- Assignment tracking ---
-            if expr.op == ida_hexrays.cot_asg:
-                lhs, rhs = expr.x, expr.y
-                self._track_var_assignment(lhs, rhs)
-                # Field write: target->field = value
-                #
-                # Modern Hex-Rays normalizes ``*(T*)(ptr + N) = value`` into
-                # ``cot_asg(cot_memptr(ptr, m=N*8), value)`` regardless of
-                # whether ``ptr`` has an applied struct type — the
-                # memory-dereference *is* the LHS, never a ``cot_ptr``. So we
-                # don't need a separate ``cot_ptr``/``cot_idx`` write branch
-                # here; the read-side handler below catches those shapes when
-                # they appear in rvalue contexts.
-                if lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
-                    self._diag["asg_memptr_seen"] += 1
-                    if self._is_tracked_base(lhs.x):
-                        self._record_field_access(lhs, is_write=True)
-                    else:
-                        self._diag["asg_memptr_base_mismatch"] += 1
-                        self._record_base_mismatch_sample(lhs.x)
-                        # Stored-in: if the RHS is the target, the LHS struct
-                        # has the target as a field VALUE — record where.
-                        # Only meaningful when the LHS base wasn't the target
-                        # itself, otherwise it's just a self-field write.
-                        rhs_uw = _unwrap_casts(rhs)
-                        if rhs_uw is not None and self._is_target_expr(rhs_uw):
-                            self._record_stored_in(lhs)
-                # Malloc origin: var = malloc(...)
-                if self._is_target_expr(lhs) or (lhs.op == ida_hexrays.cot_var and lhs.v.idx in self._found_vars):
-                    self._check_malloc_origin(rhs)
-
-            # --- Field reads (already-typed struct ptr) ---
-            if expr.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
-                self._diag["read_memptr_seen"] += 1
-                if self._is_tracked_base(expr.x):
-                    self._record_field_access(expr, is_write=False)
-                else:
-                    self._diag["read_memptr_base_mismatch"] += 1
-                    self._record_base_mismatch_sample(expr.x)
-
-            # --- Field reads (raw pointer arithmetic on untyped ptr) ---
-            # When Hex-Rays does *not* fold the access into a ``cot_memptr``
-            # (typically because the cast type is one-off or the base is a
-            # local), the rvalue appears as ``cot_ptr(cot_cast(cot_add(...)))``.
-            elif expr.op in (ida_hexrays.cot_ptr, ida_hexrays.cot_idx):
-                self._diag["read_ptr_seen"] += 1
-                decomp = _decompose_ptr_access(expr)
-                if decomp is None:
-                    self._diag["read_ptr_decompose_failed"] += 1
-                else:
-                    target_expr, offset, access_size = decomp
-                    if self._is_tracked_base(target_expr):
-                        self._record_raw_field_access(expr, offset, access_size, is_write=False)
-                    else:
-                        self._diag["read_ptr_base_mismatch"] += 1
-                        self._record_base_mismatch_sample(target_expr)
-
-            # --- Call arguments ---
-            if expr.op == ida_hexrays.cot_call:
-                args = expr.a
-                if args:
-                    for idx, arg in enumerate(args):
-                        arg_unwrapped = _unwrap_casts(arg)
-                        if arg_unwrapped is not None and (
-                            self._is_target_expr(arg_unwrapped)
-                            or (arg_unwrapped.op == ida_hexrays.cot_var
-                                and arg_unwrapped.v.idx in self._found_vars)
-                        ):
-                            self._record_call_usage(expr, idx)
-
-        except Exception as e:
-            logger.debug("_UsageCollector.visit_expr failed: %s", e)
-        return 0
-
-
-def _resolve_target(address: str) -> tuple[int | None, str | None, str | None]:
-    """Parse address string. Returns (func_ea, var_name, error)."""
-    if "::" in address:
-        parts = address.rsplit("::", 1)
-        func_spec = parts[0].strip()
-        var_name = parts[1].strip()
-        if not var_name:
-            return None, None, "Variable name must not be empty after '::'"
-        try:
-            func_ea = parse_address(func_spec)
-        except Exception:
-            func_ea = ida_name.get_name_ea(idaapi.BADADDR, func_spec)
-            if func_ea == idaapi.BADADDR:
-                return None, None, f"Function '{func_spec}' not found"
-        return func_ea, var_name, None
-    return None, None, None
 
 
 def _guess_field_type(access_size: int) -> str:
@@ -1796,6 +1782,30 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
     except Exception as e:
         logger.debug("_build_struct_type failed: %s", e)
         return None
+
+
+
+
+# ============================================================================
+# Constructor Analysis — Phase 4.4
+# ============================================================================
+
+def _resolve_target(address: str) -> tuple[int | None, str | None, str | None]:
+    """Parse address string. Returns (func_ea, var_name, error)."""
+    if "::" in address:
+        parts = address.rsplit("::", 1)
+        func_spec = parts[0].strip()
+        var_name = parts[1].strip()
+        if not var_name:
+            return None, None, "Variable name must not be empty after '::'"
+        try:
+            func_ea = parse_address(func_spec)
+        except Exception:
+            func_ea = ida_name.get_name_ea(idaapi.BADADDR, func_spec)
+            if func_ea == idaapi.BADADDR:
+                return None, None, f"Function '{func_spec}' not found"
+        return func_ea, var_name, None
+    return None, None, None
 
 
 def _infer_type_and_confidence(evidence: dict) -> tuple[str, float]:
@@ -2043,6 +2053,365 @@ def _collect_xref_functions(target_ea: int, direction: str, max_depth: int, max_
 
     return result
 
+
+@tool
+@idasync
+
+
+
+
+class ConstructorFieldEntry(TypedDict, total=False):
+    offset: int           # byte offset from this pointer
+    access_size: int      # bytes written
+    inferred_type: str    # "bool", "int", "void*", "float", "__int64", etc.
+    zero_init: bool       # True when this field is always zeroed in the ctor
+    assigned_value: str   # human-readable repr of the constant assigned (if any)
+    ea: str               # instruction address
+    disasm: str           # decompiled expression text
+
+
+class AnalyzeConstructorResult(TypedDict, total=False):
+    ok: bool
+    func_ea: str
+    func_name: str
+    this_param: str           # name of the identified this-pointer local
+    this_param_idx: int       # lvar index of the this-pointer
+    field_assignments: list[ConstructorFieldEntry]
+    estimated_size: int | None  # max(offset + size) across all observed fields
+    unique_offsets: int
+    suggested_struct_name: str | None
+    suggested_struct_definition: str | None
+    applied: bool
+    error: str
+    error_type: str
+    hint: str
+
+
+# Whitelist of 32-bit float bit patterns that are unambiguously floats in
+# constructor context — values like 1.0f, Pi, 180.0f.  Anything not in this
+# set is emitted as "int" so we never misclassify an integer constant.
+_KNOWN_FLOAT_BITS: frozenset[int] = frozenset({
+    0x3F800000,  # 1.0f
+    0xBF800000,  # -1.0f
+    0x3F000000,  # 0.5f
+    0xBF000000,  # -0.5f
+    0x40000000,  # 2.0f
+    0xC0000000,  # -2.0f
+    0x40800000,  # 4.0f
+    0xC0800000,  # -4.0f
+    0x3E800000,  # 0.25f
+    0x3F333333,  # 0.7f (approx)
+    0x3F4CCCCD,  # 0.8f
+    0x40490FDB,  # Pi
+    0x402DF854,  # e
+    0x43B40000,  # 360.0f
+    0x43340000,  # 180.0f
+    0x42B40000,  # 90.0f
+    0x41200000,  # 10.0f
+    0x42C80000,  # 100.0f
+})
+
+
+def _infer_ctor_field_type(access_size: int, rhs_val: int | None) -> tuple[str, bool, str]:
+    """Infer a C type for a constructor field write from size + constant value.
+
+    Returns ``(type_str, zero_init, value_repr)``.
+    """
+    zero_init = rhs_val == 0
+    if rhs_val is not None:
+        if access_size == 1:
+            if rhs_val in (0, 1):
+                return ("bool", zero_init, "true" if rhs_val else "false")
+            return ("uint8_t", zero_init, hex(rhs_val & 0xFF))
+        if access_size == 2:
+            return ("uint16_t", zero_init, hex(rhs_val & 0xFFFF))
+        if access_size == 4:
+            bits = rhs_val & 0xFFFFFFFF
+            if bits in _KNOWN_FLOAT_BITS:
+                import struct
+                try:
+                    as_float = struct.unpack("f", bits.to_bytes(4, "little"))[0]
+                    return ("float", False, f"{as_float}f")
+                except Exception:
+                    pass
+            return ("int", zero_init, hex(bits))
+        if access_size == 8:
+            if rhs_val == 0:
+                return ("void*", True, "nullptr")
+            # Large address → likely pointer
+            if rhs_val > 0x10000:
+                return ("void*", False, hex(rhs_val))
+            return ("__int64", zero_init, hex(rhs_val))
+    # No constant: infer from size only
+    return (_guess_field_type(access_size), False, "?")
+
+
+class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
+    """Walk a constructor's ctree and collect (this + N) field writes.
+
+    Identifies the this-pointer as:
+    1. A lvar named "this", "v0", or "a1" (first arg convention)
+    2. Falling back to the first pointer-typed lvar if none of the above match
+    """
+
+    def __init__(self, cfunc: ida_hexrays.cfunc_t):
+        ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+        self.cfunc = cfunc
+        self.this_idx: int | None = None
+        self.this_name: str = ""
+        # alias set: lvar indices that hold a copy of this
+        self._this_vars: set[int] = set()
+        self.writes: list[dict] = []
+        self._seen: set[tuple[str, int]] = set()
+        self._identify_this()
+
+    def _identify_this(self):
+        lvars = self.cfunc.get_lvars()
+        CANDIDATE_NAMES = {"this", "v0", "a1", "ecx", "rcx"}
+        for idx, lv in enumerate(lvars):
+            nm = (lv.name or "").lower()
+            try:
+                is_ptr = lv.tif.is_ptr()
+            except Exception:
+                is_ptr = False
+            if nm in CANDIDATE_NAMES or (idx == 0 and is_ptr):
+                self.this_idx = idx
+                self.this_name = lv.name or f"arg{idx}"
+                self._this_vars.add(idx)
+                return
+        # Last resort: first lvar that has pointer type
+        for idx, lv in enumerate(lvars):
+            try:
+                if lv.tif.is_ptr():
+                    self.this_idx = idx
+                    self.this_name = lv.name or f"arg{idx}"
+                    self._this_vars.add(idx)
+                    return
+            except Exception:
+                continue
+
+    def _is_this(self, expr) -> bool:
+        expr = _unwrap_casts(expr)
+        if expr is None:
+            return False
+        if expr.op == ida_hexrays.cot_var:
+            return expr.v.idx in self._this_vars
+        return False
+
+    def _track_alias(self, lhs, rhs):
+        """Track lhs = this → lhs is also a this alias."""
+        rhs_uw = _unwrap_casts(rhs)
+        if rhs_uw is None:
+            return
+        if rhs_uw.op == ida_hexrays.cot_var and rhs_uw.v.idx in self._this_vars:
+            if lhs.op == ida_hexrays.cot_var:
+                self._this_vars.add(lhs.v.idx)
+
+    def _rhs_constant(self, rhs) -> int | None:
+        """Extract a constant from the RHS of an assignment (strips casts)."""
+        rhs = _unwrap_casts(rhs)
+        return _const_value(rhs)
+
+    def _rhs_repr(self, rhs) -> str:
+        """Human-readable RHS."""
+        try:
+            return _get_expr_text(rhs, self.cfunc)
+        except Exception:
+            return "?"
+
+    def visit_expr(self, expr):
+        try:
+            if expr.op == ida_hexrays.cot_asg:
+                lhs, rhs = expr.x, expr.y
+                self._track_alias(lhs, rhs)
+
+                # cot_memptr(this, m) = rhs
+                if lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                    if self._is_this(lhs.x):
+                        self._record_memptr_write(lhs, rhs)
+
+                # *(T*)(this + N) = rhs
+                elif lhs.op in (ida_hexrays.cot_ptr, ida_hexrays.cot_idx):
+                    decomp = _decompose_ptr_access(lhs)
+                    if decomp:
+                        base, offset, size = decomp
+                        if self._is_this(base):
+                            self._record_ptr_write(lhs, offset, size, rhs)
+
+        except Exception as e:
+            logger.debug("_ConstructorVisitor.visit_expr failed: %s", e)
+        return 0
+
+    def _record_memptr_write(self, lhs, rhs):
+        try:
+            offset = lhs.m // 8
+            size = getattr(lhs, "ptrsize", 8) or 8
+            ea_hex = hex(lhs.ea)
+            key = (ea_hex, offset)
+            if key in self._seen:
+                return
+            self._seen.add(key)
+            rhs_val = self._rhs_constant(rhs)
+            inferred, zero_init, val_repr = _infer_ctor_field_type(size, rhs_val)
+            self.writes.append({
+                "offset": offset,
+                "access_size": size,
+                "inferred_type": inferred,
+                "zero_init": zero_init,
+                "assigned_value": self._rhs_repr(rhs) if rhs_val is None else val_repr,
+                "ea": ea_hex,
+                "disasm": _get_expr_text(lhs, self.cfunc),
+            })
+        except Exception as e:
+            logger.debug("_record_memptr_write failed: %s", e)
+
+    def _record_ptr_write(self, lhs, offset: int, size: int, rhs):
+        try:
+            if offset < 0:
+                return
+            ea_hex = hex(lhs.ea)
+            key = (ea_hex, offset)
+            if key in self._seen:
+                return
+            self._seen.add(key)
+            rhs_val = self._rhs_constant(rhs)
+            inferred, zero_init, val_repr = _infer_ctor_field_type(size, rhs_val)
+            self.writes.append({
+                "offset": offset,
+                "access_size": size,
+                "inferred_type": inferred,
+                "zero_init": zero_init,
+                "assigned_value": self._rhs_repr(rhs) if rhs_val is None else val_repr,
+                "ea": ea_hex,
+                "disasm": f"*(this+0x{offset:X})",
+            })
+        except Exception as e:
+            logger.debug("_record_ptr_write failed: %s", e)
+
+
+@tool
+@idasync
+@tool_timeout(60.0)
+def analyze_constructor(
+    address: Annotated[str, "Constructor function address or name"],
+    infer_struct: Annotated[bool, "Create struct from observed field layout (default: True)"] = True,
+    apply_type: Annotated[bool, "Apply inferred struct* type to the this parameter (default: False)"] = False,
+) -> AnalyzeConstructorResult:
+    """Infer struct layout by analyzing all field assignments in a constructor.
+
+    Decompiles the constructor at ``address`` and walks its ctree to collect every
+    ``*(this + N) = value`` write, including typed memptr accesses on already-typed
+    structs. For each field, the tool records:
+
+    - Byte offset from the this pointer
+    - Write size (1/2/4/8 bytes)
+    - Inferred C type (bool, int, float, void*, __int64, …) from size + constant pattern
+    - Whether the field is zero-initialized
+    - The constant or expression assigned
+
+    From those writes it builds an estimated struct layout and optionally creates a
+    named struct in the IDA type library. This is the fastest way to go from a raw
+    constructor to a draft struct definition without manually tracing every assignment.
+
+    Limitations:
+    - Only direct writes to *this* (or aliases assigned in the same function) are seen.
+      Delegating constructors that chain to another ctor will be missed unless you also
+      analyze the callee.
+    - Variable-stride array writes (``*(this + i*4) = …``) are skipped.
+    - Value-type inference is heuristic; always review the generated struct.
+    """
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return {
+                "ok": False,
+                "error": "Hex-Rays decompiler is not available",
+                "hint": "Ensure Hex-Rays is installed and licensed.",
+            }
+
+        func_ea = parse_address(address)
+        func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+
+        cfunc = _decompile_func(func_ea)
+        if cfunc is None:
+            return {
+                "ok": False,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "error": "Decompilation failed",
+            }
+
+        visitor = _ConstructorVisitor(cfunc)
+        if visitor.this_idx is None:
+            return {
+                "ok": False,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "error": "Could not identify this-pointer parameter",
+                "hint": (
+                    "Ensure the target is a __thiscall or __fastcall constructor. "
+                    "If IDA hasn't typed the first argument as a pointer, try applying "
+                    "a function signature first with set_type."
+                ),
+            }
+
+        visitor.apply_to(cfunc.body, None)
+
+        # Sort by offset for stable output
+        writes = sorted(visitor.writes, key=lambda w: w["offset"])
+
+        # Estimated struct size
+        estimated_size: int | None = None
+        if writes:
+            last = max(writes, key=lambda w: w["offset"] + w["access_size"])
+            estimated_size = last["offset"] + last["access_size"]
+
+        # Build struct
+        suggested_struct_name = None
+        suggested_struct_definition = None
+        applied = False
+
+        if infer_struct and writes:
+            fields = [(w["offset"], w["access_size"]) for w in writes]
+            base_name = f"ctor_struct_{func_ea:X}"
+            struct_result = _build_struct_type(fields, base_name)
+            if struct_result:
+                suggested_struct_name, suggested_struct_definition = struct_result
+                # Apply struct* type to the this parameter if requested
+                if apply_type and suggested_struct_name:
+                    try:
+                        tif = _parse_type_tinfo(f"{suggested_struct_name}*")
+                        if tif and visitor.this_name:
+                            modifier = my_modifier_t(visitor.this_name, tif)
+                            applied = bool(ida_hexrays.modify_user_lvars(func_ea, modifier))
+                    except Exception as ex:
+                        logger.debug("apply_type failed in analyze_constructor: %s", ex)
+
+        unique_offsets = len({w["offset"] for w in writes})
+
+        result: dict = {
+            "ok": True,
+            "func_ea": hex(func_ea),
+            "func_name": func_name,
+            "this_param": visitor.this_name,
+            "this_param_idx": visitor.this_idx,
+            "field_assignments": writes,
+            "estimated_size": estimated_size,
+            "unique_offsets": unique_offsets,
+            "suggested_struct_name": suggested_struct_name,
+            "suggested_struct_definition": suggested_struct_definition,
+            "applied": applied,
+        }
+        if not writes:
+            result["hint"] = (
+                "No this-pointer field writes detected. This may be a delegating "
+                "constructor that calls another ctor, or the function may not be "
+                "a constructor. Try analyze_constructor on any chained callees."
+            )
+        return result
+
+    except Exception as e:
+        logger.exception("analyze_constructor failed")
+        return tool_error(e)
 
 @tool
 @idasync

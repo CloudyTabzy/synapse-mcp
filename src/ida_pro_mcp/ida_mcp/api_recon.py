@@ -197,12 +197,19 @@ class FunctionEntry(TypedDict, total=False):
     has_type: bool
 
 
+class UndefinedCodeCandidate(TypedDict, total=False):
+    addr: str
+    size: int
+
+
 class FunctionsRangeResult(TypedDict, total=False):
     ok: bool
     start: str
     end: str
     functions: list[FunctionEntry]
     count: int
+    undefined_code_regions: list[UndefinedCodeCandidate]
+    hint: str
     error: str
     warnings: list[str]
 
@@ -563,6 +570,43 @@ def find_vtable_candidates(
         return _annotate({**tool_error(e, f"vtable scan in {section!r}"), "section": section})
 
 
+def _scan_undefined_code(start_ea: int, end_ea: int, max_hits: int = 5) -> list[UndefinedCodeCandidate]:
+    """Scan [start_ea, end_ea) for contiguous code-flagged bytes not in any function.
+
+    Walks ``idautils.Heads()`` (capped at 10 000 items) looking for items that
+    are code but not part of any function.  Consecutive such items are merged
+    into a single run and returned as ``UndefinedCodeCandidate`` entries.
+    """
+    candidates: list[UndefinedCodeCandidate] = []
+    run_start: int | None = None
+    run_end: int = 0
+    checked = 0
+
+    for ea in idautils.Heads(start_ea, end_ea):
+        if checked >= 10_000:
+            break
+        checked += 1
+        flags = idc.get_full_flags(ea)
+        if idc.is_code(flags) and not ida_bytes.is_func(flags):
+            item_size = max(1, idc.get_item_size(ea))
+            if run_start is None:
+                run_start = ea
+                run_end = ea + item_size
+            else:
+                run_end = ea + item_size
+        else:
+            if run_start is not None:
+                candidates.append({"addr": hex(run_start), "size": run_end - run_start})
+                run_start = None
+                if len(candidates) >= max_hits:
+                    break
+
+    if run_start is not None:
+        candidates.append({"addr": hex(run_start), "size": run_end - run_start})
+
+    return candidates[:max_hits]
+
+
 @tool
 @idasync
 def list_functions_in_range(
@@ -577,6 +621,11 @@ def list_functions_in_range(
     The cluster-analysis primitive from protocol section X — when XREFs are
     gone, pull every function in a 4 KB-or-so window around your target,
     decompile them all, and look for shared globals and struct offsets.
+
+    When no functions are found, ``undefined_code_regions`` lists code-flagged
+    byte runs in the range that IDA has not yet promoted to functions. Use
+    ``find_function_prologues`` or ``scan_and_define_funcs`` to create them,
+    then re-run this tool.
     """
     try:
         start_ea = parse_address(start)
@@ -611,13 +660,27 @@ def list_functions_in_range(
                     "has_type": bool(idc.get_type(func.start_ea)),
                 }
             )
-        return _annotate({
+
+        result: dict = {
             "ok": True,
             "start": hex(start_ea),
             "end": hex(end_ea),
             "functions": functions,
             "count": len(functions),
-        })
+        }
+
+        # Scan for undefined code in the range so callers know what's missing
+        undef_regions = _scan_undefined_code(start_ea, end_ea)
+        if undef_regions:
+            result["undefined_code_regions"] = undef_regions
+            if not functions:
+                result["hint"] = (
+                    "No functions defined in this range, but code-flagged bytes were found. "
+                    "Run find_function_prologues or scan_and_define_funcs on this range to "
+                    "create the missing function entries, then re-run list_functions_in_range."
+                )
+
+        return _annotate(result)
     except Exception as e:
         return _annotate({
             **tool_error(e, f"list functions {hex(start_ea)}-{hex(end_ea)}"),

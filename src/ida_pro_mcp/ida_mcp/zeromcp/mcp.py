@@ -1026,6 +1026,25 @@ class McpServer:
 
         return schema
 
+    def _open_output_schema(self, schema: Any) -> Any:
+        """Recursively remove additionalProperties:false from an output schema.
+
+        Tool outputs must never be rejected for having fields that weren't in
+        the schema at registration time — tools evolve and add fields.  Input
+        schemas (inputSchema) are NOT passed through here, so callers still get
+        strict param validation.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        result = {k: v for k, v in schema.items() if not (k == "additionalProperties" and v is False)}
+        if "properties" in result:
+            result["properties"] = {k: self._open_output_schema(v) for k, v in result["properties"].items()}
+        if "items" in result:
+            result["items"] = self._open_output_schema(result["items"])
+        if "anyOf" in result:
+            result["anyOf"] = [self._open_output_schema(s) for s in result["anyOf"]]
+        return result
+
     def _schema_is_object_like(self, schema: dict) -> bool:
         """Check if a JSON schema always describes a dict at runtime.
 
@@ -1115,16 +1134,24 @@ class McpServer:
             hints = dict(getattr(typed_dict_class, '__annotations__', {}))
 
         required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
+        required = [key for key in hints.keys() if key in required_keys]
 
-        return {
+        schema: dict = {
             "type": "object",
             "properties": {
                 field_name: self._type_to_json_schema(field_type)
                 for field_name, field_type in hints.items()
             },
-            "required": [key for key in hints.keys() if key in required_keys],
-            "additionalProperties": False
+            "required": required,
         }
+        # Only close the schema against extra properties when the TypedDict has
+        # required keys (total=True or mixed).  total=False dicts (all keys
+        # optional) are used for tool *outputs* that grow over time; adding
+        # additionalProperties:false there causes MCP clients to reject
+        # responses whenever a new field is added without a schema refresh.
+        if required:
+            schema["additionalProperties"] = False
+        return schema
 
     def _generate_tool_schema(self, func_name: str, func: Callable) -> dict:
         """Generate MCP tool schema from a function"""
@@ -1179,6 +1206,6 @@ class McpServer:
                 # accept the schema while anyOf still constrains the variants.
                 return_schema = {"type": "object", **return_schema}
 
-            schema["outputSchema"] = return_schema
+            schema["outputSchema"] = self._open_output_schema(return_schema)
 
         return schema

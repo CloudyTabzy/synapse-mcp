@@ -39,6 +39,7 @@ import contextvars
 import dataclasses
 import enum
 import functools
+import heapq
 import logging
 import pathlib
 import re
@@ -532,6 +533,9 @@ class GeneratedSignature:
 @dataclasses.dataclass(slots=True)
 class XrefGeneratedSignature:
     signatures: list[GeneratedSignature]
+    total_xrefs: int = 0
+    xrefs_sampled: int = 0
+    truncated: bool = False
 
 
 class SigText:
@@ -866,33 +870,51 @@ class XrefFinder:
     def count_code_xrefs_to(cls, ea: int) -> int:
         return sum(1 for _ in cls.iter_code_xrefs_to(ea))
 
-    def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
-        xref_signatures: list[GeneratedSignature] = []
-
-        total = self.count_code_xrefs_to(ea)
-        if total == 0:
-            return XrefGeneratedSignature([])
-
+    def find_xrefs(
+        self,
+        ea: int,
+        cfg: SigMakerConfig,
+        max_xrefs: int = 50,
+        top: int = 5,
+    ) -> XrefGeneratedSignature:
         cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
 
-        shortest_len = cfg.max_xref_signature_length + 1
+        # Single pass: count all code xrefs and collect up to max_xrefs candidates.
+        # Pairing each address with its containing function size lets us sort before
+        # generating — smaller functions tend to produce shorter unique byte sequences,
+        # so processing them first maximises quality within the sample window.
+        candidates: list[tuple[int, int]] = []  # (func_size, frm_ea)
+        total = 0
+        for frm_ea in self.iter_code_xrefs_to(ea):
+            total += 1
+            if len(candidates) < max_xrefs:
+                fn = idaapi.get_func(frm_ea)
+                fn_size = (fn.end_ea - fn.start_ea) if fn else 0x7FFFFFFF
+                candidates.append((fn_size, frm_ea))
 
-        for i, frm_ea in enumerate(self.iter_code_xrefs_to(ea), start=1):
+        if total == 0:
+            return XrefGeneratedSignature([], total_xrefs=0, xrefs_sampled=0, truncated=False)
+
+        candidates.sort()  # ascending function size → best candidates first
+
+        xref_signatures: list[GeneratedSignature] = []
+        for _, frm_ea in candidates:
             try:
                 result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
                 sig: typing.Optional[Signature] = result.signature
             except Exception:
                 sig = None
+            if sig is not None:
+                xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
 
-            if sig is None:
-                continue
-
-            if len(sig) < shortest_len:
-                shortest_len = len(sig)
-            xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
-
-        xref_signatures.sort()
-        return XrefGeneratedSignature(xref_signatures)
+        best = heapq.nsmallest(top, xref_signatures)
+        best.sort()  # ascending signature length for consistent output
+        return XrefGeneratedSignature(
+            best,
+            total_xrefs=total,
+            xrefs_sampled=len(candidates),
+            truncated=total > max_xrefs,
+        )
 
 
 @dataclasses.dataclass(slots=True)

@@ -16,7 +16,7 @@ Core API modules (upstream + enhanced):
 - `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries
 - `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling
 - `api_memory.py`: bytes/ints/strings read and patch, typed integer I/O
-- `api_types.py`: structs, type inference, type application, enum management, decompiler-based type propagation (`type_propagate` — infers struct layouts from field access patterns across functions)
+- `api_types.py`: structs, type inference, type application, enum management, constructor analysis (`analyze_constructor` — extracts field layout from `*(this+N)=value` patterns in constructors)
 - `api_modify.py`: comments, renaming, asm patching, function definition, forced range analysis (`analyze_range`), bulk function creation (`scan_and_define_funcs`), user xref creation (`add_xref`)
 - `api_stack.py`: stack frame operations
 - `api_sigmaker.py`: signature creation, scanning, xref-based signature generation
@@ -27,7 +27,7 @@ Core API modules (upstream + enhanced):
 - `api_flirt.py`: FLIRT signature management tools — apply signatures, load type libraries, and suggest names for unidentified functions via structural similarity scoring (prologue match, callee Jaccard, string xref overlap)
 - `api_survey.py`: one-call binary triage (metadata, segments, imports, strings, statistics)
 - `api_composite.py`: multi-step composite operations and cross-engine workflows
-- `api_discovery.py`: instance discovery and proxying
+- `api_discovery.py`: instance discovery and proxying (`list_instances`, `select_instance`, `get_active_instance` — unambiguously shows which IDB is currently active)
 - `api_tasks.py`: async task queue for long-running operations
 
 Optional analysis engine modules (this fork):
