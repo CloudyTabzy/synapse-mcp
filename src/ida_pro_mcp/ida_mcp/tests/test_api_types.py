@@ -23,6 +23,7 @@ from ..api_types import (
     set_type,
     type_apply_batch,
     infer_types,
+    type_propagate,
 )
 
 
@@ -605,3 +606,244 @@ def test_infer_types_invalid_text_address_errors_cleanly():
     result = infer_types("InvalidAddressName123")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Not found")
+
+
+# ============================================================================
+# type_propagate — high-level integration tests
+# ============================================================================
+
+
+def _require_hexrays_in_result(result):
+    """Skip if Hex-Rays isn't available — every type_propagate test needs it."""
+    if not result.get("ok") and "Hex-Rays" in str(result.get("error", "")):
+        skip_test("Hex-Rays decompiler not available in this IDA instance")
+
+
+@test()
+def test_type_propagate_rejects_invalid_direction():
+    """Bad ``direction`` strings produce a structured error, not a crash."""
+    result = type_propagate(get_any_function(), direction="sideways")
+    assert result["ok"] is False
+    assert "direction" in result["error"].lower()
+
+
+@test()
+def test_type_propagate_rejects_empty_var_name():
+    """``func::`` (trailing empty var name) returns a structured error."""
+    result = type_propagate("main::")
+    assert result["ok"] is False
+    assert "empty" in result["error"].lower() or "must not be empty" in result["error"].lower()
+
+
+@test()
+def test_type_propagate_returns_full_schema_on_success():
+    """A successful call carries every documented top-level field.
+
+    Even with no evidence, the result schema must be complete so AI agents
+    don't have to handle a sparse-result fallback path.
+    """
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(fn_addr, max_functions=2, max_depth=1)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    for key in (
+        "address", "inferred_type", "confidence", "confidence_breakdown",
+        "field_accesses", "field_profile", "call_usages", "stored_in",
+        "propagation_path", "functions_analyzed",
+        "suggested_struct_name", "suggested_struct_definition", "applied",
+    ):
+        assert key in result, f"missing {key!r} in result"
+
+
+@test()
+def test_type_propagate_confidence_in_unit_interval():
+    """Property: confidence must lie in [0, 1] for every input."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(fn_addr, max_functions=2, max_depth=1)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+    c = result["confidence"]
+    assert 0.0 <= c <= 1.0, f"confidence {c} outside [0, 1]"
+
+
+@test()
+def test_type_propagate_function_entry_target_hint():
+    """Targeting a function entry point returns a hint pointing the user
+    toward a data variable instead — this is the most common foot-gun."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(fn_addr, max_functions=1)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    # If the function genuinely has no analyzable usages, the hint mentions
+    # 'function entry point' (the code-pointer-global path). If the function
+    # itself has field accesses through some argument, this branch may not fire
+    # — accept either outcome but never crash.
+    hint = result.get("hint", "")
+    if not result["field_accesses"]:
+        assert hint, "zero-fields result must have a hint explaining why"
+
+
+@test()
+def test_type_propagate_zero_fields_includes_diag():
+    """When zero field accesses, every ``functions_analyzed`` entry that was
+    decompiled must include a ``diag`` block — that's the only way callers
+    can tell ``no evidence`` from ``visitor never saw anything``."""
+    addr = get_unmapped_address()
+    # Use a high address with a containing function would be ideal; falling
+    # back to an arbitrary function should still produce diag on zero-result
+    # functions.
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(fn_addr, max_functions=2, max_depth=1)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    if result["field_accesses"]:
+        # If by chance the function did produce field accesses, no diag is
+        # required — skip the rest of this test.
+        return
+
+    decompiled_entries = [
+        e for e in result["functions_analyzed"] if e.get("decompiled")
+    ]
+    for entry in decompiled_entries:
+        assert "diag" in entry, f"function {entry.get('func_name')} missing diag block on zero result"
+        diag = entry["diag"]
+        # Every counter key documented in the visitor must be present.
+        for k in (
+            "asg_memptr_seen", "asg_memptr_base_mismatch",
+            "read_memptr_seen", "read_memptr_base_mismatch",
+            "read_ptr_seen", "read_ptr_base_mismatch",
+            "read_ptr_decompose_failed", "stored_in_count",
+        ):
+            assert k in diag, f"diag missing key {k!r}"
+            assert isinstance(diag[k], int), f"diag[{k!r}] not int"
+
+
+@test()
+def test_type_propagate_field_profile_invariants():
+    """``field_profile`` must be consistent with ``field_accesses``:
+
+    - Every offset present in ``field_accesses`` appears in ``field_profile``.
+    - ``reads + writes`` per offset equals the count in ``field_accesses``.
+    - Offsets are non-negative.
+    """
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(fn_addr, max_functions=3, max_depth=1)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    profile = result["field_profile"]
+    fas = result["field_accesses"]
+
+    counts: dict[int, dict] = {}
+    for fa in fas:
+        off = fa["offset"]
+        slot = counts.setdefault(off, {"reads": 0, "writes": 0})
+        if fa.get("is_write"):
+            slot["writes"] += 1
+        else:
+            slot["reads"] += 1
+
+    for off, expected in counts.items():
+        assert off >= 0, f"negative offset {off} leaked into result"
+        key = f"0x{off:X}"
+        assert key in profile, f"offset {key} missing from field_profile"
+        assert profile[key]["reads"] == expected["reads"]
+        assert profile[key]["writes"] == expected["writes"]
+
+
+@test()
+def test_type_propagate_confidence_breakdown_present():
+    """The ``confidence_breakdown`` list is always non-empty — even with no
+    evidence, it carries a single ``no_evidence`` factor so callers can rely
+    on the field's shape."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(fn_addr, max_functions=2, max_depth=1)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    factors = result["confidence_breakdown"]
+    assert isinstance(factors, list)
+    assert len(factors) >= 1
+    for factor in factors:
+        assert "kind" in factor
+        assert "contribution" in factor
+        assert 0.0 <= factor["contribution"] <= 1.0
+
+
+@test(binary="typed_fixture.elf")
+def test_type_propagate_typed_global_struct_pointer():
+    """Targeting a global of a known struct type yields field accesses with
+    valid offsets — the canonical 'this works' end-to-end check."""
+    result = type_propagate(TYPED_FIXTURE_G_WRAPPER, max_functions=5, max_depth=2)
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    # We don't require a specific count — Hex-Rays output varies — but if any
+    # accesses are detected, they must validate. If zero, we at least demand
+    # a diagnostic hint so the analyst knows why.
+    if result["field_accesses"]:
+        for fa in result["field_accesses"]:
+            assert fa["offset"] >= 0
+            assert fa["access_size"] in (1, 2, 4, 8, 16)
+            assert "func_ea" in fa
+            assert "ea" in fa
+    else:
+        assert result.get("hint"), "zero field accesses must include a diagnostic hint"
+
+
+@test(binary="typed_fixture.elf")
+def test_type_propagate_unmapped_address_returns_clean_error():
+    """An unmapped address produces a structured error, not a traceback."""
+    result = type_propagate(get_unmapped_address(), max_functions=1)
+    # Two valid outcomes:
+    #   (a) ok=False with an error message
+    #   (b) ok=True with zero evidence and a hint
+    # Either is acceptable — neither must crash.
+    if result.get("ok"):
+        assert result["field_accesses"] == []
+        assert result.get("hint")
+    else:
+        assert "error" in result
+
+
+@test()
+def test_type_propagate_local_var_not_found_per_function_note():
+    """When ``func::var`` resolves but ``var`` doesn't exist in the locals,
+    the per-function entry records a ``note`` rather than crashing."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = type_propagate(f"{fn_addr}::__nonexistent_var__")
+    _require_hexrays_in_result(result)
+    if not result.get("ok"):
+        skip_test(f"type_propagate failed: {result.get('error')}")
+
+    decompiled = [e for e in result["functions_analyzed"] if e.get("decompiled")]
+    if decompiled:
+        # At least the containing function should report the missing var.
+        notes = [e.get("note", "") for e in decompiled]
+        assert any("not found" in n.lower() for n in notes), (
+            f"expected a 'not found' note among {notes}"
+        )

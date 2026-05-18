@@ -1172,6 +1172,22 @@ class CallUsage(TypedDict, total=False):
     callee_name: str
 
 
+class StoredIn(TypedDict, total=False):
+    """Records target being *stored into* another struct's field.
+
+    Distinct from ``FieldAccess`` (which records target's *own* fields being
+    accessed). This is the "the target is a value held by something else" case
+    — e.g. ``some_struct->member = target`` makes target the rvalue, not the
+    base. Crucial for analyzing char*/value-type globals like ``String1``.
+    """
+    offset: int                # offset within the containing struct
+    access_size: int           # size of the slot the target occupies
+    ea: str
+    func_ea: str
+    func_name: str
+    container_expr: str        # text of the base expression (e.g. "v8")
+
+
 class PropagationStep(TypedDict, total=False):
     ea: str
     func_ea: str
@@ -1180,18 +1196,35 @@ class PropagationStep(TypedDict, total=False):
     detail: str
 
 
+class FieldProfileEntry(TypedDict, total=False):
+    reads: int
+    writes: int
+    max_size: int
+    min_size: int
+    function_count: int        # how many distinct functions accessed this offset
+
+
+class ConfidenceFactor(TypedDict, total=False):
+    kind: str                  # "api_match" | "field_accesses" | "malloc_origin" | "no_evidence"
+    detail: str
+    contribution: float
+
+
 class TypePropagateResult(TypedDict, total=False):
     ok: bool
     address: str
     inferred_type: str
     confidence: float
     field_accesses: list[FieldAccess]
+    field_profile: dict[str, FieldProfileEntry]    # offset (hex) -> stats
     call_usages: list[CallUsage]
+    stored_in: list[StoredIn]
     propagation_path: list[PropagationStep]
     functions_analyzed: list[dict]
     suggested_struct_name: str | None
     suggested_struct_definition: str | None
     applied: bool
+    confidence_breakdown: list[ConfidenceFactor]
     error: str
     error_type: str
     hint: str
@@ -1291,6 +1324,94 @@ def _get_expr_text(expr, cfunc) -> str:
     return f"expr_{expr.op}"
 
 
+def _unwrap_casts(expr):
+    """Strip ``cot_cast`` (and harmless ``cot_ref``) wrappers from an expression.
+
+    Used because Hex-Rays often emits ``(T*)expr`` or ``&expr`` wrappers around
+    the real address operand in untyped pointer-arithmetic patterns. Walks until
+    a non-cast, non-ref node is found or until ``None``.
+    """
+    while expr is not None:
+        if expr.op == ida_hexrays.cot_cast:
+            expr = expr.x
+        elif expr.op == ida_hexrays.cot_ref:
+            expr = expr.x
+        else:
+            break
+    return expr
+
+
+def _const_value(expr) -> int | None:
+    """Return the integer value of a ``cot_num`` expression, sign-extended.
+
+    ``cnumber_t._value`` is an unsigned 64-bit raw value; negative offsets are
+    stored as their two's-complement, so we sign-extend at 64 bits. Returns
+    ``None`` for non-numeric expressions.
+    """
+    if expr is None or expr.op != ida_hexrays.cot_num:
+        return None
+    try:
+        v = int(expr.n._value)
+        if v >= (1 << 63):
+            v -= (1 << 64)
+        return v
+    except Exception:
+        return None
+
+
+def _decompose_ptr_access(expr) -> tuple | None:
+    """Decompose a raw-pointer-arithmetic dereference into ``(target_expr, offset_bytes, access_size)``.
+
+    Handles these untyped-pointer field-access patterns Hex-Rays emits when a
+    pointer has no struct type applied yet — the exact patterns ``type_propagate``
+    is supposed to *recognize* in order to infer that struct type:
+
+    - ``*(T*)(ptr + N)`` → ``cot_ptr(cot_cast(cot_add(ptr, N)))``  (most common)
+    - ``*(T*)ptr``       → ``cot_ptr(cot_cast(ptr))``               (offset = 0)
+    - ``*ptr``           → ``cot_ptr(ptr)``                          (already typed)
+    - ``ptr[N]``         → ``cot_idx(ptr, N)``                      (constant index)
+
+    Returns ``None`` if the expression isn't one of these forms or if the
+    offset is not a compile-time constant. Caller must check whether
+    ``target_expr`` matches the propagation target.
+    """
+    if expr is None:
+        return None
+
+    # ptr[N] — array indexing with constant index
+    if expr.op == ida_hexrays.cot_idx:
+        base = _unwrap_casts(expr.x)
+        index_val = _const_value(expr.y)
+        if base is None or index_val is None:
+            return None
+        access_size = getattr(expr, "ptrsize", 0) or 8
+        return (base, index_val * access_size, access_size)
+
+    # *(T*)(...) — pointer dereference
+    if expr.op != ida_hexrays.cot_ptr:
+        return None
+
+    access_size = getattr(expr, "ptrsize", 0) or 8
+    inner = _unwrap_casts(expr.x)
+    if inner is None:
+        return None
+
+    # *(T*)(ptr + N) — additive offset
+    if inner.op == ida_hexrays.cot_add:
+        lhs = _unwrap_casts(inner.x)
+        rhs = _unwrap_casts(inner.y)
+        rhs_v = _const_value(rhs)
+        lhs_v = _const_value(lhs)
+        if rhs_v is not None:
+            return (lhs, rhs_v, access_size)
+        if lhs_v is not None:
+            return (rhs, lhs_v, access_size)
+        return None
+
+    # *(T*)ptr — plain dereference (offset = 0)
+    return (inner, 0, access_size)
+
+
 class _UsageCollector(ida_hexrays.ctree_visitor_t):
     """Collect field accesses, call usages, and malloc origins for a target variable."""
 
@@ -1301,21 +1422,54 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
         self.target_ea = target_ea
         self.field_accesses: list[dict] = []
         self.call_usages: list[dict] = []
+        self.stored_in: list[dict] = []         # NEW: target stored INTO another struct's field
         self.malloc_origin: dict | None = None
         self.assignments: list[dict] = []
         self._found_vars: set[int] = set()
         self._seen_field_writes: set[tuple[str, int]] = set()  # (ea_hex, offset)
+        self._seen_stored_in: set[tuple[str, int]] = set()
         if target_lvar_idx is not None:
             self._found_vars.add(target_lvar_idx)
+        # Diagnostic counters — surfaced in `functions_analyzed[*].diag` so
+        # callers can tell *why* no field accesses were found (visitor never
+        # saw a memptr at all? saw one but rejected the base? rejected because
+        # of a cast we don't unwrap?). These are essential for debugging
+        # zero-field-access mysteries on real binaries.
+        self._diag: dict[str, int] = {
+            "asg_memptr_seen": 0,            # cot_asg with cot_memptr LHS encountered
+            "asg_memptr_base_mismatch": 0,   # ...but the base wasn't the target
+            "read_memptr_seen": 0,           # standalone cot_memptr / cot_memref reads
+            "read_memptr_base_mismatch": 0,
+            "read_ptr_seen": 0,              # cot_ptr / cot_idx reads
+            "read_ptr_base_mismatch": 0,
+            "read_ptr_decompose_failed": 0,  # cot_ptr that didn't decompose to (target, offset, size)
+            "stored_in_count": 0,            # target appeared as RHS of `other_struct.field = target`
+        }
+        # Up to 3 sample base expressions we rejected — helps identify
+        # unexpected wrapping (e.g. `cot_ref(cot_obj(...))`).
+        self._base_mismatch_samples: list[str] = []
 
     def _is_target_expr(self, expr) -> bool:
         return _expr_is_target(expr, self.target_lvar_idx, self.target_ea)
 
     def _track_var_assignment(self, lhs, rhs):
-        """Track assignments: if rhs is target, lhs var is now also tracked."""
+        """Track assignments: if rhs resolves to the target (or to another
+        tracked alias), the lhs local is added to ``_found_vars`` so later
+        accesses through it are attributed correctly. Casts are stripped on
+        both sides because Hex-Rays inserts ``(T*)`` wrappers liberally."""
         if lhs is None or rhs is None:
             return
-        if lhs.op == ida_hexrays.cot_var and self._is_target_expr(rhs):
+        if lhs.op != ida_hexrays.cot_var:
+            return
+        rhs_unwrapped = _unwrap_casts(rhs)
+        if rhs_unwrapped is None:
+            return
+        # Direct target → alias
+        if self._is_target_expr(rhs_unwrapped):
+            self._found_vars.add(lhs.v.idx)
+            return
+        # Alias chain: v_new = v_known
+        if rhs_unwrapped.op == ida_hexrays.cot_var and rhs_unwrapped.v.idx in self._found_vars:
             self._found_vars.add(lhs.v.idx)
 
     def _record_field_access(self, expr, is_write: bool):
@@ -1345,6 +1499,114 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
             })
         except Exception as e:
             logger.debug("_record_field_access failed: %s", e)
+
+    def _record_raw_field_access(self, expr, offset_bytes: int, access_size: int, is_write: bool):
+        """Record a field access detected via raw pointer arithmetic.
+
+        Distinct from ``_record_field_access`` (which handles ``cot_memptr``/
+        ``cot_memref`` nodes from already-typed struct pointers) — this handles
+        the ``*(T*)(ptr+N)`` shape Hex-Rays emits for *untyped* struct pointers,
+        which is exactly what ``type_propagate`` is trying to identify.
+        """
+        try:
+            if offset_bytes < 0:
+                # Sign-extended negative offset — skip; struct fields don't
+                # live at negative offsets, and this is usually base-pointer
+                # arithmetic the caller doesn't want surfaced as a field.
+                return
+            ea_hex = hex(expr.ea)
+            if is_write:
+                self._seen_field_writes.add((ea_hex, offset_bytes))
+            else:
+                if (ea_hex, offset_bytes) in self._seen_field_writes:
+                    return
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.field_accesses.append({
+                "offset": offset_bytes,
+                "access_size": access_size,
+                "is_write": is_write,
+                "ea": ea_hex,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "disasm": f"*(uint{access_size*8}_t*)(target+0x{offset_bytes:X})",
+            })
+        except Exception as e:
+            logger.debug("_record_raw_field_access failed: %s", e)
+
+    def _record_stored_in(self, lhs_memptr):
+        """Record that target appeared as the RHS of an assignment whose LHS
+        is a struct-field access. Distinguishes "target is stored at offset N
+        of another struct" from "target is a struct with a field at offset N".
+
+        This is the inverse direction of ``_record_field_access`` and is
+        critical for analyzing value-type globals (``char*``, ``int``, etc.)
+        that are *held by* other structs rather than being struct bases
+        themselves.
+        """
+        try:
+            offset_bytes = lhs_memptr.m // 8
+            access_size = getattr(lhs_memptr, "ptrsize", 8) or 8
+            ea_hex = hex(lhs_memptr.ea)
+            key = (ea_hex, offset_bytes)
+            if key in self._seen_stored_in:
+                return
+            self._seen_stored_in.add(key)
+            container_expr = _get_expr_text(lhs_memptr.x, self.cfunc)
+            func_ea = self.cfunc.entry_ea
+            func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self.stored_in.append({
+                "offset": offset_bytes,
+                "access_size": access_size,
+                "ea": ea_hex,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "container_expr": container_expr,
+            })
+            self._diag["stored_in_count"] += 1
+        except Exception as e:
+            logger.debug("_record_stored_in failed: %s", e)
+
+    def _is_tracked_base(self, base) -> bool:
+        """Whether ``base`` resolves to the propagation target.
+
+        A base is "tracked" if it is the target global/lvar directly, or if it
+        is a local variable that has been assigned from the target (a derived
+        alias collected in ``_found_vars``). Casts are stripped before checks.
+        """
+        base = _unwrap_casts(base)
+        if base is None:
+            return False
+        if self._is_target_expr(base):
+            return True
+        if base.op == ida_hexrays.cot_var and base.v.idx in self._found_vars:
+            return True
+        return False
+
+    def _record_base_mismatch_sample(self, base) -> None:
+        """Save up to 3 string samples of bases we rejected for diagnostics.
+
+        Helps distinguish "ctree shape we don't recognize" (unexpected node
+        op like ``cot_ref``) from "wrong target_ea" (cot_obj with non-matching
+        obj_ea) from "untracked local" (cot_var not in _found_vars).
+        """
+        if len(self._base_mismatch_samples) >= 3:
+            return
+        try:
+            unwrapped = _unwrap_casts(base)
+            if unwrapped is None:
+                self._base_mismatch_samples.append("None")
+                return
+            op_name = f"op={unwrapped.op}"
+            if unwrapped.op == ida_hexrays.cot_var:
+                detail = f"var.idx={unwrapped.v.idx}"
+            elif unwrapped.op == ida_hexrays.cot_obj:
+                detail = f"obj_ea={hex(unwrapped.obj_ea)}"
+            else:
+                detail = _get_expr_text(unwrapped, self.cfunc)
+            self._base_mismatch_samples.append(f"{op_name} {detail}")
+        except Exception:
+            self._base_mismatch_samples.append("<exception extracting sample>")
 
     def _record_call_usage(self, call_expr, arg_index: int):
         """Record that target is passed as argument to a call."""
@@ -1391,25 +1653,69 @@ class _UsageCollector(ida_hexrays.ctree_visitor_t):
                 lhs, rhs = expr.x, expr.y
                 self._track_var_assignment(lhs, rhs)
                 # Field write: target->field = value
+                #
+                # Modern Hex-Rays normalizes ``*(T*)(ptr + N) = value`` into
+                # ``cot_asg(cot_memptr(ptr, m=N*8), value)`` regardless of
+                # whether ``ptr`` has an applied struct type — the
+                # memory-dereference *is* the LHS, never a ``cot_ptr``. So we
+                # don't need a separate ``cot_ptr``/``cot_idx`` write branch
+                # here; the read-side handler below catches those shapes when
+                # they appear in rvalue contexts.
                 if lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
-                    if self._is_target_expr(lhs.x) or _expr_is_target(lhs.x, None, self.target_ea) or (lhs.x.op == ida_hexrays.cot_var and lhs.x.v.idx in self._found_vars):
+                    self._diag["asg_memptr_seen"] += 1
+                    if self._is_tracked_base(lhs.x):
                         self._record_field_access(lhs, is_write=True)
+                    else:
+                        self._diag["asg_memptr_base_mismatch"] += 1
+                        self._record_base_mismatch_sample(lhs.x)
+                        # Stored-in: if the RHS is the target, the LHS struct
+                        # has the target as a field VALUE — record where.
+                        # Only meaningful when the LHS base wasn't the target
+                        # itself, otherwise it's just a self-field write.
+                        rhs_uw = _unwrap_casts(rhs)
+                        if rhs_uw is not None and self._is_target_expr(rhs_uw):
+                            self._record_stored_in(lhs)
                 # Malloc origin: var = malloc(...)
                 if self._is_target_expr(lhs) or (lhs.op == ida_hexrays.cot_var and lhs.v.idx in self._found_vars):
                     self._check_malloc_origin(rhs)
 
-            # --- Field reads ---
+            # --- Field reads (already-typed struct ptr) ---
             if expr.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
-                base = expr.x
-                if self._is_target_expr(base) or (base.op == ida_hexrays.cot_var and base.v.idx in self._found_vars):
+                self._diag["read_memptr_seen"] += 1
+                if self._is_tracked_base(expr.x):
                     self._record_field_access(expr, is_write=False)
+                else:
+                    self._diag["read_memptr_base_mismatch"] += 1
+                    self._record_base_mismatch_sample(expr.x)
+
+            # --- Field reads (raw pointer arithmetic on untyped ptr) ---
+            # When Hex-Rays does *not* fold the access into a ``cot_memptr``
+            # (typically because the cast type is one-off or the base is a
+            # local), the rvalue appears as ``cot_ptr(cot_cast(cot_add(...)))``.
+            elif expr.op in (ida_hexrays.cot_ptr, ida_hexrays.cot_idx):
+                self._diag["read_ptr_seen"] += 1
+                decomp = _decompose_ptr_access(expr)
+                if decomp is None:
+                    self._diag["read_ptr_decompose_failed"] += 1
+                else:
+                    target_expr, offset, access_size = decomp
+                    if self._is_tracked_base(target_expr):
+                        self._record_raw_field_access(expr, offset, access_size, is_write=False)
+                    else:
+                        self._diag["read_ptr_base_mismatch"] += 1
+                        self._record_base_mismatch_sample(target_expr)
 
             # --- Call arguments ---
             if expr.op == ida_hexrays.cot_call:
                 args = expr.a
                 if args:
                     for idx, arg in enumerate(args):
-                        if self._is_target_expr(arg) or (arg.op == ida_hexrays.cot_var and arg.v.idx in self._found_vars):
+                        arg_unwrapped = _unwrap_casts(arg)
+                        if arg_unwrapped is not None and (
+                            self._is_target_expr(arg_unwrapped)
+                            or (arg_unwrapped.op == ida_hexrays.cot_var
+                                and arg_unwrapped.v.idx in self._found_vars)
+                        ):
                             self._record_call_usage(expr, idx)
 
         except Exception as e:
@@ -1525,6 +1831,178 @@ def _infer_type_and_confidence(evidence: dict) -> tuple[str, float]:
     return "void*", 0.20
 
 
+def _build_field_profile(field_accesses: list[dict]) -> dict[str, dict]:
+    """Aggregate field accesses into a per-offset profile.
+
+    Output: ``{ "0x18": { reads, writes, max_size, min_size, function_count } }``
+
+    The ``function_count`` field is the killer signal for RE work: an offset
+    accessed from 5 different functions is much stronger evidence than 50
+    accesses all in one function. Sorted by offset for stable iteration.
+    """
+    by_offset: dict[int, dict] = {}
+    for fa in field_accesses:
+        off = fa.get("offset", 0)
+        if off not in by_offset:
+            by_offset[off] = {
+                "reads": 0,
+                "writes": 0,
+                "max_size": 0,
+                "min_size": None,
+                "_funcs": set(),
+            }
+        slot = by_offset[off]
+        if fa.get("is_write"):
+            slot["writes"] += 1
+        else:
+            slot["reads"] += 1
+        sz = fa.get("access_size", 0) or 0
+        slot["max_size"] = max(slot["max_size"], sz)
+        slot["min_size"] = sz if slot["min_size"] is None else min(slot["min_size"], sz)
+        fea = fa.get("func_ea")
+        if fea:
+            slot["_funcs"].add(fea)
+
+    out: dict[str, dict] = {}
+    for off in sorted(by_offset.keys()):
+        s = by_offset[off]
+        out[f"0x{off:X}"] = {
+            "reads": s["reads"],
+            "writes": s["writes"],
+            "max_size": s["max_size"],
+            "min_size": s["min_size"] or 0,
+            "function_count": len(s["_funcs"]),
+        }
+    return out
+
+
+def _build_confidence_breakdown(evidence: dict, inferred_type: str, confidence: float) -> list[dict]:
+    """Decompose the final confidence score into named factors.
+
+    Each entry: ``{kind, detail, contribution}``. The sum of contributions
+    won't equal ``confidence`` exactly because ``_infer_type_and_confidence``
+    multiplies and caps — this list exposes the *inputs* to that scoring,
+    letting analysts see *why* a number was chosen.
+    """
+    field_accesses = evidence.get("field_accesses", [])
+    call_usages = evidence.get("call_usages", [])
+    malloc_origin = evidence.get("malloc_origin")
+    stored_in = evidence.get("stored_in", [])
+
+    factors: list[dict] = []
+
+    # API matches — highest-priority signal in _infer_type_and_confidence
+    matched_apis: list[str] = []
+    for cu in call_usages:
+        callee = (cu.get("callee_name") or "").lower()
+        for api_name in _KNOWN_API_TYPES:
+            if api_name in callee:
+                matched_apis.append(api_name)
+                break
+    if matched_apis:
+        factors.append({
+            "kind": "api_match",
+            "detail": f"argument to {', '.join(sorted(set(matched_apis)))}",
+            "contribution": 0.90,
+        })
+
+    # Field-access count + coverage
+    if field_accesses:
+        offsets = {fa.get("offset", 0) for fa in field_accesses}
+        funcs = {fa.get("func_ea") for fa in field_accesses if fa.get("func_ea")}
+        factors.append({
+            "kind": "field_accesses",
+            "detail": f"{len(offsets)} distinct offsets across {len(funcs)} functions",
+            "contribution": min(0.50 + len(offsets) * 0.12, 0.95),
+        })
+
+    # Malloc origin boost
+    if malloc_origin:
+        factors.append({
+            "kind": "malloc_origin",
+            "detail": f"allocated via {malloc_origin.get('allocator', '?')}",
+            "contribution": 0.10,
+        })
+
+    # Stored-in evidence (informational; doesn't bump confidence yet)
+    if stored_in:
+        containers = {s.get("container_expr", "?") for s in stored_in}
+        factors.append({
+            "kind": "stored_in",
+            "detail": (
+                f"appears as rvalue stored into {len(stored_in)} field(s) of "
+                f"{len(containers)} container(s) — target is value-held, not a struct base"
+            ),
+            "contribution": 0.0,
+        })
+
+    if not factors:
+        factors.append({
+            "kind": "no_evidence",
+            "detail": "no field accesses, call usages, or malloc origin observed",
+            "contribution": 0.20,
+        })
+
+    return factors
+
+
+def _build_zero_fields_hint(diag: dict, samples: list[str], stored_in_count: int) -> str:
+    """Generate a diagnostic-aware hint when zero field accesses found.
+
+    Distinguishes four failure modes:
+    1. Visitor never saw any pointer dereference → likely scalar / unused.
+    2. Target was stored INTO other structs → it's a value, not a base.
+    3. Visitor saw many memptrs but rejected the bases → alias-tracking gap.
+    4. Mixed signals → generic fallback.
+
+    Without this kind of hint, a zero result is indistinguishable from a tool
+    failure — the analyst can't tell whether to give up, change input, or
+    file a bug.
+    """
+    asg_seen = diag.get("asg_memptr_seen", 0)
+    read_seen = diag.get("read_memptr_seen", 0) + diag.get("read_ptr_seen", 0)
+    seen_total = asg_seen + read_seen
+    rejected_total = (
+        diag.get("asg_memptr_base_mismatch", 0)
+        + diag.get("read_memptr_base_mismatch", 0)
+        + diag.get("read_ptr_base_mismatch", 0)
+    )
+
+    if stored_in_count > 0:
+        return (
+            f"Target was *stored into* {stored_in_count} struct field(s) but "
+            f"is never used as a struct base itself. It's a value held by "
+            f"another struct (likely a pointer/scalar field). See `stored_in` "
+            f"for the containers; consider targeting THOSE for struct inference."
+        )
+
+    if seen_total == 0:
+        return (
+            "Visitor saw no pointer dereferences involving this target. "
+            "Likely a scalar (int/char), an unused variable, or a value that "
+            "only flows through registers. Try a wider `max_depth` or verify "
+            "the target is referenced by the analyzed functions."
+        )
+
+    if rejected_total > 0 and rejected_total == seen_total:
+        sample_hint = f" Sample bases: {samples[:3]}." if samples else ""
+        return (
+            f"Visitor saw {seen_total} dereferences but rejected every base. "
+            f"The target is referenced but never used as the *base* of a field "
+            f"access — most likely accesses go through a local copy obtained "
+            f"via a function call or a struct-of-target relationship.{sample_hint}"
+        )
+
+    if rejected_total > 0:
+        return (
+            f"Saw {seen_total} dereferences ({seen_total - rejected_total} matched, "
+            f"{rejected_total} rejected) but no offsets accumulated. Decode may "
+            f"have skipped offset extraction — check `diag.read_ptr_decompose_failed`."
+        )
+
+    return "No field-access evidence collected. The target may not be a struct base."
+
+
 def _collect_xref_functions(target_ea: int, direction: str, max_depth: int, max_funcs: int) -> set[int]:
     """Collect function EAs that xref target_ea, up to max_depth hops."""
     result: set[int] = set()
@@ -1603,11 +2081,28 @@ def type_propagate(
     - "both": collect evidence from both directions
 
     Evidence collected:
-    - Field accesses (cot_memptr / cot_memref): offset, access size, read/write
+    - Field accesses (cot_memptr / cot_memref / cot_ptr / cot_idx): offset, access size, read/write
     - Call arguments: which known API functions receive the target
     - Malloc origins: whether target is assigned from malloc/calloc/realloc
 
     Confidence is derived from the diversity and strength of evidence.
+
+    Limitations:
+    - The target must be the *base* of the field access, not a *stored value*.
+      ``*(T*)(other_ptr + N) = target`` records a write to ``other_ptr``'s
+      struct, not to ``target`` — so a ``char*`` global stored inside a struct
+      field will report zero field accesses for itself.
+    - Aliases through call returns are not tracked. ``v8 = sub_X(...); v8->f = ...``
+      only finds the write if you target the struct pointer, not if you target
+      something the struct happens to *contain*.
+    - Only compile-time-constant offsets are captured. Variable-stride array
+      indexing (``ptr[i]`` with non-constant ``i``) is skipped.
+
+    When zero field accesses are returned, each ``functions_analyzed`` entry
+    includes a ``diag`` dict and (when applicable) ``rejected_base_samples``
+    to show *why* — useful for distinguishing "never saw a memptr" (target
+    isn't a struct base) from "saw memptrs but the base wasn't recognized"
+    (alias-tracking gap or unexpected ctree wrapping).
     """
     try:
         if not ida_hexrays.init_hexrays_plugin():
@@ -1676,8 +2171,11 @@ def type_propagate(
                 "address": address,
                 "inferred_type": "unknown",
                 "confidence": 0.0,
+                "confidence_breakdown": [],
                 "field_accesses": [],
+                "field_profile": {},
                 "call_usages": [],
+                "stored_in": [],
                 "propagation_path": [],
                 "functions_analyzed": [],
                 "suggested_struct_name": None,
@@ -1689,11 +2187,16 @@ def type_propagate(
         all_evidence = {
             "field_accesses": [],
             "call_usages": [],
+            "stored_in": [],
             "malloc_origin": None,
             "assignments": [],
         }
         functions_analyzed: list[dict] = []
         propagation_path: list[PropagationStep] = []
+        # Aggregate the visitor's diag counters across functions so we can
+        # produce a coherent zero-fields explanation at the end.
+        aggregated_diag: dict[str, int] = {}
+        aggregated_samples: list[str] = []
 
         for fea in func_eas:
             func_name = ida_funcs.get_func_name(fea) or hex(fea)
@@ -1727,9 +2230,17 @@ def type_propagate(
 
             all_evidence["field_accesses"].extend(collector.field_accesses)
             all_evidence["call_usages"].extend(collector.call_usages)
+            all_evidence["stored_in"].extend(collector.stored_in)
             if collector.malloc_origin and all_evidence["malloc_origin"] is None:
                 all_evidence["malloc_origin"] = collector.malloc_origin
             all_evidence["assignments"].extend(collector.assignments)
+
+            # Roll up diagnostic counters and sample bases for the final hint.
+            for k, v in collector._diag.items():
+                aggregated_diag[k] = aggregated_diag.get(k, 0) + v
+            for sample in collector._base_mismatch_samples:
+                if sample not in aggregated_samples and len(aggregated_samples) < 5:
+                    aggregated_samples.append(sample)
 
             # Build propagation path entries
             for fa in collector.field_accesses:
@@ -1756,14 +2267,33 @@ def type_propagate(
                     "kind": "malloc",
                     "detail": f"assigned from {collector.malloc_origin['allocator']}",
                 })
+            for si in collector.stored_in:
+                propagation_path.append({
+                    "ea": si["ea"],
+                    "func_ea": si["func_ea"],
+                    "func_name": si["func_name"],
+                    "kind": "stored_in",
+                    "detail": f"stored at offset=0x{si['offset']:X} of {si['container_expr']} (size={si['access_size']})",
+                })
 
-            functions_analyzed.append({
+            # Build per-function entry. When zero field accesses were
+            # collected, also include diagnostic counters + rejected-base
+            # samples — these are the only signal a caller has for whether
+            # the visitor never saw a memptr ("target isn't really a struct
+            # base") versus saw plenty of them but rejected the base ("alias
+            # tracking gap").
+            entry: dict = {
                 "func_ea": hex(fea),
                 "func_name": func_name,
                 "decompiled": True,
                 "field_access_count": len(collector.field_accesses),
                 "call_usage_count": len(collector.call_usages),
-            })
+            }
+            if len(collector.field_accesses) == 0:
+                entry["diag"] = dict(collector._diag)
+                if collector._base_mismatch_samples:
+                    entry["rejected_base_samples"] = list(collector._base_mismatch_samples)
+            functions_analyzed.append(entry)
 
         # Deduplicate propagation path by (ea, kind, detail)
         seen_path = set()
@@ -1778,15 +2308,24 @@ def type_propagate(
         # Infer type
         inferred_type, confidence = _infer_type_and_confidence(all_evidence)
 
-        # Detect code-pointer globals (no field accesses, but target is in a function)
+        # Diagnostic-aware hinting: when zero field accesses are found,
+        # explain WHY using the aggregated visitor counters.
         hint_msg: str | None = None
-        if not all_evidence["field_accesses"] and target_global_ea is not None:
-            if ida_funcs.get_func(target_global_ea):
+        if not all_evidence["field_accesses"]:
+            if target_global_ea is not None and ida_funcs.get_func(target_global_ea):
                 inferred_type = "void*"
                 confidence = 0.30
-                hint_msg = "Target address is a function entry point, not a data variable. Use 'forward' direction to trace where this function pointer flows, or target a global data variable instead."
-            elif not all_evidence["call_usages"] and not all_evidence["malloc_origin"]:
-                hint_msg = "No type evidence found. The target may be an unused variable, a scalar integer, or may require a larger max_depth/max_functions to find referencing functions."
+                hint_msg = (
+                    "Target address is a function entry point, not a data variable. "
+                    "Use 'forward' direction to trace where this function pointer flows, "
+                    "or target a global data variable instead."
+                )
+            else:
+                hint_msg = _build_zero_fields_hint(
+                    aggregated_diag,
+                    aggregated_samples,
+                    len(all_evidence["stored_in"]),
+                )
 
         # Build struct if requested
         suggested_struct_name = None
@@ -1822,13 +2361,22 @@ def type_propagate(
             except Exception as e:
                 logger.warning("type_propagate: apply_type failed for %s: %s", inferred_type, e)
 
+        # Build aggregated outputs that make raw evidence usable.
+        field_profile = _build_field_profile(all_evidence["field_accesses"])
+        confidence_breakdown = _build_confidence_breakdown(
+            all_evidence, inferred_type, confidence
+        )
+
         result: dict = {
             "ok": True,
             "address": address,
             "inferred_type": inferred_type,
             "confidence": round(confidence, 3),
+            "confidence_breakdown": confidence_breakdown,
             "field_accesses": all_evidence["field_accesses"],
+            "field_profile": field_profile,
             "call_usages": all_evidence["call_usages"],
+            "stored_in": all_evidence["stored_in"],
             "propagation_path": propagation_path,
             "functions_analyzed": functions_analyzed,
             "suggested_struct_name": suggested_struct_name,

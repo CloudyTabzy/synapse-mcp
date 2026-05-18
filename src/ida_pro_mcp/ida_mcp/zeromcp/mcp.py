@@ -1062,17 +1062,23 @@ class McpServer:
 
         # list[T]
         if origin is list:
-            return {
-                "type": "array",
-                "items": self._type_to_json_schema(get_args(py_type)[0]),
-            }
+            args = get_args(py_type)
+            if args:
+                return {
+                    "type": "array",
+                    "items": self._type_to_json_schema(args[0]),
+                }
+            return {"type": "array"}
 
         # dict[str, T]
         if origin is dict:
-            return {
-                "type": "object",
-                "additionalProperties": self._type_to_json_schema(get_args(py_type)[1]),
-            }
+            args = get_args(py_type)
+            if len(args) >= 2:
+                return {
+                    "type": "object",
+                    "additionalProperties": self._type_to_json_schema(args[1]),
+                }
+            return {"type": "object"}
 
         # TypedDict
         if is_typeddict(py_type):
@@ -1093,7 +1099,21 @@ class McpServer:
 
     def _typed_dict_to_schema(self, typed_dict_class) -> dict:
         """Convert TypedDict to JSON schema"""
-        hints = get_type_hints(typed_dict_class, include_extras=True)
+        try:
+            hints = get_type_hints(typed_dict_class, include_extras=True)
+        except Exception as e:
+            # get_type_hints can fail when forward references in nested
+            # TypedDicts cannot be resolved (e.g. due to module reloads or
+            # functools.wraps changing the evaluation namespace). Fall back
+            # to the raw __annotations__ dict so we still generate a schema
+            # rather than silently dropping the tool or missing fields.
+            logger.warning(
+                "[MCP] get_type_hints failed for %s: %s. Falling back to __annotations__.",
+                typed_dict_class.__name__,
+                e,
+            )
+            hints = dict(getattr(typed_dict_class, '__annotations__', {}))
+
         required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
 
         return {

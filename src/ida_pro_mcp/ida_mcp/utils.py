@@ -472,6 +472,7 @@ class Import(TypedDict, total=False):
     addr: str
     imported_name: str
     module: str
+    ordinal: NotRequired[int]
 
 
 class String(TypedDict):
