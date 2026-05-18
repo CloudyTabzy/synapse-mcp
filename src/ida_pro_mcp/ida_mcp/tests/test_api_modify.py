@@ -17,6 +17,9 @@ from ..api_modify import (
     define_func,
     define_code,
     undefine,
+    analyze_range,
+    scan_and_define_funcs,
+    add_xref,
 )
 from ..api_memory import get_bytes, patch
 from ..api_core import lookup_funcs
@@ -394,14 +397,17 @@ def test_define_undefine_func_roundtrip():
 
 
 @test()
-def test_define_func_already_exists():
-    """define_func reports an already-exists error on an existing function."""
+def test_define_func_already_exists_is_success():
+    """define_func on an existing function succeeds with existed=True (not an error)."""
     fn_addr = get_any_function()
     if not fn_addr:
         skip_test("binary has no functions")
 
     result = define_func({"addr": fn_addr})[0]
-    assert_error(result, contains="already exists")
+    assert "error" not in result, f"Expected success, got error: {result.get('error')}"
+    assert result.get("existed") is True, "Expected existed=True for pre-existing function"
+    assert "start" in result
+    assert "end" in result
 
 
 @test()
@@ -482,6 +488,151 @@ def test_undefine_batch():
         result = undefine([{"addr": hex(start_ea), "end": hex(end_ea)}])
         assert_is_list(result, min_length=1)
         assert "error" not in result[0]
+    finally:
+        if idaapi.get_func(start_ea) is None:
+            define_code({"addr": hex(start_ea)})
+            define_func({"addr": hex(start_ea), "end": hex(end_ea)})
+
+
+# ============================================================================
+# analyze_range tests
+# ============================================================================
+
+
+@test(binary="crackme03.elf")
+def test_analyze_range_returns_ok():
+    """analyze_range on a valid code range returns ok=True and function count."""
+    import idaapi
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+    result = analyze_range(hex(func.start_ea), hex(func.end_ea))
+    assert result.get("ok") is True, f"Expected ok=True, got: {result}"
+    assert "functions_in_range" in result
+    assert result["functions_in_range"] >= 1
+
+
+@test()
+def test_analyze_range_invalid_bounds():
+    """analyze_range rejects end <= start with a structured error."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = analyze_range(fn_addr, fn_addr)
+    assert result.get("ok") is False
+    assert "error" in result
+
+
+# ============================================================================
+# scan_and_define_funcs tests
+# ============================================================================
+
+
+@test(binary="crackme03.elf")
+def test_scan_and_define_funcs_on_existing_region():
+    """scan_and_define_funcs on an already-analysed range reports ok and skips existing functions."""
+    import idaapi
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+    result = scan_and_define_funcs(hex(func.start_ea), hex(func.end_ea), force=False)
+    assert result.get("ok") is True, f"Expected ok=True, got: {result}"
+    assert "created_count" in result
+    assert "failed_count" in result
+
+
+@test()
+def test_scan_and_define_funcs_invalid_bounds():
+    """scan_and_define_funcs rejects end <= start."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    result = scan_and_define_funcs(fn_addr, fn_addr)
+    assert result.get("ok") is False
+    assert "error" in result
+
+
+# ============================================================================
+# add_xref tests
+# ============================================================================
+
+
+@test(binary="crackme03.elf")
+def test_add_xref_call_and_verify():
+    """add_xref registers a user-defined call xref that xrefs_to can find."""
+    import idaapi
+    import ida_xref
+    from ..api_analysis import xrefs_to
+
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+
+    frm_ea = func.start_ea
+    to_ea = func.end_ea - 1
+    frm_hex = hex(frm_ea)
+    to_hex = hex(to_ea)
+
+    try:
+        result = add_xref({"from": frm_hex, "to": to_hex, "type": "call"})
+        assert_is_list(result, min_length=1)
+        item = result[0]
+        assert "error" not in item, f"add_xref failed: {item.get('error')}"
+        assert item.get("ok") is True
+
+        xref_result = xrefs_to(to_hex)[0]
+        frm_addrs = [x["addr"] for x in (xref_result.get("xrefs") or [])]
+        assert frm_hex in frm_addrs, f"Expected {frm_hex} in xrefs_to result, got {frm_addrs}"
+    finally:
+        ida_xref.del_cref(frm_ea, to_ea, 0)
+
+
+@test()
+def test_add_xref_invalid_address():
+    """add_xref returns a structured error for an invalid address."""
+    result = add_xref({"from": "0xdeadbeefdeadbeef0", "to": "0x1234", "type": "call"})
+    assert_is_list(result, min_length=1)
+    assert "error" in result[0]
+
+
+# ============================================================================
+# define_func hint / force tests
+# ============================================================================
+
+
+@test(binary="crackme03.elf")
+def test_define_func_fail_returns_hint():
+    """define_func failure includes a hint explaining why IDA refused."""
+    import idaapi
+
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+
+    # Pick an interior address of an existing function — add_func should refuse
+    interior = func.start_ea + 1
+    result = define_func({"addr": hex(interior)})[0]
+    # Either it already succeeded (interior happens to be a func head) or failed with hint
+    if "error" in result:
+        assert "hint" in result, "define_func failure must include a hint field"
+
+
+@test(binary="crackme03.elf")
+def test_define_func_force_roundtrip():
+    """define_func with force=True re-analyses then recreates a function."""
+    import idaapi
+
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+
+    start_ea, end_ea = func.start_ea, func.end_ea
+    try:
+        undefine({"addr": hex(start_ea), "end": hex(end_ea)})
+        result = define_func({"addr": hex(start_ea), "end": hex(end_ea), "force": True})[0]
+        assert "error" not in result, f"force define_func failed: {result.get('error')} hint={result.get('hint')}"
+        recreated = idaapi.get_func(start_ea)
+        assert recreated is not None
     finally:
         if idaapi.get_func(start_ea) is None:
             define_code({"addr": hex(start_ea)})

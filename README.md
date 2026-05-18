@@ -312,6 +312,25 @@ triton_get_path_constraints()
 triton_solve_path_constraints(timeout_ms=30000)
 ```
 
+### Workflow 5: Encrypted Section Unpacking
+For packed/encrypted sections where IDA skipped auto-analysis.
+```
+# 1. Run the target in IDA's debugger until the decryption stub completes
+dbg_run_to(address="0x412000")     # run to post-decrypt point
+  ↓
+# 2. Sync live decrypted bytes from the debugger into the IDB
+sync_debugger_to_idb(start="0x401000", end="0x412000", analyze=True)
+  ↓
+# 3. Create IDA functions for all newly disassembled code
+scan_and_define_funcs(start="0x401000", end="0x412000", force=True)
+  ↓
+# 4. Query cross-references — they now resolve correctly
+xrefs_to(addr="0x4010A0")
+  ↓
+# 5. For indirect/obfuscated calls, add explicit xrefs
+add_xref([{"from": "0x4011F2", "to": "0x4010A0", "type": "call"}])
+```
+
 ---
 
 ## 📋 Prerequisites
@@ -413,11 +432,12 @@ _Note:_ Headless `idalib-mcp` requires [idalib](https://docs.hex-rays.com/core/i
 | **Search** | `find_bytes`, `find_immediate`, `find_regex`, `search_text`, `scan_signature` |
 | **Memory** | `get_bytes`, `get_int`, `get_string`, `get_global_value`, `patch`, `put_int` |
 | **Types** | `declare_type`, `apply_type_batch`, `infer_type`, `read_struct`, `search_structs` |
-| **Mutation** | `rename`, `set_comments`, `patch_asm`, `define_func`, `define_code`, `undefine` |
+| **Mutation** | `rename`, `set_comments`, `patch_asm`, `define_func`, `define_code`, `undefine`, `add_xref` |
+| **Analysis control** | `analyze_range`, `scan_and_define_funcs` |
 | **Stack** | `stack_frame`, `declare_stack`, `delete_stack` |
 | **Signatures** | `make_signature`, `scan_signature`, `apply_flirt_signature`, `load_type_library` |
 | **Python** | `py_eval`, `py_exec_file` (`@unsafe`) |
-| **Debugger** | `dbg_start`, `dbg_run_to`, `dbg_add_bp`, `dbg_regs`, `dbg_stacktrace` (`?ext=dbg`) |
+| **Debugger** | `dbg_start`, `dbg_run_to`, `dbg_add_bp`, `dbg_regs`, `dbg_stacktrace`, `sync_debugger_to_idb` (`?ext=dbg`) |
 
 **Design principles:**
 - ✅ **Structured returns** — every tool returns `{"ok": true/false, ...}`

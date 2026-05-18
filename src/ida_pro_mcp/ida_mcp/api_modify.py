@@ -15,7 +15,6 @@ import ida_xref
 
 from .compat import tinfo_get_udm
 import ida_nalt
-import ida_xref
 
 from .rpc import tool, unsafe
 from .sync import idasync, IDAError
@@ -1043,14 +1042,32 @@ def scan_and_define_funcs(
         return tool_error(e, "scan_and_define_funcs")
 
 
+_XREF_CREFS = {
+    "call":       ida_xref.fl_CN,
+    "call_near":  ida_xref.fl_CN,
+    "call_far":   ida_xref.fl_CF,
+    "jump":       ida_xref.fl_JN,
+    "jump_near":  ida_xref.fl_JN,
+    "jump_far":   ida_xref.fl_JF,
+    "flow":       ida_xref.fl_F,
+}
+_XREF_DREFS = {
+    "data_read":   ida_xref.dr_R,
+    "data_write":  ida_xref.dr_W,
+    "data_offset": ida_xref.dr_O,
+}
+_XREF_VALID = sorted(_XREF_CREFS) + sorted(_XREF_DREFS)
+
+
 @unsafe
 @tool
 @idasync
 def add_xref(
     items: Annotated[
         list[dict] | dict,
-        "List of {from, to, type} dicts. type: 'call' (default), 'jump', 'call_far', "
-        "'jump_far', 'data_read', 'data_write'",
+        "List of {from, to, type} dicts. "
+        "type (default 'call'): call/call_near, call_far, jump/jump_near, jump_far, "
+        "flow, data_read, data_write, data_offset",
     ],
 ) -> list[XrefItem]:
     """Manually add cross-references between addresses.
@@ -1074,19 +1091,12 @@ def add_xref(
             frm_ea = parse_address(frm_str)
             to_ea = parse_address(to_str)
 
-            if xref_type in ("call", "call_near"):
-                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_CN | ida_xref.XREF_USER)
-            elif xref_type in ("jump", "jump_near"):
-                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_JN | ida_xref.XREF_USER)
-            elif xref_type == "call_far":
-                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_CF | ida_xref.XREF_USER)
-            elif xref_type == "jump_far":
-                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_JF | ida_xref.XREF_USER)
-            elif xref_type == "data_write":
-                ok = ida_xref.add_dref(frm_ea, to_ea, ida_xref.dr_W | ida_xref.XREF_USER)
+            if xref_type in _XREF_CREFS:
+                ok = ida_xref.add_cref(frm_ea, to_ea, _XREF_CREFS[xref_type] | ida_xref.XREF_USER)
+            elif xref_type in _XREF_DREFS:
+                ok = ida_xref.add_dref(frm_ea, to_ea, _XREF_DREFS[xref_type] | ida_xref.XREF_USER)
             else:
-                # data_read and anything unrecognised
-                ok = ida_xref.add_dref(frm_ea, to_ea, ida_xref.dr_R | ida_xref.XREF_USER)
+                raise ValueError(f"Unknown xref type '{xref_type}'. Valid: {_XREF_VALID}")
 
             results.append({"frm": hex(frm_ea), "to": hex(to_ea), "type": xref_type, "ok": ok})
         except Exception as e:
@@ -1174,77 +1184,6 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[DefineResult]:
             results.append({"addr": addr_str, **item_error(e, f"undefine at {addr_str}")})
 
     return results
-
-
-# ============================================================================
-# Xref creation
-# ============================================================================
-
-
-class AddXrefResult(TypedDict, total=False):
-    ok: bool
-    from_addr: str
-    to_addr: str
-    xref_type: str
-    error: str
-
-
-_CODE_XREF_TYPES = {
-    "call_near":  ida_xref.fl_CN,
-    "call_far":   ida_xref.fl_CF,
-    "jump_near":  ida_xref.fl_JN,
-    "jump_far":   ida_xref.fl_JF,
-    "flow":       ida_xref.fl_F,
-}
-_DATA_XREF_TYPES = {
-    "data_offset": ida_xref.dr_O,
-    "data_read":   ida_xref.dr_R,
-    "data_write":  ida_xref.dr_W,
-}
-
-
-@unsafe
-@tool
-@idasync
-def add_xref(
-    from_addr: Annotated[str, "Source address of the cross-reference"],
-    to_addr: Annotated[str, "Target address of the cross-reference"],
-    xref_type: Annotated[
-        str,
-        "Reference type. Code: 'call_near', 'call_far', 'jump_near', 'jump_far', 'flow'. "
-        "Data: 'data_offset', 'data_read', 'data_write'. Default: 'call_near'.",
-    ] = "call_near",
-) -> AddXrefResult:
-    """Add a user-defined cross-reference between two addresses.
-
-    User xrefs (XREF_USER flag) persist across IDA reanalysis unlike
-    auto-generated ones. Incorrect xrefs corrupt analysis — use with care.
-    """
-    try:
-        frm = parse_address(from_addr)
-        to  = parse_address(to_addr)
-        xtype = xref_type.lower().strip()
-
-        if xtype in _CODE_XREF_TYPES:
-            ok = ida_xref.add_cref(frm, to, _CODE_XREF_TYPES[xtype] | ida_xref.XREF_USER)
-        elif xtype in _DATA_XREF_TYPES:
-            ok = ida_xref.add_dref(frm, to, _DATA_XREF_TYPES[xtype] | ida_xref.XREF_USER)
-        else:
-            valid = list(_CODE_XREF_TYPES) + list(_DATA_XREF_TYPES)
-            return {"ok": False, "error": f"Unknown xref_type '{xref_type}'. Valid: {valid}"}
-
-        if not ok:
-            return {
-                "ok": False,
-                "from_addr": from_addr,
-                "to_addr": to_addr,
-                "error": "IDA rejected the xref (addresses may be invalid or xref already exists)",
-            }
-
-        return {"ok": True, "from_addr": hex(frm), "to_addr": hex(to), "xref_type": xtype}
-
-    except Exception as e:
-        return tool_error(e, "add_xref")
 
 
 # ============================================================================

@@ -17,10 +17,10 @@ Core API modules (upstream + enhanced):
 - `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling
 - `api_memory.py`: bytes/ints/strings read and patch, typed integer I/O
 - `api_types.py`: structs, type inference, type application, enum management
-- `api_modify.py`: comments, renaming, asm patching, function definition, xref creation
+- `api_modify.py`: comments, renaming, asm patching, function definition, forced range analysis (`analyze_range`), bulk function creation (`scan_and_define_funcs`), user xref creation (`add_xref`)
 - `api_stack.py`: stack frame operations
 - `api_sigmaker.py`: signature creation, scanning, xref-based signature generation
-- `api_debug.py`: debugger control, unsafe / low priority for tests
+- `api_debug.py`: debugger control, breakpoints, `sync_debugger_to_idb` (live memory → IDB patch + analysis), unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://`, `triton://`, `miasm://` MCP resources
 - `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection

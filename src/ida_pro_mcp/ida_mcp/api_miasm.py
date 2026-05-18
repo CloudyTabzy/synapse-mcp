@@ -60,6 +60,15 @@ class _MiasmManager:
         self._is_be: bool = False
         self._procname: str = ""
 
+    # Miasm architecture strings supported by this plugin.
+    _SUPPORTED_ARCHS = (
+        "x86_32", "x86_64",
+        "arml", "armb",
+        "aarch64l", "aarch64b",
+        "mips32l", "mips32b",
+        "ppc32b",
+    )
+
     def _detect_arch_from_ida(self) -> tuple[str, int, bool, str]:
         """Return (miasm_arch_str, bitness, is_big_endian, procname)."""
         procname = compat.inf_get_procname().lower()
@@ -73,17 +82,30 @@ class _MiasmManager:
         else:
             bits = 16
 
-        if procname.startswith("metapc") or procname.startswith("80"):
-            # x86 is always little-endian — Miasm doesn't expose big-endian x86
+        # x86 / x86-64 — IDA uses several procname variants across versions
+        _X86_PREFIXES = ("metapc", "80", "x86", "ia-32", "ia32", "i386", "i486", "i586", "i686")
+        if any(procname.startswith(p) for p in _X86_PREFIXES):
+            # Miasm x86 is always little-endian
             arch = f"x86_{bits}"
+        # AArch64 — IDA 8.x uses "arm", IDA 9.x may use "aarch64"
+        elif procname in ("aarch64", "arm64", "arm64e", "arm64eb") or (
+            procname.startswith("arm") and bits == 64
+        ):
+            arch = f"aarch64{endian_suffix}"
         elif procname.startswith("arm"):
-            arch = f"aarch64{endian_suffix}" if bits == 64 else f"arm{endian_suffix}"
+            arch = f"arm{endian_suffix}"
         elif procname.startswith("mips"):
             arch = f"mips32{endian_suffix}"
-        elif procname.startswith("ppc"):
+        elif procname.startswith("ppc") or procname.startswith("powerpc"):
             arch = f"ppc32{endian_suffix}"
         else:
-            raise IDAError(f"Unsupported architecture for Miasm: {procname!r}")
+            supported_str = ", ".join(self._SUPPORTED_ARCHS)
+            raise IDAError(
+                f"Unsupported architecture for Miasm: IDA procname={procname!r}, "
+                f"bitness={bits}. "
+                f"Call miasm_init(arch=X) with one of: {supported_str}. "
+                f"Tip: for 32-bit x86 use arch='x86_32', for 64-bit use arch='x86_64'."
+            )
 
         return arch, bits, is_be, procname
 
@@ -373,7 +395,13 @@ def miasm_get_context_info() -> dict:
                 "note": "Machine not yet built. First Miasm call auto-syncs, or call miasm_init explicitly.",
             }
         except IDAError as e:
-            return {**tool_error(e), "initialized": False, "miasm_version": miasm_version}
+            return {
+                **tool_error(e),
+                "initialized": False,
+                "miasm_version": miasm_version,
+                "supported_arch_overrides": list(_manager._SUPPORTED_ARCHS),
+                "tip": "Call miasm_init(arch=X) with one of the supported_arch_overrides values.",
+            }
 
     machine = _manager.machine
     return {

@@ -19,6 +19,9 @@ import ida_idaapi
 import ida_kernwin
 import ida_name
 import idaapi
+import ida_bytes
+import ida_auto
+import idautils
 
 from .rpc import tool, unsafe, ext
 from .sync import idasync, keep_batch, get_pre_call_batch, IDAError
@@ -1091,3 +1094,84 @@ def dbg_attach_pid(
 
     except Exception as e:
         return {**tool_error(e, "get debug state"), "state": "error"}
+
+
+# ============================================================================
+# Debugger: sync live memory into the IDA database
+# ============================================================================
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def sync_debugger_to_idb(
+    start: Annotated[str, "Start address of the range to sync from live process memory"],
+    end: Annotated[str, "End address (exclusive) of the range to sync"],
+    analyze: Annotated[
+        bool,
+        "After patching, run plan_and_wait on the range so IDA disassembles "
+        "and builds xrefs for the newly synced bytes (default: True)",
+    ] = True,
+) -> dict:
+    """Read a range of bytes from the live debugger process and patch them into the IDA database.
+
+    This is the key tool for encrypted/packed sections: run the target under
+    IDA's debugger until the section is decrypted in memory, then call this
+    tool to capture the decrypted bytes into the IDB. Once patched, ``analyze``
+    triggers ``plan_and_wait`` so that ``xrefs_to``, ``define_func``, and
+    decompilation work on the real code.
+
+    Workflow for encrypted sections:
+    1. Load the binary in IDA and attach the debugger.
+    2. Run until the section is decrypted (breakpoint on the decryption stub's RET).
+    3. Call ``sync_debugger_to_idb(start, end)``.
+    4. Call ``scan_and_define_funcs(start, end)`` to define functions.
+    5. Use ``xrefs_to`` / ``analyze_batch`` normally.
+
+    Requires: active debugger session (dbg_run or dbg_attach_pid first).
+    """
+    try:
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            return {"ok": False, "error": "end must be greater than start", "error_type": "invalid_input"}
+
+        dbg_ensure_active()
+
+        size = end_ea - start_ea
+        data = idaapi.dbg_read_memory(start_ea, size)
+        if not data:
+            return {
+                "ok": False,
+                "error": f"dbg_read_memory failed for {hex(start_ea)}–{hex(end_ea)}. "
+                         "Ensure the debugger is suspended (not running) and the address "
+                         "is mapped in the target process.",
+                "error_type": "not_found",
+            }
+
+        # Patch the bytes into the IDA database
+        ida_bytes.patch_bytes(start_ea, bytes(data))
+
+        functions_before = sum(1 for _ in idautils.Functions(start_ea, end_ea))
+        if analyze:
+            ida_auto.plan_and_wait(start_ea, end_ea)
+        functions_after = sum(1 for _ in idautils.Functions(start_ea, end_ea))
+
+        return {
+            "ok": True,
+            "start": hex(start_ea),
+            "end": hex(end_ea),
+            "bytes_synced": len(data),
+            "analyzed": analyze,
+            "functions_before": functions_before,
+            "functions_after": functions_after,
+            "new_functions": functions_after - functions_before,
+            "note": (
+                "Bytes patched into IDB from live process. "
+                + ("IDA analysis complete — xrefs_to and define_func should now work. " if analyze else "")
+                + "Call scan_and_define_funcs to batch-define any remaining functions."
+            ),
+        }
+    except Exception as e:
+        return tool_error(e, "sync_debugger_to_idb")

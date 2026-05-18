@@ -144,10 +144,19 @@ def _parse_int_value(text: str, signed: bool, bits: int) -> int:
 def get_int(
     queries: Annotated[
         list[IntRead] | IntRead,
-        "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc",
+        "Integer read requests with {addr, ty}. "
+        "ty format: <sign><bits>[<endian>] — "
+        "sign: 'i' (signed) or 'u' (unsigned); "
+        "bits: 8, 16, 32, 64; "
+        "endian: 'le' (little, default) or 'be' (big). "
+        "Examples: i8, u8, i16, u16, i32, u32, i64, u64, "
+        "i16le, u16be, i32le, u32be, i64le, u64be.",
     ],
 ) -> list[IntReadResult]:
-    """Read integer values from memory addresses"""
+    """Read integer values from memory addresses.
+
+    ty examples: ``i8`` ``u8`` ``i16`` ``u16le`` ``u32be`` ``i64`` ``u64le``
+    """
     if isinstance(queries, dict):
         queries = [queries]
 
@@ -178,15 +187,26 @@ def get_int(
 @idasync
 def get_string(
     addrs: Annotated[list[str] | str, "Addresses to read strings from"],
+    max_length: Annotated[
+        int,
+        "Maximum string length in bytes (0 = IDA auto-detect, default). "
+        "Useful for truncating very long strings or reading fixed-length buffers.",
+    ] = 0,
 ) -> list[StringReadResult]:
-    """Read strings from memory addresses"""
+    """Read null-terminated strings from memory addresses.
+
+    Uses IDA's string literal detection by default (``max_length=0``).
+    Supply ``max_length`` to cap the result or to read from addresses where
+    IDA has not yet defined a string item.
+    """
     addrs = normalize_list_input(addrs)
+    ida_len = max_length if max_length > 0 else -1
     results = []
 
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            raw = idaapi.get_strlit_contents(ea, -1, 0)
+            raw = idaapi.get_strlit_contents(ea, ida_len, 0)
             if not raw:
                 results.append(
                     {"addr": addr, "value": None, "error": "No string at address"}

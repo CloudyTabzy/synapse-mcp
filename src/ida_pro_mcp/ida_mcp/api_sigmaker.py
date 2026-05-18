@@ -382,15 +382,19 @@ def scan_signature(
         "x64dbg format, or hex string. Use ? or ?? as wildcards.",
     ],
     max_results: Annotated[int, "Maximum number of match addresses to return (default 200)"] = 200,
+    count: Annotated[int | None, "Alias for max_results"] = None,
+    limit: Annotated[int | None, "Alias for max_results"] = None,
 ) -> ScanSignatureResult:
     """Scan the loaded binary for all occurrences of a byte pattern.
 
     Returns each matching address. Wildcards (? or ??) skip individual bytes.
+    Use ``count`` or ``limit`` as aliases for ``max_results``.
 
     Examples:
       'E8 ? ? ? ? 90'   — call followed by NOP
       'FF 25 ?? ?? ?? ??' — indirect jump (x64 style)
     """
+    cap = count if count is not None else (limit if limit is not None else max_results)
     try:
         if not pattern.strip():
             return {"ok": False, "error": "Pattern must not be empty"}
@@ -399,8 +403,8 @@ def scan_signature(
         results = searcher.search()
 
         all_matches = results.matches
-        truncated = len(all_matches) > max_results
-        matches = [{"addr": hex(m.address)} for m in all_matches[:max_results]]
+        truncated = len(all_matches) > cap
+        matches = [{"addr": hex(m.address)} for m in all_matches[:cap]]
 
         return {
             "ok": True,

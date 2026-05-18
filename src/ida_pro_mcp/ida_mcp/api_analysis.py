@@ -159,6 +159,7 @@ class XrefsToResult(TypedDict, total=False):
     addr: str
     xrefs: list[Xref] | None
     more: bool
+    note: str
     error: str
     error_type: str
     hint: str
@@ -1252,7 +1253,15 @@ def xrefs_to(
     addrs: Annotated[list[str] | str, "Addresses or function names to find cross-references to (e.g. '0x11a9', 'check_pw', 'main')"],
     limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
 ) -> list[XrefsToResult]:
-    """Return xrefs to address(es) or named symbols, capped per target with truncation flag."""
+    """Return xrefs to address(es) or named symbols, capped per target with truncation flag.
+
+    Empty results are expected for addresses in regions IDA has not analysed
+    (e.g. encrypted sections). In that case:
+    1. If the bytes are already decrypted in the IDB, call ``analyze_range``
+       to force IDA to build the xref database for the region, then retry.
+    2. If callers live in undefined code, use ``add_xref`` to register
+       user-defined xrefs that persist across reanalysis.
+    """
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 1000:
@@ -1262,9 +1271,10 @@ def xrefs_to(
 
     for addr in addrs:
         try:
+            ea = parse_address(addr)
             xrefs = []
             more = False
-            for xref in idautils.XrefsTo(parse_address(addr)):
+            for xref in idautils.XrefsTo(ea):
                 if len(xrefs) >= limit:
                     more = True
                     break
@@ -1275,7 +1285,24 @@ def xrefs_to(
                         fn=get_function(xref.frm, raise_error=False),
                     )
                 )
-            results.append({"addr": addr, "xrefs": xrefs, "more": more})
+            row: XrefsToResult = {"addr": addr, "xrefs": xrefs, "more": more}
+            if not xrefs:
+                import idc as _idc
+                flags = _idc.get_full_flags(ea)
+                if _idc.is_unknown(flags):
+                    row["note"] = (
+                        "No xrefs found and address is undefined. "
+                        "If bytes are decrypted in the IDB, call analyze_range first "
+                        "to build the xref database. "
+                        "If the caller is in undefined code, use add_xref to register it manually."
+                    )
+                else:
+                    row["note"] = (
+                        "No xrefs found. The address is defined but has no recorded callers. "
+                        "If callers exist in an unanalysed region, call analyze_range on that "
+                        "region first, or use add_xref to register user-defined xrefs."
+                    )
+            results.append(row)
         except Exception as e:
             results.append({"addr": addr, "xrefs": None, **item_error(e, f"xrefs to {addr}")})
 

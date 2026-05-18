@@ -2,6 +2,53 @@
 
 All notable changes to this fork of `ida-pro-mcp` are documented in this file.
 
+## [1.2.0] — 2026-05-18
+
+### Phase 6 — Field-Test Refinements (Encrypted-Region Workflow)
+
+Based on a field test report from an AI agent (MiniMax-M2.7) conducting real reverse-engineering work on a SecuROM DRM bypass.  The test exposed six categories of gaps; all are now addressed.
+
+#### New Tools
+
+##### `api_modify.py`
+
+| Tool | Description |
+|------|-------------|
+| `analyze_range(start, end)` | Force IDA to analyse an address range via `ida_auto.plan_and_wait`. Disassembles bytes, builds xrefs, defines data items. Essential before querying xrefs in encrypted/packed sections. |
+| `scan_and_define_funcs(start, end, force, del_items)` | Walk an address range and create IDA functions at all code heads. Optionally force-analyses first (`force=True`) and clears mis-typed data items (`del_items=True`). Returns `created_count`, `failed_count`, and per-address lists. |
+| `add_xref(items)` | Batch-create user cross-references tagged `XREF_USER` so they survive reanalysis. Types: `call`/`call_near`, `call_far`, `jump`/`jump_near`, `jump_far`, `flow`, `data_read`, `data_write`, `data_offset`. Replaces the Phase 3.8 single-param version. |
+
+##### `api_debug.py`
+
+| Tool | Description |
+|------|-------------|
+| `sync_debugger_to_idb(start, end, analyze)` | Read live debugger memory (`dbg_read_memory`) and patch it into the IDA database, then optionally run `plan_and_wait`. The complete one-call workflow for encrypted sections: run the target to the decrypt stub → call `sync_debugger_to_idb` → call `scan_and_define_funcs` → query `xrefs_to`. Marked `@unsafe @ext("dbg")`. |
+
+#### Enhanced Tools
+
+- **`define_func`** — `force=True` now calls `ida_auto.plan_and_wait(start, end)` before `add_func`, making function creation reliable in unanalysed regions. `del_items=True` (requires `force`) clears mis-typed bytes first. `existed: True` is returned (not an error) when the function already exists at the exact start address.
+- **`get_string`** — Added `max_length` parameter (default 0 = IDA auto-detect). Allows reading fixed-length buffers or truncating very long strings from addresses where IDA has not yet defined a string item.
+- **`get_int`** — Expanded `ty` parameter annotation documenting the full `<sign><bits>[<endian>]` format with all valid examples (`i8`, `u16be`, `i64le`, etc.).
+- **`xrefs_to`** — Added `note` field in the result when no xrefs are found. Explains whether the address is undefined (→ call `analyze_range` first) or defined-but-empty (→ callers may be in unanalysed code; use `analyze_range` or `add_xref`).
+- **`scan_signature`** — Added `count` and `limit` as aliases for `max_results` to match the naming convention used by other paginated tools.
+
+#### Bug Fixes
+
+- **`api_modify.py` — duplicate `add_xref`** — Two `add_xref` functions existed: the Phase 3.8 single-param version and the new batch version added in this phase. Only the last definition was registered by `@tool`. Resolved by removing the old single-param version; the batch version now covers all type aliases from both.
+- **`api_modify.py` — duplicate `import ida_xref`** — Removed the second import statement.
+- **`api_modify.py` — `add_xref` unknown type silent fallback** — The batch `add_xref` previously silently treated any unrecognised xref type as `data_read`. Now raises `ValueError` with the valid type list.
+- **`api_miasm.py` — arch detection edge cases** — `_detect_arch_from_ida` previously only matched `metapc`, `80`, `arm`, `mips`, `ppc`. Broadened to 9 x86 prefixes (`metapc`, `80`, `x86`, `ia-32`, `ia32`, `i386`, `i486`, `i586`, `i686`), added `aarch64`/`arm64`/`arm64e`/`arm64eb`, and `powerpc`. Unsupported architectures now return a structured error listing all valid `arch=` overrides and a `tip` field.
+- **`api_miasm.py` — `miasm_sync` unhandled exception** — `_manager.sync()` could raise `IDAError` for unsupported architectures, propagating as an unstructured crash. Wrapped in `try/except` returning `tool_error`.
+- **`api_analysis.py` / multiple modules — `error_type` + `hint` missing from TypedDicts** — `item_error()` spreads `error_type` (and optionally `hint`) into result dicts, but ~38 TypedDicts declared `additionalProperties: false` via MCP schema derivation without these fields. Added `error_type: NotRequired[str]` and `hint: NotRequired[str]` to all affected TypedDicts across `api_analysis.py`, `api_core.py`, `api_debug.py`, `api_memory.py`, `api_modify.py`, `api_sigmaker.py`, `api_stack.py`, `api_types.py`.
+- **`utils.py` — `Page` missing `total`** — `list_funcs` returned `next_offset: null` with no way for callers to know the total count. Added `total: int` to `Page` TypedDict and `paginate()` return.
+
+#### Tests
+
+- `test_api_modify.py` — added `test_analyze_range_returns_ok`, `test_analyze_range_invalid_bounds`, `test_scan_and_define_funcs_on_existing_region`, `test_scan_and_define_funcs_invalid_bounds`, `test_add_xref_call_and_verify`, `test_add_xref_invalid_address`, `test_define_func_fail_returns_hint`, `test_define_func_force_roundtrip`
+- `test_api_modify.py` — fixed `test_define_func_already_exists_is_success`: old test expected an error `contains="already exists"`; new behavior returns success with `existed: True`
+
+---
+
 ## [1.1.0] — 2026-05-18
 
 ### Phase 5 — Binary Format Parsing + Comprehensive Quality Audit

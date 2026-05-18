@@ -121,6 +121,8 @@ class FindRegexResult(TypedDict, total=False):
     matches: list[dict[str, Any]]
     cursor: dict[str, Any]
     error: str | None
+    error_type: str
+    hint: str
 
 
 class SearchTextLine(TypedDict, total=False):
@@ -140,6 +142,8 @@ class SearchTextResult(TypedDict, total=False):
     hits: list[SearchTextHit]
     cursor: dict[str, Any]
     error: str
+    error_type: str
+    hint: str
 
 
 # Cached strings list: [(ea, text), ...]
