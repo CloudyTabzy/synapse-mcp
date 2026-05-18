@@ -141,6 +141,8 @@ class TypeInspectResult(TypedDict, total=False):
     members: list[TypeCatalogMemberResult] | None
     member_count: int
     error: str
+    error_type: str
+    hint: str
 
 
 class SetTypeResult(TypedDict, total=False):
@@ -1664,6 +1666,7 @@ def type_propagate(
         func_eas = set(sorted(func_eas)[:max_functions])
 
         if not func_eas:
+            logger.info("type_propagate: no functions to analyze for %s", address)
             return {
                 "ok": True,
                 "address": address,
@@ -1676,6 +1679,7 @@ def type_propagate(
                 "suggested_struct_name": None,
                 "suggested_struct_definition": None,
                 "applied": False,
+                "hint": "No functions found referencing this address. Try a different direction or verify the address is a data variable (not a code pointer).",
             }
 
         all_evidence = {
@@ -1691,6 +1695,7 @@ def type_propagate(
             func_name = ida_funcs.get_func_name(fea) or hex(fea)
             cfunc = _decompile_func(fea)
             if not cfunc:
+                logger.info("type_propagate: decompilation failed for %s", func_name)
                 functions_analyzed.append({
                     "func_ea": hex(fea),
                     "func_name": func_name,
@@ -1701,9 +1706,9 @@ def type_propagate(
             # Resolve target in this function
             target_lvar_idx: int | None = None
             if var_name is not None and containing_func_ea == fea:
-                lvar = _find_lvar_by_name(cfunc, var_name)
-                if lvar:
-                    target_lvar_idx = lvar.idx
+                lvar, lvar_idx = _find_lvar_by_name(cfunc, var_name)
+                if lvar is not None:
+                    target_lvar_idx = lvar_idx
                 else:
                     functions_analyzed.append({
                         "func_ea": hex(fea),
@@ -1769,6 +1774,16 @@ def type_propagate(
         # Infer type
         inferred_type, confidence = _infer_type_and_confidence(all_evidence)
 
+        # Detect code-pointer globals (no field accesses, but target is in a function)
+        hint_msg: str | None = None
+        if not all_evidence["field_accesses"] and target_global_ea is not None:
+            if ida_funcs.get_func(target_global_ea):
+                inferred_type = "void*"
+                confidence = 0.30
+                hint_msg = "Target address is a function entry point, not a data variable. Use 'forward' direction to trace where this function pointer flows, or target a global data variable instead."
+            elif not all_evidence["call_usages"] and not all_evidence["malloc_origin"]:
+                hint_msg = "No type evidence found. The target may be an unused variable, a scalar integer, or may require a larger max_depth/max_functions to find referencing functions."
+
         # Build struct if requested
         suggested_struct_name = None
         suggested_struct_definition = None
@@ -1785,21 +1800,25 @@ def type_propagate(
             struct_result = _build_struct_type(fields, base_name)
             if struct_result:
                 suggested_struct_name, suggested_struct_definition = struct_result
+                logger.info("type_propagate: created struct %s with %d fields", suggested_struct_name, len(fields))
                 # If the inferred type was generic "struct_inferred*", make it specific
                 if inferred_type == "struct_inferred*":
                     inferred_type = f"{suggested_struct_name}*"
+            else:
+                logger.warning("type_propagate: struct creation failed for %s", base_name)
 
         # Apply type if requested
-        if apply_type and target_global_ea is not None and inferred_type != "unknown":
+        if apply_type and target_global_ea is not None and inferred_type not in ("unknown", "void*"):
             try:
                 tif = _parse_type_tinfo(inferred_type)
                 if tif:
                     ida_typeinf.apply_tinfo(target_global_ea, tif, ida_typeinf.TINFO_DEFINITE)
                     applied = True
+                    logger.info("type_propagate: applied type %s to 0x%x", inferred_type, target_global_ea)
             except Exception as e:
-                logger.debug("apply_type failed: %s", e)
+                logger.warning("type_propagate: apply_type failed for %s: %s", inferred_type, e)
 
-        return {
+        result: dict = {
             "ok": True,
             "address": address,
             "inferred_type": inferred_type,
@@ -1812,6 +1831,9 @@ def type_propagate(
             "suggested_struct_definition": suggested_struct_definition,
             "applied": applied,
         }
+        if hint_msg:
+            result["hint"] = hint_msg
+        return result
 
     except Exception as e:
         logger.exception("type_propagate failed")

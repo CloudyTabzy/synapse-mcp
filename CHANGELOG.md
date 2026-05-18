@@ -54,6 +54,16 @@ Based on a field test report from an AI agent (MiniMax-M2.7) conducting real rev
 |------|-------------|
 | `type_propagate(address, direction, max_depth, max_functions, infer_struct, apply_type)` | Decompiler-based type propagation and struct inference. Analyzes how a variable or global is used across decompiled functions to infer its type. Primary use case: infer struct layouts from field access patterns (e.g., `ptr->field_0x18 = value`). Supports two input modes — raw address (`"0x401000"`) or scoped variable (`"main::ptr"`). Collects `cot_memptr`/`cot_memref` field accesses, call-argument patterns (strlen→`char*`, fopen→`FILE*`, malloc→`void*`), and malloc origins. Cross-function expansion via xref BFS (`max_depth` hops, `max_functions` cap). Auto-creates `inferred_struct_*` types in the TIL when `infer_struct=True`. Confidence score (0.0–1.0) derived from field count, offset coverage, and API evidence. |
 
+#### Post-Review Fixes (type_propagate) — Round 2
+
+- **`api_types.py` — Bug B: `lvar.idx` crash on IDA 9.x** — `lvar_t` does not expose `.idx` in IDA 9.x. Changed `_find_lvar_by_name` to use `enumerate(cfunc.get_lvars())` returning `(lvar, idx)` tuple. The enumerated index matches `expr.v.idx` used in `cot_var` expressions.
+- **`api_types.py` — Bug A: empty result for code-pointer globals** — When a global address is a function entry point (not a data variable), the tool now detects this, sets `inferred_type: "void*"`, and returns a `hint` explaining the situation with guidance to use `forward` direction or target a data variable.
+- **`api_types.py` — Bug C: invisible debug logging** — Added `logger.info()` / `logger.warning()` for decompilation failures, struct creation, type application, and empty-result hints. Previously only `logger.debug()` was used, which is invisible in IDA's output window by default.
+- **`api_core.py` — schema mismatch: `FunctionQueryPage` missing `total`** — `paginate()` injects `total` but the TypedDict didn't declare it. Added.
+- **`api_core.py` — schema mismatch: `IdbSaveResult` missing `error_type`/`hint`** — `tool_error()` spreads these fields but they weren't in the TypedDict. Added as `NotRequired`.
+- **`api_types.py` — schema mismatch: `TypeInspectResult` missing `error_type`/`hint`** — `item_error()` spreads these fields. Added.
+- **`api_analysis.py` — schema mismatch: `DecompileResult`, `DisasmResult`, `CfgDotResult` missing `error_type`/`hint`** — All return `item_error()` or `tool_error()` which inject `error_type` and `hint`. Added to all three TypedDicts.
+
 #### Post-Review Fixes (type_propagate)
 
 - **`api_types.py` — field writes recorded twice** — `cot_asg` handler recorded field writes, then the independent `cot_memptr` visit recorded the same access as a read. Added `_seen_field_writes` dedup set to skip reads that were already recorded as writes at the same EA+offset.

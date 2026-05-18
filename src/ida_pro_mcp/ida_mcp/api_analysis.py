@@ -56,6 +56,8 @@ class DecompileResult(TypedDict):
     code: str | None
     refs: NotRequired[list[Ref]]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class ResultCursor(TypedDict, total=False):
@@ -70,6 +72,8 @@ class DisasmResult(TypedDict, total=False):
     total_instructions: int | None
     cursor: ResultCursor
     error: str
+    error_type: str
+    hint: str
 
 
 class FuncProfileItem(TypedDict, total=False):
@@ -2476,6 +2480,8 @@ class CfgDotResult(TypedDict, total=False):
     block_count: int
     dot: str
     error: str
+    error_type: str
+    hint: str
 
 
 class SimilarFunctionMatch(TypedDict):

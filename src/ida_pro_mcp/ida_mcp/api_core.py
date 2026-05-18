@@ -94,6 +94,7 @@ class FunctionQueryRow(Function, total=False):
 class FunctionQueryPage(TypedDict, total=False):
     data: list[FunctionQueryRow]
     next_offset: int | None
+    total: int
     error: str | None
 
 
@@ -108,12 +109,15 @@ class EntityQueryPage(TypedDict, total=False):
 class ImportsQueryPage(TypedDict):
     data: list[Import]
     next_offset: int | None
+    total: int
 
 
 class IdbSaveResult(TypedDict):
     ok: bool
     path: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class FindRegexResult(TypedDict, total=False):
