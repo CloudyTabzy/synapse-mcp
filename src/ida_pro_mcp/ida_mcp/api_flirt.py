@@ -17,6 +17,7 @@ import ida_funcs
 import ida_segment
 import ida_typeinf
 import idautils
+import idc
 
 from .utils import tool_error, item_error
 from .rpc import tool
@@ -59,7 +60,7 @@ class ListTilResult(TypedDict, total=False):
     error: str
 
 
-class SigCandidate(TypedDict):
+class SigCandidate(TypedDict, total=False):
     addr: str
     name: str
     size_bytes: int
@@ -103,66 +104,65 @@ def _is_auto_named(name: str) -> bool:
     return not name or any(name.startswith(p) for p in _UNNAMED_PREFIXES)
 
 
-def _get_func_prologue(ea: int, n: int = 16) -> bytes:
-    func = ida_funcs.get_func(ea)
+def _get_func_prologue(func, n: int = 16) -> bytes:
     if not func:
         return b""
     size = min(n, func.end_ea - func.start_ea)
     if size <= 0:
         return b""
-    data = ida_bytes.get_bytes(ea, size)
+    data = ida_bytes.get_bytes(func.start_ea, size)
     return data or b""
 
 
-def _prologue_match_score(a: bytes, b: bytes, n: int = 16) -> float:
-    """Step-filtered byte-level match ratio. Returns 0.0/0.5/0.75/1.0."""
+def _prologue_match_score(a: bytes, b: bytes, n: int = 16) -> tuple[float, float]:
+    """Step-filtered byte-level match. Returns (step_score, raw_ratio)."""
     cmp_len = min(len(a), len(b), n)
     if cmp_len == 0:
-        return 0.0
+        return 0.0, 0.0
     matches = sum(1 for x, y in zip(a[:cmp_len], b[:cmp_len]) if x == y)
     ratio = matches / cmp_len
     if ratio >= 1.0:
-        return 1.0
+        return 1.0, ratio
     if ratio >= 0.875:
-        return 0.75
+        return 0.75, ratio
     if ratio >= 0.75:
-        return 0.50
-    return 0.0
+        return 0.50, ratio
+    return 0.0, ratio
 
 
-def _get_named_callees(ea: int) -> frozenset[str]:
-    """Named (non-auto) direct-call targets of the function at ea."""
+def _get_named_callees(func) -> frozenset[str]:
+    """Named (non-auto) direct-call targets of the function."""
     result: set[str] = set()
+    if not func:
+        return frozenset()
     try:
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return frozenset()
         for head in idautils.Heads(func.start_ea, func.end_ea):
+            if not idc.is_call_insn(head):
+                continue
             for ref in idautils.CodeRefsFrom(head, 0):
                 if ref == head:
                     continue
                 ref_name = ida_funcs.get_func_name(ref) or ""
                 if ref_name and not _is_auto_named(ref_name):
                     result.add(ref_name)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("_get_named_callees failed at 0x%x: %s", func.start_ea, e)
     return frozenset(result)
 
 
-def _get_string_refs(ea: int) -> frozenset[int]:
-    """Addresses of string-literal data xrefs from the function at ea."""
+def _get_string_refs(func) -> frozenset[int]:
+    """Addresses of string-literal data xrefs from the function."""
     result: set[int] = set()
+    if not func:
+        return frozenset()
     try:
-        func = ida_funcs.get_func(ea)
-        if not func:
-            return frozenset()
         for head in idautils.Heads(func.start_ea, func.end_ea):
             for ref in idautils.DataRefsFrom(head):
                 flags = ida_bytes.get_full_flags(ref)
                 if ida_bytes.is_strlit(flags):
                     result.add(ref)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("_get_string_refs failed at 0x%x: %s", func.start_ea, e)
     return frozenset(result)
 
 
@@ -392,7 +392,12 @@ def sig_suggest_candidates(
     try:
         seg = ida_segment.get_segm_by_name(segment)
         if seg is None:
-            return {"ok": False, "error": f"Segment {segment!r} not found", "segment": segment}
+            return {
+                "ok": False,
+                "error": f"Segment {segment!r} not found",
+                "segment": segment,
+                "hint": "Call list_segments to find the correct segment name and retry.",
+            }
 
         min_confidence = max(0.0, min(1.0, min_confidence))
 
@@ -405,12 +410,13 @@ def sig_suggest_candidates(
             name = ida_funcs.get_func_name(func_ea) or ""
             if _is_auto_named(name):
                 continue
-            prologue = _get_func_prologue(func_ea, 16)
+            prologue = _get_func_prologue(func, 16)
             if not prologue:
                 continue
             named_entries.append({
                 "name": name,
                 "ea": func_ea,
+                "func": func,
                 "prologue": prologue,
                 "is_lib": bool(func.flags & ida_funcs.FUNC_LIB),
                 "callees": None,
@@ -418,49 +424,49 @@ def sig_suggest_candidates(
             })
 
         # Collect unnamed functions in segment
-        unnamed_eas: list[int] = []
+        unnamed_funcs: list = []
         for func_ea in idautils.Functions(seg.start_ea, seg.end_ea):
+            func = ida_funcs.get_func(func_ea)
+            if not func:
+                continue
             name = ida_funcs.get_func_name(func_ea) or ""
             if _is_auto_named(name):
-                unnamed_eas.append(func_ea)
-            if len(unnamed_eas) >= max_scan:
+                unnamed_funcs.append(func)
+            if len(unnamed_funcs) >= max_scan:
                 break
 
         if not named_entries:
             return {
                 "ok": True,
                 "segment": segment,
-                "scanned": len(unnamed_eas),
+                "scanned": len(unnamed_funcs),
                 "library_funcs_indexed": 0,
                 "candidates": [],
             }
 
         candidates: list[SigCandidate] = []
 
-        for func_ea in unnamed_eas:
-            func = ida_funcs.get_func(func_ea)
-            if not func:
-                continue
-
+        for func in unnamed_funcs:
+            func_ea = func.start_ea
             size_bytes = func.end_ea - func.start_ea
-            prologue = _get_func_prologue(func_ea, 16)
+            prologue = _get_func_prologue(func, 16)
 
             # Signal A: prologue
-            best_pro_entry, best_pro_raw = None, 0.0
+            best_pro_entry, best_pro_raw, best_pro_ratio = None, 0.0, 0.0
             if prologue:
                 for entry in named_entries:
-                    s = _prologue_match_score(prologue, entry["prologue"])
+                    s, r = _prologue_match_score(prologue, entry["prologue"])
                     if s > best_pro_raw:
-                        best_pro_raw, best_pro_entry = s, entry
+                        best_pro_raw, best_pro_ratio, best_pro_entry = s, r, entry
             pro_contribution = best_pro_raw * 0.40
 
             # Signal B: callees Jaccard
             best_cal_entry, best_cal_raw = None, 0.0
-            func_callees = _get_named_callees(func_ea)
+            func_callees = _get_named_callees(func)
             if func_callees:
                 for entry in named_entries:
                     if entry["callees"] is None:
-                        entry["callees"] = _get_named_callees(entry["ea"])
+                        entry["callees"] = _get_named_callees(entry["func"])
                     ref = entry["callees"]
                     if not ref:
                         continue
@@ -471,11 +477,11 @@ def sig_suggest_candidates(
 
             # Signal C: string xref overlap
             best_str_entry, best_str_raw = None, 0.0
-            func_strings = _get_string_refs(func_ea)
+            func_strings = _get_string_refs(func)
             if func_strings:
                 for entry in named_entries:
                     if entry["strings"] is None:
-                        entry["strings"] = _get_string_refs(entry["ea"])
+                        entry["strings"] = _get_string_refs(entry["func"])
                     ref = entry["strings"]
                     if not ref:
                         continue
@@ -491,8 +497,8 @@ def sig_suggest_candidates(
             # Dominant signal -> suggested name
             scores = [
                 ("prologue", pro_contribution, best_pro_entry),
-                ("callees", cal_contribution, best_cal_entry),
-                ("strings", str_contribution, best_str_entry),
+                ("callees",  cal_contribution, best_cal_entry),
+                ("strings",  str_contribution, best_str_entry),
             ]
             dominant_type, _, best_entry = max(scores, key=lambda x: x[1])
             if best_entry is None:
@@ -504,7 +510,7 @@ def sig_suggest_candidates(
             reasons: list[str] = []
             if best_pro_raw >= 0.50 and best_pro_entry:
                 reasons.append(
-                    f"prologue {best_pro_raw:.0%} match with '{best_pro_entry['name']}'"
+                    f"prologue {best_pro_ratio:.0%} byte match with '{best_pro_entry['name']}'"
                 )
             if best_cal_raw >= 0.30 and best_cal_entry:
                 reasons.append(
@@ -529,7 +535,7 @@ def sig_suggest_candidates(
         return {
             "ok": True,
             "segment": segment,
-            "scanned": len(unnamed_eas),
+            "scanned": len(unnamed_funcs),
             "library_funcs_indexed": len(named_entries),
             "candidates": candidates[:max_results],
         }

@@ -48,6 +48,14 @@ Based on a field test report from an AI agent (MiniMax-M2.7) conducting real rev
 - **`api_analysis.py` / multiple modules — `error_type` + `hint` missing from TypedDicts** — `item_error()` spreads `error_type` (and optionally `hint`) into result dicts, but ~38 TypedDicts declared `additionalProperties: false` via MCP schema derivation without these fields. Added `error_type: NotRequired[str]` and `hint: NotRequired[str]` to all affected TypedDicts across `api_analysis.py`, `api_core.py`, `api_debug.py`, `api_memory.py`, `api_modify.py`, `api_sigmaker.py`, `api_stack.py`, `api_types.py`.
 - **`utils.py` — `Page` missing `total`** — `list_funcs` returned `next_offset: null` with no way for callers to know the total count. Added `total: int` to `Page` TypedDict and `paginate()` return.
 
+#### Post-Review Fixes (sig_suggest_candidates)
+
+- **`api_flirt.py` — `_get_named_callees` collected jumps as well as calls** — `CodeRefsFrom(head, 0)` returns all code references (including jumps and tail calls). Added `idc.is_call_insn(head)` filter so only true `call` instructions contribute to the callee Jaccard signal, matching the spec.
+- **`api_flirt.py` — misleading prologue reason text** — `best_pro_raw` was the step score (0.0/0.5/0.75/1.0), not the actual byte match ratio. A 13/16 match (~81%) reported as "prologue 50% match". `_prologue_match_score` now returns `(step_score, raw_ratio)` and reasons report the actual byte match percentage (e.g., "prologue 81% byte match").
+- **`api_flirt.py` — `SigCandidate` TypedDict missing `total=False`** — Added for consistency with all other TypedDicts in the module, preventing potential MCP schema generation issues.
+- **`api_flirt.py` — segment-not-found error lacked recovery hint** — Added `"hint": "Call list_segments to find the correct segment name and retry."` per project error-handling conventions.
+- **`api_flirt.py` — helpers swallowed exceptions silently** — Replaced bare `except Exception: pass` with `logger.debug(...)` so IDA-side failures are visible in debug logs without exposing internal errors to the AI client.
+
 #### Tests
 
 - `test_api_modify.py` — added `test_analyze_range_returns_ok`, `test_analyze_range_invalid_bounds`, `test_scan_and_define_funcs_on_existing_region`, `test_scan_and_define_funcs_invalid_bounds`, `test_add_xref_call_and_verify`, `test_add_xref_invalid_address`, `test_define_func_fail_returns_hint`, `test_define_func_force_roundtrip`
