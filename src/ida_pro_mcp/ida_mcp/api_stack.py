@@ -30,12 +30,16 @@ class StackFrameResult(TypedDict):
     addr: str
     vars: list[StackFrameVariable] | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class StackMutationResult(TypedDict):
     addr: str
     name: str
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 # ============================================================================

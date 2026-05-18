@@ -151,6 +151,8 @@ class AnalyzeBatchResult(TypedDict, total=False):
     name: str | None
     analysis: AnalyzeBatchDetails | None
     error: str | None
+    error_type: str
+    hint: str
 
 
 class XrefsToResult(TypedDict, total=False):
@@ -158,6 +160,8 @@ class XrefsToResult(TypedDict, total=False):
     xrefs: list[Xref] | None
     more: bool
     error: str
+    error_type: str
+    hint: str
 
 
 XrefQueryRow = TypedDict(
@@ -183,6 +187,8 @@ class XrefQueryResult(TypedDict, total=False):
     next_offset: int | None
     total: int
     error: str | None
+    error_type: str
+    hint: str
 
 
 class StructFieldXrefsResult(TypedDict, total=False):
@@ -190,6 +196,8 @@ class StructFieldXrefsResult(TypedDict, total=False):
     field: str
     xrefs: list[Xref]
     error: str
+    error_type: str
+    hint: str
 
 
 class CalleeResultItem(TypedDict):
@@ -203,6 +211,8 @@ class CalleesResult(TypedDict, total=False):
     callees: list[CalleeResultItem] | None
     more: bool
     error: str
+    error_type: str
+    hint: str
 
 
 class FindBytesResult(TypedDict, total=False):
@@ -211,6 +221,8 @@ class FindBytesResult(TypedDict, total=False):
     n: int
     cursor: ResultCursor
     error: str
+    error_type: str
+    hint: str
 
 
 class BasicBlocksResult(TypedDict, total=False):
@@ -220,6 +232,8 @@ class BasicBlocksResult(TypedDict, total=False):
     count: int
     total_blocks: int
     cursor: ResultCursor
+    error_type: str
+    hint: str
 
 
 class FindResult(TypedDict, total=False):
@@ -228,6 +242,8 @@ class FindResult(TypedDict, total=False):
     count: int
     cursor: ResultCursor
     error: str | None
+    error_type: str
+    hint: str
 
 
 class InsnScanRange(TypedDict):
@@ -267,6 +283,8 @@ class InsnQueryResult(TypedDict, total=False):
     truncated: bool
     next_start: str | None
     error: str | None
+    error_type: str
+    hint: str
 
 
 class ExportedFunctionJson(TypedDict, total=False):
@@ -279,6 +297,8 @@ class ExportedFunctionJson(TypedDict, total=False):
     code: str | None
     xrefs: dict[str, list[dict[str, str]]]
     error: str
+    error_type: str
+    hint: str
 
 
 class ExportedPrototype(TypedDict, total=False):
@@ -325,6 +345,8 @@ class CallGraphResult(TypedDict, total=False):
     max_edges_per_func: int
     per_func_capped: bool
     error: str
+    error_type: str
+    hint: str
 
 
 # ============================================================================

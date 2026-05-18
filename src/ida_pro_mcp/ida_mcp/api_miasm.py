@@ -294,13 +294,16 @@ def miasm_sync() -> dict:
     """Re-synchronise Miasm architecture with the currently loaded IDA binary."""
     if not MIASM_AVAILABLE:
         return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
-    arch = _manager.sync()
-    return {
-        "ok": True,
-        "architecture": arch,
-        "bitness": _manager.bitness,
-        "endianness": "big" if _manager.is_big_endian else "little",
-    }
+    try:
+        arch = _manager.sync()
+        return {
+            "ok": True,
+            "architecture": arch,
+            "bitness": _manager.bitness,
+            "endianness": "big" if _manager.is_big_endian else "little",
+        }
+    except Exception as e:
+        return tool_error(e, "miasm_sync")
 
 @tool
 @idasync

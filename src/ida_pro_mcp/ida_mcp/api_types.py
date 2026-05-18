@@ -37,6 +37,8 @@ from .compat import tinfo_get_udm
 class DeclareTypeResult(TypedDict, total=False):
     decl: str
     error: str
+    error_type: str
+    hint: str
 
 
 class EnumMemberUpsertResult(TypedDict, total=False):
@@ -45,6 +47,8 @@ class EnumMemberUpsertResult(TypedDict, total=False):
     created: bool
     skipped: bool
     error: str
+    error_type: str
+    hint: str
 
 
 class EnumUpsertSummaryResult(TypedDict):
@@ -61,6 +65,8 @@ class EnumUpsertResult(TypedDict, total=False):
     members: list[EnumMemberUpsertResult]
     summary: EnumUpsertSummaryResult
     error: str
+    error_type: str
+    hint: str
 
 
 class StructMemberValueResult(TypedDict):
@@ -76,6 +82,8 @@ class ReadStructResult(TypedDict, total=False):
     struct: str | None
     members: list[StructMemberValueResult] | None
     error: str
+    error_type: str
+    hint: str
 
 
 class SearchStructResult(TypedDict):
@@ -133,6 +141,8 @@ class SetTypeResult(TypedDict, total=False):
     kind: str
     ok: bool
     error: str
+    error_type: str
+    hint: str
 
 
 class TypeApplyBatchResult(TypedDict):
@@ -149,6 +159,8 @@ class InferTypeResult(TypedDict, total=False):
     method: str | None
     confidence: str
     error: str
+    error_type: str
+    hint: str
 
 
 # ============================================================================

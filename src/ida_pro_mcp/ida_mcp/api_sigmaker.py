@@ -85,6 +85,8 @@ class MakeSigResult(TypedDict):
     format: str
     unique: NotRequired[bool]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class MakeSigForFunctionResult(TypedDict):
@@ -94,6 +96,8 @@ class MakeSigForFunctionResult(TypedDict):
     signature: str | None
     format: str
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class XrefSigResult(TypedDict):
@@ -102,6 +106,8 @@ class XrefSigResult(TypedDict):
     signatures: list[dict] | None
     total_xrefs: NotRequired[int]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +369,8 @@ class ScanSignatureResult(TypedDict, total=False):
     truncated: bool
     matches: list[ScanMatch]
     error: str
+    error_type: str
+    hint: str
 
 
 @tool

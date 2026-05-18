@@ -29,6 +29,8 @@ class BytesReadResult(TypedDict):
     addr: str | None
     data: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class IntReadResult(TypedDict):
@@ -36,24 +38,32 @@ class IntReadResult(TypedDict):
     ty: str
     value: int | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class StringReadResult(TypedDict):
     addr: str
     value: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class GlobalValueResult(TypedDict):
     query: str
     value: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class PatchResult(TypedDict):
     addr: str | None
     size: int
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class IntWriteResult(TypedDict):
@@ -61,6 +71,8 @@ class IntWriteResult(TypedDict):
     ty: str
     value: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 # ============================================================================

@@ -76,6 +76,8 @@ class LookupFuncResult(TypedDict):
     query: str
     fn: Function | None
     error: str | None
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class IntConvertResult(TypedDict):

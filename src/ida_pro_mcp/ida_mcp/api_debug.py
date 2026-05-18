@@ -47,6 +47,8 @@ class DebugControlResult(TypedDict, total=False):
     exited: bool
     state: str
     error: str
+    error_type: str
+    hint: str
 
 
 class BreakpointResult(TypedDict, total=False):
@@ -55,12 +57,16 @@ class BreakpointResult(TypedDict, total=False):
     condition: str | None
     language: str | None
     error: str
+    error_type: str
+    hint: str
 
 
 class ThreadRegistersResult(TypedDict, total=False):
     tid: int
     regs: ThreadRegisters | None
     error: str
+    error_type: str
+    hint: str
 
 
 class StackFrameInfo(TypedDict):
@@ -74,6 +80,8 @@ class DebugMemoryReadResult(TypedDict):
     size: int
     data: str | None
     error: NotRequired[str | None]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class DebugMemoryWriteResult(TypedDict, total=False):
@@ -81,6 +89,8 @@ class DebugMemoryWriteResult(TypedDict, total=False):
     size: int
     ok: bool
     error: str | None
+    error_type: str
+    hint: str
 
 
 # ============================================================================

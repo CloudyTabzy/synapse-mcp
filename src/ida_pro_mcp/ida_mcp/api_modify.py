@@ -10,6 +10,8 @@ import ida_frame
 import ida_dirtree
 import ida_funcs
 import ida_ua
+import ida_auto
+import ida_xref
 
 from .compat import tinfo_get_udm
 import ida_nalt
@@ -39,6 +41,8 @@ from .utils import (
 class CommentResult(TypedDict):
     addr: str
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class AppendCommentResult(TypedDict):
@@ -47,12 +51,16 @@ class AppendCommentResult(TypedDict):
     appended: NotRequired[bool]
     skipped: NotRequired[bool]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class PatchAsmResult(TypedDict, total=False):
     addr: str
     verified: bool
     error: str
+    error_type: str
+    hint: str
 
 
 class RenameItemResult(TypedDict, total=False):
@@ -65,6 +73,8 @@ class RenameItemResult(TypedDict, total=False):
     dir_error: str
     dry_run: bool
     error: str
+    error_type: str
+    hint: str
 
 
 class RenameSummaryResult(TypedDict, total=False):
@@ -94,7 +104,20 @@ class DefineResult(TypedDict, total=False):
     end: str
     size: int
     length: int
+    existed: bool
     error: str
+    error_type: str
+    hint: str
+
+
+class XrefItem(TypedDict, total=False):
+    frm: str
+    to: str
+    type: str
+    ok: bool
+    error: str
+    error_type: str
+    hint: str
 
 
 # ============================================================================
@@ -803,10 +826,49 @@ def rename(
     return result
 
 
+def _diagnose_add_func_failure(start_ea: int, end_ea: int) -> str:
+    """Build a human-readable hint explaining why add_func failed."""
+    parts: list[str] = []
+    seg = idaapi.getseg(start_ea)
+    if seg is None:
+        return "address is not in any known segment"
+    seg_name = idaapi.get_segm_name(seg) or "?"
+    if seg.type == idaapi.SEG_DATA:
+        parts.append(f"segment '{seg_name}' is typed as DATA")
+    elif seg.type == idaapi.SEG_BSS:
+        parts.append(f"segment '{seg_name}' is typed as BSS")
+    flags = idc.get_full_flags(start_ea)
+    if idc.is_unknown(flags):
+        parts.append("bytes are undefined (try force=True to run analysis first)")
+    elif idc.is_data(flags):
+        parts.append("bytes are currently typed as data (try force=True with del_items=True)")
+    overlap = idaapi.get_func(start_ea)
+    if overlap:
+        parts.append(
+            f"overlaps existing function {hex(overlap.start_ea)}–{hex(overlap.end_ea)}"
+        )
+    if not parts:
+        parts.append("IDA declined to create the function (bounds may be ambiguous; supply end=)")
+    return "; ".join(parts)
+
+
 @tool
 @idasync
 def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
-    """Define functions; IDA infers bounds unless end is provided."""
+    """Define functions at one or more addresses.
+
+    IDA infers bounds unless ``end`` is supplied. If the function already
+    exists at the start address the call succeeds (``existed: true``).
+
+    **force=true** — runs ``ida_auto.plan_and_wait(start, end)`` before
+    ``add_func``, forcing IDA to analyse and disassemble the range first.
+    This is essential for encrypted or unanalysed regions where ``add_func``
+    would otherwise silently fail.
+
+    **del_items=true** (requires ``force=true``) — clears existing
+    code/data definitions before re-analysis via ``ida_bytes.del_items``.
+    Use this when IDA previously misidentified bytes as data.
+    """
     if isinstance(items, dict):
         items = [items]
 
@@ -814,22 +876,31 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
     for item in items:
         addr_str = item.get("addr", "")
         end_str = item.get("end", "")
+        force = bool(item.get("force", False))
+        do_del = bool(item.get("del_items", False)) and force
 
         try:
             start_ea = parse_address(addr_str)
             end_ea = parse_address(end_str) if end_str else idaapi.BADADDR
 
-            # Check if already a function
+            # Already a function → success, no-op
             existing = idaapi.get_func(start_ea)
             if existing and existing.start_ea == start_ea:
                 results.append(
                     {
                         "addr": addr_str,
-                        "start": hex(start_ea),
-                        "error": "Function already exists at this address",
+                        "start": hex(existing.start_ea),
+                        "end": hex(existing.end_ea),
+                        "existed": True,
                     }
                 )
                 continue
+
+            if force:
+                plan_end = end_ea if end_ea != idaapi.BADADDR else start_ea + 0x200
+                if do_del:
+                    ida_bytes.del_items(start_ea, 0, plan_end - start_ea)
+                ida_auto.plan_and_wait(start_ea, plan_end)
 
             success = ida_funcs.add_func(start_ea, end_ea)
             if success:
@@ -842,15 +913,184 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                     }
                 )
             else:
+                hint = _diagnose_add_func_failure(start_ea, end_ea)
                 results.append(
                     {
                         "addr": addr_str,
                         "start": hex(start_ea),
                         "error": "define_func failed",
+                        "hint": hint,
                     }
                 )
         except Exception as e:
             results.append({"addr": addr_str, **item_error(e, f"define function at {addr_str}")})
+
+    return results
+
+
+@tool
+@idasync
+def analyze_range(
+    start: Annotated[str, "Start address of range to force-analyse"],
+    end: Annotated[str, "End address (exclusive) of range to force-analyse"],
+) -> dict:
+    """Force IDA to analyse an address range and rebuild the xref database for it.
+
+    Calls ``ida_auto.plan_and_wait(start, end)``, which processes all queued
+    analysis requests for the range: it disassembles bytes, creates xrefs, and
+    defines data items. After this call, ``xrefs_to`` / ``xrefs_from`` will
+    return results for code that lives in the range.
+
+    This is useful for encrypted or packed sections that IDA skipped during
+    the initial auto-analysis pass. Note that the bytes must already be
+    decrypted in the IDA database (via patching or a custom loader) before
+    this tool can produce correct results.
+    """
+    try:
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            return {"ok": False, "error": "end must be greater than start", "error_type": "invalid_input"}
+        ida_auto.plan_and_wait(start_ea, end_ea)
+        func_count = sum(1 for _ in idautils.Functions(start_ea, end_ea))
+        return {
+            "ok": True,
+            "start": hex(start_ea),
+            "end": hex(end_ea),
+            "size": end_ea - start_ea,
+            "functions_in_range": func_count,
+            "note": "Analysis complete. xrefs_to / xrefs_from should now reflect this range.",
+        }
+    except Exception as e:
+        return tool_error(e, "analyze_range")
+
+
+@tool
+@idasync
+def scan_and_define_funcs(
+    start: Annotated[str, "Start address of range to scan"],
+    end: Annotated[str, "End address (exclusive) of range to scan"],
+    force: Annotated[
+        bool,
+        "Run plan_and_wait on the range before scanning (needed for unanalysed regions)",
+    ] = True,
+    del_items: Annotated[
+        bool,
+        "Clear existing definitions before analysis (use with force=True when IDA "
+        "previously misidentified bytes as data)",
+    ] = False,
+) -> dict:
+    """Scan an address range, force IDA analysis, and define all functions found.
+
+    Workflow:
+    1. Optionally clear existing definitions (``del_items=true``).
+    2. Run ``plan_and_wait`` to disassemble the range (``force=true``).
+    3. Walk every code head not already inside a function and call ``add_func``.
+    4. Return a summary of created and failed function definitions.
+
+    Ideal for encrypted/obfuscated sections that have been decrypted in-place
+    and need batch function recovery without manual IDA interaction.
+    """
+    try:
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            return {"ok": False, "error": "end must be greater than start", "error_type": "invalid_input"}
+
+        if force:
+            if del_items:
+                ida_bytes.del_items(start_ea, 0, end_ea - start_ea)
+            ida_auto.plan_and_wait(start_ea, end_ea)
+
+        created: list[dict] = []
+        failed: list[str] = []
+
+        ea = start_ea
+        while ea < end_ea and ea != idaapi.BADADDR:
+            fn = idaapi.get_func(ea)
+            if fn:
+                # Skip to end of existing function
+                ea = fn.end_ea
+                continue
+            flags = idc.get_full_flags(ea)
+            if idc.is_code(flags):
+                ok = ida_funcs.add_func(ea)
+                if ok:
+                    fn2 = idaapi.get_func(ea)
+                    if fn2:
+                        created.append({"start": hex(fn2.start_ea), "end": hex(fn2.end_ea)})
+                        ea = fn2.end_ea
+                        continue
+                    else:
+                        created.append({"start": hex(ea), "end": None})
+                else:
+                    failed.append(hex(ea))
+            next_ea = idc.next_head(ea, end_ea)
+            if next_ea == idaapi.BADADDR or next_ea <= ea:
+                break
+            ea = next_ea
+
+        return {
+            "ok": True,
+            "start": hex(start_ea),
+            "end": hex(end_ea),
+            "created_count": len(created),
+            "failed_count": len(failed),
+            "created": created,
+            "failed": failed,
+        }
+    except Exception as e:
+        return tool_error(e, "scan_and_define_funcs")
+
+
+@unsafe
+@tool
+@idasync
+def add_xref(
+    items: Annotated[
+        list[dict] | dict,
+        "List of {from, to, type} dicts. type: 'call' (default), 'jump', 'call_far', "
+        "'jump_far', 'data_read', 'data_write'",
+    ],
+) -> list[XrefItem]:
+    """Manually add cross-references between addresses.
+
+    Use when IDA has not detected a call/jump relationship, e.g. when the
+    caller lives in encrypted or undefined code that IDA has not analysed.
+    All xrefs are tagged ``XREF_USER`` so they survive IDA reanalysis.
+
+    After adding xrefs, ``xrefs_to(target)`` will return these entries.
+    """
+    if isinstance(items, dict):
+        items = [items]
+
+    results: list[XrefItem] = []
+    for item in items:
+        frm_str = str(item.get("from", "") or item.get("frm", ""))
+        to_str = str(item.get("to", ""))
+        xref_type = str(item.get("type", "call")).lower().replace("-", "_")
+
+        try:
+            frm_ea = parse_address(frm_str)
+            to_ea = parse_address(to_str)
+
+            if xref_type in ("call", "call_near"):
+                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_CN | ida_xref.XREF_USER)
+            elif xref_type in ("jump", "jump_near"):
+                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_JN | ida_xref.XREF_USER)
+            elif xref_type == "call_far":
+                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_CF | ida_xref.XREF_USER)
+            elif xref_type == "jump_far":
+                ok = ida_xref.add_cref(frm_ea, to_ea, ida_xref.fl_JF | ida_xref.XREF_USER)
+            elif xref_type == "data_write":
+                ok = ida_xref.add_dref(frm_ea, to_ea, ida_xref.dr_W | ida_xref.XREF_USER)
+            else:
+                # data_read and anything unrecognised
+                ok = ida_xref.add_dref(frm_ea, to_ea, ida_xref.dr_R | ida_xref.XREF_USER)
+
+            results.append({"frm": hex(frm_ea), "to": hex(to_ea), "type": xref_type, "ok": ok})
+        except Exception as e:
+            results.append({"frm": frm_str, "to": to_str, **item_error(e, f"add_xref {frm_str}->{to_str}")})  # type: ignore[arg-type]
 
     return results
 

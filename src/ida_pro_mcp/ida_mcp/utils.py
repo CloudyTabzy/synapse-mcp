@@ -412,6 +412,17 @@ class DefineOp(TypedDict, total=False):
         str, "Address to define (hex or decimal). Use 'start:end' for explicit bounds."
     ]
     end: Annotated[str, "Optional end address for explicit bounds"]
+    force: Annotated[
+        bool,
+        "If True, run plan_and_wait on the range before add_func to force IDA to "
+        "analyze unanalyzed/encrypted bytes. If del_items is also True, existing "
+        "data/code definitions are cleared first.",
+    ]
+    del_items: Annotated[
+        bool,
+        "If True (requires force=True), call ida_bytes.del_items on the range before "
+        "analysis. Useful when IDA incorrectly defined bytes as data.",
+    ]
 
 
 class UndefineOp(TypedDict, total=False):
@@ -592,6 +603,7 @@ T = TypeVar("T")
 class Page(TypedDict, Generic[T]):
     data: list[T]
     next_offset: Optional[int]
+    total: int
 
 
 # ============================================================================
@@ -971,6 +983,7 @@ def paginate(data: list[T], offset: int, count: int) -> Page[T]:
     return {
         "data": data[offset : offset + count],
         "next_offset": next_offset,
+        "total": len(data),
     }
 
 
