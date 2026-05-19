@@ -1,3 +1,4 @@
+import heapq
 from itertools import islice
 import struct
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
@@ -2838,8 +2839,18 @@ _FINGERPRINT_BOOST_WEIGHT = 0.3  # How much fingerprint score contributes to fin
 
 @tool
 @idasync
+@tool_timeout(30.0)
 def get_cfg_dot(
     address: Annotated[str, "Function start address or name"],
+    max_blocks: Annotated[
+        int,
+        "Maximum basic blocks to render. Functions with more blocks are rejected "
+        "unless force=true. Default 500 prevents hangs on huge/obfuscated functions.",
+    ] = 500,
+    force: Annotated[
+        bool,
+        "Bypass the block limit and generate anyway. May hang IDA on megabyte-sized functions.",
+    ] = False,
 ) -> CfgDotResult:
     """Export a function's control flow graph in Graphviz DOT format.
 
@@ -2847,7 +2858,10 @@ def get_cfg_dot(
     .dot file, then returns the content. The DOT string can be rendered with
     any Graphviz-compatible tool (dot, xdot, online viewers).
 
-    Does not require Miasm — works on any architecture IDA supports.
+    **Performance guard:** If the function has more than `max_blocks` basic blocks,
+    the call is rejected unless `force=true`. This prevents IDA from hanging on
+    huge/obfuscated functions. Use `miasm_get_cfg_dot` as an alternative for
+    very large graphs.
     """
     import os
     import tempfile
@@ -2861,9 +2875,24 @@ def get_cfg_dot(
 
         name = ida_name.get_ea_name(func.start_ea) or hex(func.start_ea)
 
-        # Count basic blocks via FlowChart for metadata
+        # Count basic blocks via FlowChart for metadata — much faster than DOT gen
         fc = ida_gdl.FlowChart(func)
         block_count = sum(1 for _ in fc)
+
+        if block_count > max_blocks and not force:
+            return {
+                "ok": False,
+                "error": (
+                    f"Function '{name}' has {block_count} basic blocks, "
+                    f"exceeds max_blocks={max_blocks}"
+                ),
+                "error_type": "BlockLimitExceeded",
+                "block_count": block_count,
+                "hint": (
+                    "Set force=true to generate anyway (may hang on huge functions), "
+                    "or use miasm_get_cfg_dot for large graphs."
+                ),
+            }
 
         # Write DOT to a temp file; IDA appends .dot automatically on some versions,
         # so use a path without extension and check both.
@@ -2920,6 +2949,7 @@ def get_cfg_dot(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def find_similar_functions(
     address: Annotated[
         str,
@@ -2950,8 +2980,9 @@ def find_similar_functions(
     Includes an embedded fingerprint database for common library functions
     (memcpy, memset, strlen, strcpy, malloc, free, open, read, write, printf, exit).
 
-    Use this to identify library wrappers, thunks, and known functions in
-    stripped binaries where FLIRT signatures don't cover everything.
+    **Performance:** Uses a bounded min-heap so only the top `max_results` matches
+    are kept in memory. A cheap size pre-filter skips functions whose size differs
+    by >10× from the reference, avoiding expensive FlowChart creation for outliers.
     """
     try:
         ea = parse_address(address)
@@ -2961,6 +2992,7 @@ def find_similar_functions(
 
         ref_ea = ref_func.start_ea
         ref_name = ida_funcs.get_func_name(ref_ea) or hex(ref_ea)
+        ref_size = ref_func.end_ea - ref_func.start_ea
 
         ref_fc = idaapi.FlowChart(ref_func)
         ref_feat = _compute_function_features(ref_ea, ref_fc)
@@ -2969,11 +3001,15 @@ def find_similar_functions(
 
         ref_vector = _feature_dict_to_vector(ref_feat)
 
-        candidate_funcs: list[tuple[int, str]] = []
+        # Collect candidate functions
+        candidate_funcs: list[tuple[int, str, int]] = []
         if scope == "all":
             for func_ea in idautils.Functions():
-                if func_ea != ref_ea:
-                    candidate_funcs.append((func_ea, ida_funcs.get_func_name(func_ea) or ""))
+                if func_ea == ref_ea:
+                    continue
+                f = idaapi.get_func(func_ea)
+                size = f.end_ea - f.start_ea if f else 0
+                candidate_funcs.append((func_ea, ida_funcs.get_func_name(func_ea) or "", size))
         else:
             seg = idaapi.get_segm_by_name(scope)
             if not seg:
@@ -2983,12 +3019,24 @@ def find_similar_functions(
                     continue
                 if func_ea == ref_ea:
                     continue
-                candidate_funcs.append((func_ea, ida_funcs.get_func_name(func_ea) or ""))
+                f = idaapi.get_func(func_ea)
+                size = f.end_ea - f.start_ea if f else 0
+                candidate_funcs.append((func_ea, ida_funcs.get_func_name(func_ea) or "", size))
 
         candidates_scanned = len(candidate_funcs)
 
-        scored: list[tuple[int, str, float, float, dict, str, str]] = []
-        for func_ea, func_name in candidate_funcs:
+        # Cheap size pre-filter: skip functions whose size differs by >10×.
+        # This avoids expensive FlowChart + feature computation for obvious outliers.
+        size_low = ref_size / 10.0 if ref_size > 0 else 0
+        size_high = ref_size * 10.0 if ref_size > 0 else float("inf")
+
+        # Bounded min-heap: only keep top `max_results` matches.
+        # heapq is a min-heap, so we store (score, ...) and push/pop the smallest.
+        top_heap: list[tuple[float, int, str, float, dict, str, str]] = []
+
+        for func_ea, func_name, size in candidate_funcs:
+            if size < size_low or size > size_high:
+                continue
             f = idaapi.get_func(func_ea)
             if not f:
                 continue
@@ -3000,17 +3048,20 @@ def find_similar_functions(
             cosine_score = _cosine_similarity(ref_vector, vec)
             fp_score, fp_name, fp_desc = _fingerprint_match_score(feat)
             combined_score = (1.0 - _FINGERPRINT_BOOST_WEIGHT) * cosine_score + _FINGERPRINT_BOOST_WEIGHT * fp_score
-            if combined_score >= threshold:
-                scored.append((func_ea, func_name, combined_score, cosine_score, feat, fp_name, fp_desc))
+            if combined_score < threshold:
+                continue
+            entry = (combined_score, func_ea, func_name, cosine_score, feat, fp_name, fp_desc)
+            if len(top_heap) < max_results:
+                heapq.heappush(top_heap, entry)
+            elif combined_score > top_heap[0][0]:
+                heapq.heapreplace(top_heap, entry)
 
-        scored.sort(key=lambda x: x[2], reverse=True)
-        top = scored[:max_results]
+        # Sort descending by score
+        top = sorted(top_heap, key=lambda x: x[0], reverse=True)
 
         matches: list[SimilarFunctionMatch] = []
-        for func_ea, func_name, combined_score, cosine_score, feat, fp_name, fp_desc in top:
-            f = idaapi.get_func(func_ea)
-            fc = idaapi.FlowChart(f) if f else None
-            block_count = sum(1 for _ in fc) if fc else 0
+        for combined_score, func_ea, func_name, cosine_score, feat, fp_name, fp_desc in top:
+            block_count = feat.get("block_count", 0)
             edge_count = feat.get("edge_count", 0)
             match: SimilarFunctionMatch = SimilarFunctionMatch(
                 addr=hex(func_ea),
