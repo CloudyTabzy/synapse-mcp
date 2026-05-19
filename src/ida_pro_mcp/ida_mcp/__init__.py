@@ -19,6 +19,7 @@ Architecture:
 # Python may not preserve CPython's default SIG_IGN for SIGPIPE.
 import logging as _logging
 import signal
+import traceback as _traceback
 
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
@@ -57,8 +58,8 @@ try:
 except Exception as _e:
     _log.warning(
         "api_triton failed to load (%s: %s) — all triton_* tools unavailable. "
-        "Install with: pip install triton-library",
-        type(_e).__name__, _e,
+        "Install with: pip install triton-library\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
     )
     api_triton = None  # type: ignore[assignment]
 
@@ -67,8 +68,8 @@ try:
 except Exception as _e:
     _log.warning(
         "api_miasm failed to load (%s: %s) — all miasm_* tools unavailable. "
-        "Install with: pip install miasm future",
-        type(_e).__name__, _e,
+        "Install with: pip install miasm future\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
     )
     api_miasm = None  # type: ignore[assignment]
 
@@ -77,8 +78,8 @@ try:
 except Exception as _e:
     _log.warning(
         "api_construct failed to load (%s: %s) — all construct_* tools unavailable. "
-        "Install with: pip install construct",
-        type(_e).__name__, _e,
+        "Install with: pip install construct\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
     )
     api_construct = None  # type: ignore[assignment]
 
@@ -87,8 +88,8 @@ try:
 except Exception as _e:
     _log.warning(
         "api_cstruct failed to load (%s: %s) — all cstruct_* tools unavailable. "
-        "Install with: pip install dissect.cstruct",
-        type(_e).__name__, _e,
+        "Install with: pip install dissect.cstruct\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
     )
     api_cstruct = None  # type: ignore[assignment]
 
@@ -97,10 +98,30 @@ try:
 except Exception as _e:
     _log.warning(
         "api_filetype failed to load (%s: %s) — all filetype_* tools unavailable. "
-        "Install with: pip install filetype",
-        type(_e).__name__, _e,
+        "Install with: pip install filetype\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
     )
     api_filetype = None  # type: ignore[assignment]
+
+try:
+    from . import api_lief
+except Exception as _e:
+    _log.warning(
+        "api_lief failed to load (%s: %s) — all lief_* tools unavailable. "
+        "Install with: pip install lief\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_lief = None  # type: ignore[assignment]
+
+try:
+    from . import api_yara
+except Exception as _e:
+    _log.warning(
+        "api_yara failed to load (%s: %s) — all yara_* tools unavailable. "
+        "Install with: pip install yara-python\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_yara = None  # type: ignore[assignment]
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
@@ -136,6 +157,8 @@ __all__ = [
     # Optional analysis engines (None when deps absent)
     "api_triton",
     "api_miasm",
+    "api_lief",
+    "api_yara",
     # Re-exported components
     "idasync",
     "IDAError",

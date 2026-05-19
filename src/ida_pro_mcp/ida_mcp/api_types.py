@@ -135,6 +135,8 @@ class TypeInspectResult(TypedDict, total=False):
     declaration: str
     size: int | None      # None when type is forward-declared without definition
     size_note: str        # present only when size is None
+    estimated_size: int | None   # lower-bound estimate from member layout
+    size_source: str | None      # "declared" | "unpadded" | "estimated_from_members"
     is_func: bool
     is_ptr: bool
     is_enum: bool
@@ -1221,12 +1223,43 @@ def type_inspect(
             # layout hasn't been resolved yet.  Expose None so callers can
             # distinguish "size unknown" from "size zero".
             resolved_size: int | None = None if raw_size == 0xFFFFFFFFFFFFFFFF else raw_size
+            size_source: str | None = "declared" if resolved_size is not None else None
+            estimated_size: int | None = None
 
-            info = {
+            # Fallback 1: unpadded size (IDA sometimes knows this even when
+            # padded size is unresolved for forward-declared structs).
+            if resolved_size is None:
+                try:
+                    unpadded = tif.get_unpadded_size()
+                    if unpadded != 0xFFFFFFFFFFFFFFFF:
+                        resolved_size = unpadded
+                        size_source = "unpadded"
+                except Exception:
+                    pass
+
+            # Fallback 2: estimate from member layout when UDT details are
+            # available.  We compute max(member_offset + member_size) which is
+            # a lower bound (actual struct may have tail padding).
+            if resolved_size is None and tif.is_udt():
+                udt_est = ida_typeinf.udt_type_data_t()
+                if tif.get_udt_details(udt_est) and len(udt_est) > 0:
+                    max_end = 0
+                    for member in udt_est:
+                        off_bytes = member.begin() // 8
+                        msize = member.type.get_size()
+                        if msize != 0xFFFFFFFFFFFFFFFF:
+                            max_end = max(max_end, off_bytes + msize)
+                    if max_end > 0:
+                        estimated_size = max_end
+                        size_source = "estimated_from_members"
+
+            info: dict = {
                 "name": name,
                 "exists": True,
                 "declaration": str(tif),
                 "size": resolved_size,
+                "estimated_size": estimated_size,
+                "size_source": size_source,
                 "is_func": tif.is_func(),
                 "is_ptr": tif.is_ptr(),
                 "is_enum": tif.is_enum(),
@@ -1235,7 +1268,14 @@ def type_inspect(
                 "member_count": 0,
             }
             if resolved_size is None:
-                info["size_note"] = "size unknown — type declared but not fully defined in this IDB"
+                if estimated_size is not None:
+                    info["size_note"] = (
+                        f"size unknown in type library — "
+                        f"estimated {estimated_size} bytes from member layout "
+                        f"(lower bound; actual size may include tail padding)"
+                    )
+                else:
+                    info["size_note"] = "size unknown — type declared but not fully defined in this IDB"
 
             if include_members and tif.is_udt():
                 udt = ida_typeinf.udt_type_data_t()
@@ -1615,9 +1655,9 @@ def _decompile_func(func_ea: int) -> ida_hexrays.cfunc_t | None:
         cfunc = ida_hexrays.decompile(func_ea, hf)
         if cfunc:
             return cfunc
-        logger.debug("decompile 0x%x failed: %s", func_ea, hf.str)
+        logger.info("decompile 0x%x failed: %s", func_ea, hf.str)
     except Exception as e:
-        logger.debug("decompile 0x%x exception: %s", func_ea, e)
+        logger.warning("decompile 0x%x exception: %s", func_ea, e)
     return None
 
 
@@ -1768,7 +1808,7 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
 
         res = tif.set_named_type(til, struct_name, ida_typeinf.NTF_TYPE)
         if res != ida_typeinf.TERR_OK:
-            logger.debug("set_named_type failed for %s: %d", struct_name, res)
+            logger.warning("set_named_type failed for %s: %d", struct_name, res)
             return None
 
         # Build C-like definition string
@@ -1780,7 +1820,7 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
 
         return struct_name, c_def
     except Exception as e:
-        logger.debug("_build_struct_type failed: %s", e)
+        logger.warning("_build_struct_type failed: %s", e)
         return None
 
 
@@ -2378,7 +2418,7 @@ def analyze_constructor(
                             modifier = my_modifier_t(visitor.this_name, tif)
                             applied = bool(ida_hexrays.modify_user_lvars(func_ea, modifier))
                     except Exception as ex:
-                        logger.debug("apply_type failed in analyze_constructor: %s", ex)
+                        logger.warning("apply_type failed in analyze_constructor: %s", ex)
 
         unique_offsets = len({w["offset"] for w in writes})
 

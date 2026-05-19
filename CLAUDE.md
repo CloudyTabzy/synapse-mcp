@@ -37,6 +37,8 @@ Optional analysis engine modules (this fork):
 - `api_construct.py`: Declarative binary format parsing — PE/ELF/protocol header extraction, custom struct templates, safe DSL evaluator, IDA struct bridge, heuristic guessing, struct scanning. Requires `pip install construct`.
 - `api_cstruct.py`: C-syntax binary structure parsing — C-style struct/enum/typedef definitions, pre-built Windows & ELF headers, serialization round-trips, per-endian registry isolation. Requires `pip install dissect.cstruct`.
 - `api_filetype.py`: Magic-byte file type identification — 79+ format detection from buffers, IDA addresses, or segments. Requires `pip install filetype`.
+- `api_lief.py`: LIEF binary format analysis — `lief_info`, `lief_checksec`, `lief_sections`, `lief_imports`, `lief_exports`, `lief_strings`, `lief_tls_callbacks`, `lief_verify_signature` (Authenticode chain verification), `lief_rich_header` (PE compiler fingerprinting), `lief_pe_overlay` (packed/SFX detection), `lief_guard_functions` (CFG table), `lief_compare_to_idb` (raw file vs IDB diff), `lief_add_section`, `lief_patch_import`, `lief_strip_metadata`, `hybrid_lief_yara_section_scan`, `hybrid_lief_checksec_exploit_assess`, `hybrid_lief_sync_symbols`. Requires `pip install lief`. Extended features (DWARF/PDB debug symbols) require LIEF Extended (commercial).
+- `api_yara.py`: YARA signature-based scanning — `yara_scan` (custom rules against IDB range, whole binary, or raw file), `yara_scan_builtin_crypto` (AES/MD5/SHA/CRC32/RC4 constants, no external files), `yara_scan_builtin_threats` (packers, C2 frameworks, hack tools, shellcode), `yara_rule_validate` (syntax check without scanning), `yara_generate_rule` (generate rule from IDA function bytes with pointer wildcarding ⭐), `yara_idb_annotate` (scan all functions + auto-annotate/rename with YARA-derived names ⭐ KILLER FEATURE), `yara_function_classifier` (per-function category heat map), `hybrid_yara_lief_profile` (section-isolated YARA + LIEF checksec → threat profile), `hybrid_yara_triton_verify_crypto` (YARA finds crypto → Triton confirms via symbolic execution), `hybrid_yara_miasm_deobfuscate` (YARA detects packer stubs → Miasm lifts and simplifies). Requires `pip install yara-python`.
 
 **Instruction trace (Triton):** Each session maintains a `deque` of executed instruction addresses (max 10,000). On `triton_snapshot_save`, the trace is stored in the snapshot. On `triton_snapshot_restore`, it is replayed to rebuild the path predicate. The `triton_replay_instructions` tool gives AI agents manual control over custom instruction sequences.
 
@@ -176,6 +178,10 @@ uv run ida-pro-mcp --install-deps miasm
 uv run ida-pro-mcp --install-deps construct
 # dissect.cstruct + filetype
 uv run ida-pro-mcp --install-deps cstruct
+# LIEF binary format analysis
+uv run ida-pro-mcp --install-deps lief
+# YARA signature scanning
+uv run ida-pro-mcp --install-deps yara
 # All at once
 uv run ida-pro-mcp --install-deps all
 ```
@@ -188,6 +194,8 @@ miasm_status       # → {"ok": true, "available": true, ...}
 construct_status   # → {"ok": true, "available": true, ...}
 cstruct_status     # → {"ok": true, "available": true, ...}
 filetype_status    # → {"ok": true, "available": true, ...}
+lief_status        # → {"ok": true, "available": true, "version": "0.17.x", ...}
+yara_status        # → {"ok": true, "available": true, "version": "4.5.x", ...}
 ```
 
 ## Testing and coverage
@@ -277,6 +285,7 @@ Lower priority:
 - `construct>=2.10.68`: Pure-Python, works everywhere. Provides declarative binary format parsing.
 - `dissect.cstruct>=4.0`: Pure-Python. C-syntax struct/enum parsing with per-endian registry isolation.
 - `filetype>=1.2.0`: Pure-Python. Magic-byte detection (79+ formats).
+- `yara-python>=4.3.0`: C-extension YARA binding. Built-in crypto and threat rules are embedded as Python string constants — no external `.yar` files needed. The `yara_idb_annotate` killer feature maps matches back to IDA virtual addresses and cannot be replicated by standalone YARA.
 - All engines are optional. The plugin loads cleanly without them; only the `*_status` probe tools report `"available": false`.
 
 ### Return-type design principle

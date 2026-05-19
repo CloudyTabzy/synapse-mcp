@@ -103,6 +103,126 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
     return results
 
 
+class ReadLocalFileResult(TypedDict):
+    ok: bool
+    path: str
+    offset: int
+    total_bytes: int
+    has_more: bool
+    data: str
+    encoding: str
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def read_local_file(
+    path: Annotated[str, "Absolute path to the file on the IDA host machine."],
+    offset: Annotated[int, "Byte offset to start reading from."] = 0,
+    max_bytes: Annotated[
+        int, "Maximum bytes to read (default 32768, cap 50000)."
+    ] = 32768,
+    encoding: Annotated[
+        str,
+        "Text encoding to use for decoding (default 'utf-8'). Use 'base64' to "
+        "return raw bytes as a base64 string without any text decoding.",
+    ] = "utf-8",
+) -> ReadLocalFileResult:
+    """Read a file from the IDA host's local filesystem.
+
+    This tool is useful when another MCP tool writes output to a temporary
+    file (e.g. graph exports, reports) and you need to retrieve the contents.
+    Use offset/max_bytes to page through large files.
+
+    Security: the path is validated to prevent directory traversal. Only
+    absolute paths are accepted.
+    """
+    import os
+    import base64
+
+    # Security: reject relative paths and directory traversal
+    cleaned = os.path.normpath(os.path.abspath(path))
+    if ".." in cleaned.split(os.sep):
+        return {
+            "ok": False,
+            "path": path,
+            "offset": 0,
+            "total_bytes": 0,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": "Invalid path: directory traversal not allowed.",
+        }
+
+    if not os.path.isfile(cleaned):
+        return {
+            "ok": False,
+            "path": path,
+            "offset": 0,
+            "total_bytes": 0,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": f"File not found: {cleaned}",
+        }
+
+    try:
+        total = os.path.getsize(cleaned)
+    except OSError as e:
+        return {
+            "ok": False,
+            "path": path,
+            "offset": 0,
+            "total_bytes": 0,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": f"Cannot stat file: {e}",
+        }
+
+    max_bytes = min(max_bytes, 50000)
+    if offset < 0:
+        offset = 0
+    if offset > total:
+        offset = total
+
+    try:
+        with open(cleaned, "rb") as f:
+            f.seek(offset)
+            raw = f.read(max_bytes)
+    except OSError as e:
+        return {
+            "ok": False,
+            "path": path,
+            "offset": offset,
+            "total_bytes": total,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": f"Read failed: {e}",
+        }
+
+    if encoding.lower() == "base64":
+        data = base64.b64encode(raw).decode("ascii")
+    else:
+        try:
+            data = raw.decode(encoding, errors="replace")
+        except LookupError:
+            data = raw.decode("utf-8", errors="replace")
+
+    has_more = offset + len(raw) < total
+
+    return {
+        "ok": True,
+        "path": cleaned,
+        "offset": offset,
+        "total_bytes": total,
+        "has_more": has_more,
+        "data": data,
+        "encoding": encoding,
+    }
+
+
 _INT_CLASS_RE = re.compile(r"^(?P<sign>[iu])(?P<bits>8|16|32|64)(?P<endian>le|be)?$")
 
 

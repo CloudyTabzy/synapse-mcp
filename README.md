@@ -1,8 +1,8 @@
 # IDA Pro Binary Analysis MCP
 
-> **One MCP server. Five analysis engines. 120+ tools. Zero configuration overhead.**
+> **One MCP server. Six analysis engines. 140+ tools. Zero configuration overhead.**
 
-Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, and cross-engine hybrid workflows, all through a single MCP server.
+Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
 
 | Engine | Status | Tools |
 |--------|--------|-------|
@@ -11,6 +11,7 @@ Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — s
 | 📦 Construct Format Parsing | `pip install construct` | 10 |
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
+| 🔍 LIEF Binary Analysis | `pip install lief` | 19 |
 | 🎯 Native IDA (core + recon + hybrid) | Built-in | 60+ |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
@@ -56,6 +57,7 @@ miasm_status       → {"ok": true, "available": true, ...}
 construct_status   → {"ok": true, "available": true, ...}
 cstruct_status     → {"ok": true, "available": true, ...}
 filetype_status    → {"ok": true, "available": true, ...}
+lief_status        → {"ok": true, "available": true, "version": "0.17.x", ...}
 ```
 
 ---
@@ -86,6 +88,7 @@ flowchart TB
         J[Construct<br/>Format Parsing]
         K[dissect.cstruct<br/>C Syntax]
         L[filetype<br/>Magic Bytes]
+        M[LIEF<br/>Binary Analysis]
     end
 
     A --> B
@@ -99,6 +102,7 @@ flowchart TB
     F -.-> J
     F -.-> K
     F -.-> L
+    F -.-> M
 ```
 
 **Execution modes:**
@@ -110,23 +114,30 @@ flowchart TB
 
 ## 🎯 Capability Matrix
 
-| Capability | Triton | Miasm | Construct | cstruct | filetype | Native |
-|-----------|:------:|:-----:|:---------:|:-------:|:--------:|:------:|
-| Symbolic execution | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| SMT constraint solving | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| PE/ELF header parsing | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ⚪ |
-| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
-| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Capability | Triton | Miasm | Construct | cstruct | filetype | LIEF | Native |
+|-----------|:------:|:-----:|:---------:|:-------:|:--------:|:----:|:------:|
+| Symbolic execution | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| SMT constraint solving | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| PE/ELF header parsing | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ |
+| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
 
 ---
 
@@ -228,6 +239,58 @@ Requires: `pip install filetype`
 | `filetype_identify_ida_segment` | Identify file type of current binary or segment |
 | `filetype_list_supported` | List 79+ detectable types by category |
 
+### 🔍 LIEF — Binary Analysis (`lief_*`, `hybrid_lief_*`)
+Requires: `pip install lief`
+
+**Status probe** (always available, even without lief installed):
+
+| Tool | What it does |
+|------|-------------|
+| `lief_status` | Probe LIEF version and extended-tier availability |
+
+**Core analysis — PE, ELF, Mach-O:**
+
+| Tool | What it does |
+|------|-------------|
+| `lief_info` | Format, arch, bits, entry point, image base, section/import/export counts |
+| `lief_checksec` | NX, ASLR, CFG, SafeSEH, Authenticode (PE); RELRO, canary, PIE (ELF); numeric score |
+| `lief_sections` | All sections with entropy, permissions, optional content preview |
+| `lief_imports` | Imported DLLs + functions with IAT addresses, ordinals, C++ demangling; delay imports |
+| `lief_exports` | Exported symbols with ordinals, forwarding chains, demangled names |
+| `lief_strings` | ASCII + UTF-16LE string extraction across sections and PE overlay |
+
+**PE-specific killers:**
+
+| Tool | What it does |
+|------|-------------|
+| `lief_tls_callbacks` ⭐ | TLS callback addresses + IDA names — common anti-debug entry point |
+| `lief_verify_signature` ⭐ | Full Authenticode verification: cert chain, authentihash compare, countersignature timestamp |
+| `lief_rich_header` ⭐ | Decode Rich Header: VS component IDs, build numbers, compiler-version guess, SHA-256 fingerprint |
+| `lief_pe_overlay` ⭐ | Detect/extract data after the last section: entropy, magic-byte type, packer/SFX notes |
+| `lief_guard_functions` ⭐ | CFG guard table (all protected indirect-call targets), longjump + EH continuation targets |
+
+**IDA bridge:**
+
+| Tool | What it does |
+|------|-------------|
+| `lief_compare_to_idb` ⭐ | Diff LIEF raw file vs loaded IDB: entry point, sections, imports, exports — surfaces packer tricks |
+
+**Modification (`@unsafe` — writes to a new output file, never modifies the source):**
+
+| Tool | What it does |
+|------|-------------|
+| `lief_add_section` | Add a new PE/ELF section with custom content and permissions |
+| `lief_patch_import` | Add, rename, or remove an import entry in a PE binary |
+| `lief_strip_metadata` | Remove debug directory, Rich Header, PDB path, or Authenticode signature |
+
+**Hybrid workflows:**
+
+| Tool | What it does |
+|------|-------------|
+| `hybrid_lief_yara_section_scan` | Scan each section independently with YARA rules; returns entropy + permissions per section |
+| `hybrid_lief_checksec_exploit_assess` | One-call exploit-surface rating: checksec + CFG + signature + overlay → HIGH/MEDIUM/LOW |
+| `hybrid_lief_sync_symbols` | Import LIEF export/dynamic/DWARF symbol names into the IDA database (dry_run=true by default) |
+
 ### 🎯 Native IDA — Reconnaissance (`api_recon.py`)
 No extra dependencies.
 
@@ -312,7 +375,37 @@ triton_get_path_constraints()
 triton_solve_path_constraints(timeout_ms=30000)
 ```
 
-### Workflow 5: Encrypted Section Unpacking
+### Workflow 5: PE Malware Triage (LIEF)
+```
+# 1. Initial binary overview — format, entry point, protection flags
+lief_info()
+  ↓
+# 2. One-call exploit-surface assessment
+hybrid_lief_checksec_exploit_assess()
+  → exploitability_rating: "HIGH", attack_surface: ["Unsigned binary", "No ASLR", ...]
+  ↓
+# 3. Authenticode chain — is it really signed by who it claims?
+lief_verify_signature(checks="all")
+  → hashes_match: false  ← tampered after signing
+  ↓
+# 4. Rich Header — what compiler built this? (attribution)
+lief_rich_header()
+  → compiler_guess: "VS 16.x (2019)", entries: [{product_name: "C/C++ Compiler build 29112", ...}]
+  ↓
+# 5. CFG guard table — every protected indirect-call target
+lief_guard_functions()
+  → guard_cf_count: 847, guard_cf_functions: [...]
+  ↓
+# 6. Diff raw file vs IDB — did the loader miss anything?
+lief_compare_to_idb()
+  → anomalies: ["3 LIEF imports not resolved by IDA — GetProcAddress obfuscation"]
+  ↓
+# 7. Sync known symbol names from export table into IDA
+hybrid_lief_sync_symbols(source="exports", dry_run=True)
+  → proposed_count: 12, changes: [{address: "0x140001000", new_name: "InitializePayload", ...}]
+```
+
+### Workflow 6: Encrypted Section Unpacking
 For packed/encrypted sections where IDA skipped auto-analysis.
 ```
 # 1. Run the target in IDA's debugger until the decryption stub completes
@@ -550,7 +643,7 @@ The project is actively evolving. Here's what's on the horizon:
 
 **YARA signature scanning.** Built-in rules for malware families (Cobalt Strike, Metasploit, Mimikatz), crypto constants, and packer stubs — scan the entire binary in milliseconds without writing a single rule.
 
-**Binary format surgery.** Add sections, patch imports, rebuild headers, and strip debug metadata — all through a unified cross-format API. Inject a TLS callback for testing, or remove a rich header to neutralize build-environment leaks.
+**Binary format surgery.** ✅ *Complete — see `lief_*` tools.* Add sections, patch imports, rebuild headers, strip metadata, verify Authenticode, decode Rich Headers, enumerate CFG guard targets, and diff raw-file state against the IDA database.
 
 **Exploit primitives.** Generate cross-architecture shellcode, build cyclic De Bruijn patterns for offset calculation, enumerate ROP gadgets, and pack/unpack integers with configurable endianness — directly inside the IDA context.
 
@@ -575,6 +668,7 @@ The following optional analysis engines are **not** bundled with this project. T
 | Construct | `construct` | [MIT](https://github.com/construct/construct) |
 | dissect.cstruct | `dissect.cstruct` | [Apache-2.0](https://github.com/fox-it/dissect.cstruct/blob/main/LICENSE) |
 | filetype | `filetype` | [MIT](https://github.com/h2non/filetype.py) |
+| LIEF | `lief` | [Apache-2.0](https://github.com/lief-project/LIEF/blob/main/LICENSE) (standard tier); commercial for LIEF Extended |
 
 > **Note:** Miasm is licensed under GPL-2.0. Because this project loads Miasm as an unmodified, independently-installed optional dependency (dynamic import at runtime, no source modification, no static linking), the GPL-2.0 terms apply to Miasm itself and any derivative works of Miasm, but do not extend to this plugin or to the user's own analysis scripts. If you redistribute a modified version of Miasm itself, GPL-2.0 obligations would apply to that modification.
 >

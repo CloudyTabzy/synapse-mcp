@@ -2851,6 +2851,17 @@ def get_cfg_dot(
         bool,
         "Bypass the block limit and generate anyway. May hang IDA on megabyte-sized functions.",
     ] = False,
+    offset_lines: Annotated[
+        int,
+        "Line offset for pagination. When the full DOT exceeds the response size "
+        "limit, use offset_lines to retrieve subsequent chunks.",
+    ] = 0,
+    max_lines: Annotated[
+        int,
+        "Maximum lines to return. Default 0 returns all lines (may be truncated "
+        "by the global output limit). Set to a positive value to page through "
+        "large graphs without hitting truncation.",
+    ] = 0,
 ) -> CfgDotResult:
     """Export a function's control flow graph in Graphviz DOT format.
 
@@ -2862,6 +2873,10 @@ def get_cfg_dot(
     the call is rejected unless `force=true`. This prevents IDA from hanging on
     huge/obfuscated functions. Use `miasm_get_cfg_dot` as an alternative for
     very large graphs.
+
+    **Pagination:** For large graphs, use offset_lines + max_lines to retrieve
+    the DOT in chunks. Each chunk preserves the Graphviz header/footer so it
+    remains valid DOT syntax.
     """
     import os
     import tempfile
@@ -2929,6 +2944,36 @@ def get_cfg_dot(
                         os.unlink(p)
                 except OSError:
                     pass
+
+        # Apply line-based pagination if requested
+        if max_lines > 0:
+            lines = dot_content.splitlines(keepends=True)
+            total_lines = len(lines)
+            if offset_lines < 0:
+                offset_lines = 0
+            if offset_lines > total_lines:
+                offset_lines = total_lines
+            end = offset_lines + max_lines
+            chunk_lines = lines[offset_lines:end]
+            # Preserve Graphviz structure: if we're not at the start, prepend a
+            # comment header; if we're not at the end, append a comment footer.
+            # This keeps each chunk valid standalone DOT syntax.
+            if offset_lines > 0:
+                chunk_lines.insert(0, f"// ... ({offset_lines} lines omitted) ...\n")
+            if end < total_lines:
+                chunk_lines.append(f"// ... ({total_lines - end} lines remaining) ...\n")
+            dot_content = "".join(chunk_lines)
+            return {
+                "ok": True,
+                "address": hex(func.start_ea),
+                "name": name,
+                "block_count": block_count,
+                "dot": dot_content,
+                "offset_lines": offset_lines,
+                "max_lines": max_lines,
+                "total_lines": total_lines,
+                "has_more": end < total_lines,
+            }
 
         return {
             "ok": True,

@@ -19,8 +19,10 @@ import ida_nalt
 import ida_typeinf
 import idc
 
-from .rpc import tool
-from .sync import idasync
+import json
+
+from .rpc import tool, get_cached_output
+from .sync import idasync, IDAError
 from .utils import (
     tool_error,
     item_error,
@@ -1119,3 +1121,69 @@ def search_text(
         cursor = {"done": True}
 
     return {"n": len(hits), "hits": hits, "cursor": cursor}
+
+
+class ReadMcpOutputResult(TypedDict):
+    ok: bool
+    output_id: str
+    offset: int
+    total_chars: int
+    has_more: bool
+    chunk: str
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def read_mcp_output(
+    output_id: Annotated[str, "Output ID from a truncated MCP tool response."],
+    offset: Annotated[int, "Character offset to start reading from."] = 0,
+    max_chars: Annotated[
+        int, "Maximum characters to return per chunk (default 40000, cap 50000)."
+    ] = 40000,
+) -> ReadMcpOutputResult:
+    """Read a previously cached MCP tool output by its output_id.
+
+    When a tool response exceeds the 50KB size limit, the full output is cached
+    in memory and an output_id is provided in the truncation hint. Use this tool
+    to retrieve the full data in chunks. Each chunk includes offset, total size,
+    and a has_more flag so you can page through large outputs.
+
+    Typical workflow:
+      1. Call any tool that may return large output (e.g. get_cfg_dot).
+      2. If the response mentions truncation and gives an output_id,
+         call read_mcp_output(output_id=..., offset=0).
+      3. If has_more is true, call again with offset = previous_offset + len(chunk).
+    """
+    data = get_cached_output(output_id)
+    if data is None:
+        return {
+            "ok": False,
+            "output_id": output_id,
+            "offset": offset,
+            "total_chars": 0,
+            "has_more": False,
+            "chunk": "",
+            "error": f"Output '{output_id}' not found or expired (cache holds max 100 entries).",
+        }
+
+    serialized = json.dumps(data)
+    total = len(serialized)
+    max_chars = min(max_chars, 50000)
+
+    if offset < 0:
+        offset = 0
+    if offset > total:
+        offset = total
+
+    chunk = serialized[offset:offset + max_chars]
+    has_more = offset + max_chars < total
+
+    return {
+        "ok": True,
+        "output_id": output_id,
+        "offset": offset,
+        "total_chars": total,
+        "has_more": has_more,
+        "chunk": chunk,
+    }

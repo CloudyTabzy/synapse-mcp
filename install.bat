@@ -59,41 +59,89 @@ if errorlevel 1 (
     pause
 )
 
-:: --- Optional binary format parsing libraries --------------------------------
+:: --- Optional analysis engine libraries --------------------------------
 echo.
-echo [4/4] Optional binary format parsing libraries
-echo -----------------------------------------------
-echo These libraries add extra IDA tools for parsing binary structures and
-echo identifying file types. Each is independently optional.
+echo [4/4] Optional analysis engines and binary tools
+echo ----------------------------------------------------
+echo These libraries add advanced binary analysis capabilities to the plugin.
+echo Each is independently optional.
 echo.
-echo   construct     - construct_*    tools  (declarative binary format grammar)
-echo   dissect.cstruct - cstruct_*   tools  (C-syntax struct/enum/typedef parsing)
-echo   filetype        - filetype_*  tools  (magic-byte file type identification)
+echo   triton         - triton_*    tools  (symbolic execution, SMT solving, taint)
+echo   miasm          - miasm_*     tools  (IR lifting, SSA, deobfuscation)
+echo   construct      - construct_*  tools  (declarative binary format grammar)
+echo   dissect.cstruct - cstruct_*  tools  (C-syntax struct/enum/typedef parsing)
+echo   filetype       - filetype_*  tools  (magic-byte file type identification)
+echo   lief           - lief_*      tools  (PE/ELF/Mach-O analysis, Authenticode,
+echo                                          Rich Header, CFG guard table, IDB diff)
+echo   yara           - yara_*      tools  (signature-based scanning, crypto detection,
+echo                                          threat profiling, function annotation)
 echo.
 
+set INSTALL_TRITON=N
+set INSTALL_MIASM=N
 set INSTALL_CONSTRUCT=N
 set INSTALL_CSTRUCT=N
 set INSTALL_FILETYPE=N
+set INSTALL_LIEF=N
+set INSTALL_YARA=N
 
-set /p CHOICE="Install ALL three parsing libraries? [Y/N] (default N): "
+set /p CHOICE="Install ALL seven libraries? [Y/N] (default N): "
 if /i "!CHOICE!"=="Y" (
+    set INSTALL_TRITON=Y
+    set INSTALL_MIASM=Y
     set INSTALL_CONSTRUCT=Y
     set INSTALL_CSTRUCT=Y
     set INSTALL_FILETYPE=Y
+    set INSTALL_LIEF=Y
+    set INSTALL_YARA=Y
 ) else (
     echo.
-    set /p CONSTRUCT_CHOICE="  Install construct        (construct_* tools)?  [Y/N]: "
+    set /p TRITON_CHOICE="  Install triton           (triton_*    tools)?  [Y/N]: "
+    if /i "!TRITON_CHOICE!"=="Y" set INSTALL_TRITON=Y
+
+    set /p MIASM_CHOICE="  Install miasm            (miasm_*     tools)?  [Y/N]: "
+    if /i "!MIASM_CHOICE!"=="Y" set INSTALL_MIASM=Y
+
+    set /p CONSTRUCT_CHOICE="  Install construct       (construct_*  tools)?  [Y/N]: "
     if /i "!CONSTRUCT_CHOICE!"=="Y" set INSTALL_CONSTRUCT=Y
 
-    set /p CSTRUCT_CHOICE="  Install dissect.cstruct  (cstruct_* tools)?   [Y/N]: "
+    set /p CSTRUCT_CHOICE="  Install dissect.cstruct (cstruct_*  tools)?   [Y/N]: "
     if /i "!CSTRUCT_CHOICE!"=="Y" set INSTALL_CSTRUCT=Y
 
-    set /p FILETYPE_CHOICE="  Install filetype         (filetype_* tools)?  [Y/N]: "
+    set /p FILETYPE_CHOICE="  Install filetype        (filetype_*  tools)?  [Y/N]: "
     if /i "!FILETYPE_CHOICE!"=="Y" set INSTALL_FILETYPE=Y
+
+    set /p LIEF_CHOICE="  Install lief            (lief_*      tools)?     [Y/N]: "
+    if /i "!LIEF_CHOICE!"=="Y" set INSTALL_LIEF=Y
+
+    set /p YARA_CHOICE="  Install yara-python    (yara_*      tools)?     [Y/N]: "
+    if /i "!YARA_CHOICE!"=="Y" set INSTALL_YARA=Y
 )
 
 echo.
 set ANY_INSTALLED=N
+
+if "!INSTALL_TRITON!"=="Y" (
+    echo Installing triton-library...
+    pip install triton-library >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARNING] triton install failed. Run manually: pip install triton-library
+    ) else (
+        echo   [OK] triton installed.
+        set ANY_INSTALLED=Y
+    )
+)
+
+if "!INSTALL_MIASM!"=="Y" (
+    echo Installing miasm...
+    pip install "miasm>=0.1.5" "future>=0.18.0" >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARNING] miasm install failed. Run manually: pip install miasm future
+    ) else (
+        echo   [OK] miasm installed.
+        set ANY_INSTALLED=Y
+    )
+)
 
 if "!INSTALL_CONSTRUCT!"=="Y" (
     echo Installing construct...
@@ -128,9 +176,31 @@ if "!INSTALL_FILETYPE!"=="Y" (
     )
 )
 
+if "!INSTALL_LIEF!"=="Y" (
+    echo Installing lief...
+    pip install "lief>=0.15.0" >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARNING] lief install failed. Run manually: pip install lief
+    ) else (
+        echo   [OK] lief installed.
+        set ANY_INSTALLED=Y
+    )
+)
+
+if "!INSTALL_YARA!"=="Y" (
+    echo Installing yara-python...
+    pip install "yara-python>=4.3.0" >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARNING] yara-python install failed. Run manually: pip install yara-python
+    ) else (
+        echo   [OK] yara-python installed.
+        set ANY_INSTALLED=Y
+    )
+)
+
 if "!ANY_INSTALLED!"=="N" (
-    if "!INSTALL_CONSTRUCT!!INSTALL_CSTRUCT!!INSTALL_FILETYPE!"=="NNN" (
-        echo   [SKIP] No parsing libraries selected.
+    if "!INSTALL_TRITON!!INSTALL_MIASM!!INSTALL_CONSTRUCT!!INSTALL_CSTRUCT!!INSTALL_FILETYPE!!INSTALL_LIEF!!INSTALL_YARA!"=="NNNNNNN" (
+        echo   [SKIP] No optional libraries selected.
     )
 )
 
@@ -154,6 +224,6 @@ echo.
 echo Tip: To install analysis engines later, run:
 echo   ida-pro-mcp --install-deps triton
 echo   ida-pro-mcp --install-deps miasm
-echo   pip install construct dissect.cstruct filetype
-echo.
+echo   ida-pro-mcp --install-deps yara
+echo   pip install construct dissect.cstruct filetype lief yara-python
 pause

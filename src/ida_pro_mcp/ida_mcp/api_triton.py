@@ -49,7 +49,7 @@ except ImportError:
     )
 
 from .rpc import tool, unsafe
-from .sync import idasync, IDAError
+from .sync import idasync, IDAError, tool_timeout
 from . import compat
 
 # ============================================================================
@@ -312,11 +312,20 @@ class _StatusAlways(TypedDict):
 
 @tool
 @idasync
-def triton_status() -> _StatusAlways:
+def triton_status(
+    probe: Annotated[
+        bool,
+        "When true, attempt to auto-detect architecture from IDA and build a "
+        "TritonContext, surfacing any error via MCP.",
+    ] = False,
+) -> _StatusAlways:
     """Report whether triton-library is installed and the current context state.
 
     Always returns a result — safe to call before triton_init to check
     availability. When available=false, install triton-library and restart IDA.
+
+    Set ``probe=true`` to force full context initialisation and diagnose
+    architecture-detection or Z3-backend errors without needing the IDA console.
     """
     version = "unknown"
     if TRITON_AVAILABLE:
@@ -327,6 +336,55 @@ def triton_status() -> _StatusAlways:
             "available": False,
             "version": version,
             "install_hint": "pip install triton-library  (then restart IDA)",
+        }
+
+    if probe:
+        probe_log: list[dict] = []
+        try:
+            probe_log.append({"step": "detect_arch", "status": "running"})
+            arch = _detect_arch_from_ida()
+            probe_log.append({"step": "detect_arch", "status": "ok", "arch": _arch_to_str(arch)})
+        except Exception as e:
+            probe_log.append({"step": "detect_arch", "status": "failed", "error": f"{type(e).__name__}: {e}"})
+            return {
+                "available": True,
+                "version": version,
+                "probe": True,
+                "initialised": False,
+                "probe_log": probe_log,
+                "error": f"Architecture detection failed: {e}",
+            }
+
+        try:
+            probe_log.append({"step": "build_ctx", "status": "running"})
+            ctx = _build_ctx(arch)
+            probe_log.append({"step": "build_ctx", "status": "ok"})
+        except Exception as e:
+            probe_log.append({"step": "build_ctx", "status": "failed", "error": f"{type(e).__name__}: {e}"})
+            return {
+                "available": True,
+                "version": version,
+                "probe": True,
+                "initialised": False,
+                "probe_log": probe_log,
+                "error": f"TritonContext creation failed: {e}",
+            }
+
+        # Store the probed context so subsequent calls work
+        _set_ctx(_CTX_KEY, ctx)
+
+        return {
+            "available": True,
+            "version": version,
+            "probe": True,
+            "initialised": True,
+            "architecture": _arch_to_str(arch),
+            "symbolic_var_count": 0,
+            "path_constraint_count": 0,
+            "tainted_register_count": 0,
+            "tainted_memory_cell_count": 0,
+            "snapshot_count": 0,
+            "probe_log": probe_log,
         }
 
     ctx = _contexts.get(_CTX_KEY)
@@ -540,7 +598,12 @@ def triton_symbolize_memory(
     size: Annotated[int, "Number of bytes to symbolise (1, 2, 4, or 8)."] = 1,
     alias: Annotated[str, "Optional alias / label for this symbolic variable."] = "",
 ) -> dict:
-    """Mark a memory range as symbolic (attacker-controlled / unknown)."""
+    """Mark a memory range as symbolic (attacker-controlled / unknown).
+
+    This is the low-level primitive: ``size`` must be a power of two and
+    ``address`` must be aligned to ``size``.  For arbitrary ranges (e.g.
+    256-byte buffers, odd addresses) use ``triton_symbolize_bytes`` instead.
+    """
     if not TRITON_AVAILABLE:
         return {"ok": False, "error": "triton-library not installed"}
     try:
@@ -559,6 +622,119 @@ def triton_symbolize_memory(
         return {"ok": False, "address": address, "error": e.message}
     except Exception as e:
         logger.exception("triton_symbolize_memory failed")
+        return {"ok": False, "address": address, "error": str(e)}
+
+
+@tool
+@idasync
+@tool_timeout(30.0)
+def triton_symbolize_bytes(
+    address: Annotated[str, "Start address (hex or decimal)."],
+    size: Annotated[int, "Number of bytes to symbolise."],
+    alias_prefix: Annotated[
+        str,
+        "Optional prefix for symbolic variable aliases (e.g. 'buf_' produces buf_0, buf_8, ...).",
+    ] = "",
+) -> dict:
+    """Mark an arbitrary byte range as symbolic using architecture-aligned chunks.
+
+    Unlike ``triton_symbolize_memory`` which requires size ∈ {1,2,4,8} and an
+    aligned address, this tool accepts any positive size and automatically splits
+    the range into the largest valid Triton chunks (e.g. 8-byte on x64, 4-byte on
+    x86) with correct alignment, falling back to smaller chunks at boundaries.
+
+    A 256-byte buffer on x64 becomes ~32 symbolic variables instead of 256,
+    and unaligned addresses are handled gracefully.
+
+    Ranges are capped at 4096 bytes by default to prevent accidental context
+    bloat.  For larger aligned ranges call ``triton_symbolize_memory`` directly
+    with word-sized chunks.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
+
+    _MAX_BYTES = 4096
+    if size <= 0:
+        return {"ok": False, "error": "size must be positive"}
+    if size > _MAX_BYTES:
+        return {
+            "ok": False,
+            "error": (
+                f"size {size} exceeds safety cap of {_MAX_BYTES} bytes. "
+                f"Break the range into smaller pieces, or use triton_symbolize_memory "
+                f"with aligned word-sized chunks (1/2/4/8 bytes)."
+            ),
+        }
+
+    try:
+        ctx = _get_ctx()
+        addr = (
+            int(address, 16)
+            if isinstance(address, str) and address.startswith("0x")
+            else int(address, 0)
+        )
+        arch = ctx.getArchitecture()
+
+        # Map architecture to max natural chunk size (GPR width in bytes)
+        _ARCH_MAX_CHUNK: "dict[ARCH, int]" = {
+            ARCH.X86: 4,
+            ARCH.X86_64: 8,
+            ARCH.ARM32: 4,
+            ARCH.AARCH64: 8,
+            ARCH.RV32: 4,
+            ARCH.RV64: 8,
+        }
+        max_chunk = _ARCH_MAX_CHUNK.get(arch, 8)
+
+        def _pick_chunk(pos: int, rem: int) -> int:
+            """Largest power-of-2 ≤ max_chunk that aligns at pos and fits in rem."""
+            for test in (max_chunk, max_chunk // 2, max_chunk // 4, max_chunk // 8, 2):
+                if test >= 1 and pos % test == 0 and test <= rem:
+                    return test
+            return 1
+
+        sym_var_ids: list[int] = []
+        pos = addr
+        rem = size
+        chunk_count = 0
+        total_fallbacks = 0
+
+        while rem > 0:
+            cs = _pick_chunk(pos, rem)
+            alias = f"{alias_prefix}{pos - addr}" if alias_prefix else ""
+            try:
+                mem = TritonMemoryAccess(pos, cs)
+                sym_var = ctx.symbolizeMemory(mem, alias)
+            except Exception:
+                # The chosen chunk failed (rare — can happen on esoteric arch
+                # limits).  Fall back to a single byte for this position and
+                # continue; the next iteration will re-chunk from pos+1.
+                cs = 1
+                alias = f"{alias_prefix}{pos - addr}" if alias_prefix else ""
+                mem = TritonMemoryAccess(pos, cs)
+                sym_var = ctx.symbolizeMemory(mem, alias)
+                total_fallbacks += 1
+
+            sym_var_ids.append(sym_var.getId())
+            pos += cs
+            rem -= cs
+            chunk_count += 1
+
+        return {
+            "ok": True,
+            "address": hex(addr),
+            "size": size,
+            "sym_var_count": len(sym_var_ids),
+            "chunk_count": chunk_count,
+            "fallback_byte_chunks": total_fallbacks,
+            "first_sym_var_id": sym_var_ids[0] if sym_var_ids else None,
+            "last_sym_var_id": sym_var_ids[-1] if sym_var_ids else None,
+            "alias_prefix": alias_prefix,
+        }
+    except IDAError as e:
+        return {"ok": False, "address": address, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_symbolize_bytes failed")
         return {"ok": False, "address": address, "error": str(e)}
 
 
@@ -770,6 +946,7 @@ def triton_process_instruction(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def triton_process_function(
     address: Annotated[str, "Address within the function (hex or symbol name)."],
     max_insns: Annotated[int, "Safety cap on instruction count (default 500)."] = 500,
@@ -1183,6 +1360,7 @@ def triton_get_taint_summary() -> TaintSummaryResult:
 
 @tool
 @idasync
+@tool_timeout(30.0)
 def triton_solve_path_constraints(
     negate_last: Annotated[
         bool,
@@ -1542,6 +1720,7 @@ def triton_snapshot_restore(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def triton_replay_instructions(
     addresses: Annotated[
         list[str],
@@ -1733,6 +1912,51 @@ def _process_function_instructions_linear(
     truncated = count >= max_insns and curr < func_end
     return processed, truncated
 
+
+def _process_function_instructions_fast(
+    ctx: "TritonContext",
+    func_start: int,
+    func_end: int,
+    max_insns: int,
+) -> tuple[int, bool]:
+    """Lightweight linear instruction processing without metadata collection.
+
+    Returns (instruction_count, truncated_flag). Bytes are preloaded once.
+    Used when only the Triton side-effects (path constraints, taint) are needed.
+    """
+    import idaapi
+    import idc
+
+    raw_func = idc.get_bytes(func_start, func_end - func_start)
+    if raw_func:
+        ctx.setConcreteMemoryAreaValue(func_start, raw_func)
+
+    curr = func_start
+    count = 0
+
+    while curr < func_end and count < max_insns:
+        insn_ida = idaapi.insn_t()
+        length = idaapi.decode_insn(insn_ida, curr)
+        if length == 0:
+            break
+
+        raw = idc.get_bytes(curr, length)
+        if not raw:
+            curr += 1
+            continue
+
+        insn = TritonInstruction()
+        insn.setAddress(curr)
+        insn.setOpcode(raw)
+        ctx.processing(insn)
+        _get_trace().append(curr)
+
+        curr += length
+        count += 1
+
+    truncated = count >= max_insns and curr < func_end
+    return count, truncated
+
 def _try_solve_predicate(ctx: "TritonContext", timeout_ms: int) -> dict:
     """Attempt Z3 solve of the current path predicate.
 
@@ -1757,6 +1981,7 @@ def _try_solve_predicate(ctx: "TritonContext", timeout_ms: int) -> dict:
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def triton_analyze_function(
     address: Annotated[str, "Function start address (hex or symbol name)."],
     symbolize_args: Annotated[
@@ -1954,6 +2179,7 @@ def _build_block_path_to_target(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def triton_find_input_for_branch(
     function_address: Annotated[str, "Function start address (hex or symbol)."],
     target_address: Annotated[
@@ -2157,6 +2383,7 @@ def triton_find_input_for_branch(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def triton_annotate_function(
     address: Annotated[str, "Function address (hex or symbol name)."],
     symbolize_args: Annotated[
@@ -2204,8 +2431,9 @@ def triton_annotate_function(
         if reg_list:
             _symbolize_registers_internal(ctx, reg_list)
 
-        # Linearly process the function and collect branch info
-        processed, _ = _process_function_instructions_linear(
+        # Linearly process the function — only need side-effects (path constraints),
+        # not the full per-instruction metadata list.
+        _process_function_instructions_fast(
             ctx, func.start_ea, func.end_ea, max_insns
         )
 
@@ -2250,6 +2478,7 @@ def triton_annotate_function(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def triton_highlight_tainted_instructions(
     function_address: Annotated[str, "Function address (hex or symbol name)."],
     color: Annotated[str, "Hex color value (default 0x00ff00 for green)."] = "0x00ff00",
@@ -2325,6 +2554,7 @@ def triton_highlight_tainted_instructions(
 
 @tool
 @idasync
+@tool_timeout(30.0)
 def triton_backward_slice(
     sym_var_id_or_name: Annotated[
         str,

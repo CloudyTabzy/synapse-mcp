@@ -23,7 +23,8 @@ try:
     from miasm.analysis.machine import Machine
     from miasm.core.locationdb import LocationDB
     from miasm.core.bin_stream import bin_stream_str
-    from miasm.expression.expression import ExprId, ExprInt, get_expr_ids
+    from miasm.core.asmblock import AsmConstraint
+    from miasm.expression.expression import ExprId, ExprInt, ExprLoc, get_expr_ids
     from miasm.expression.simplifications import expr_simp
     MIASM_AVAILABLE = True
 except ImportError:
@@ -31,8 +32,10 @@ except ImportError:
     Machine = None  # type: ignore[assignment,misc]
     LocationDB = None  # type: ignore[assignment,misc]
     bin_stream_str = None  # type: ignore[assignment]
+    AsmConstraint = None  # type: ignore[assignment,misc]
     ExprId = None  # type: ignore[assignment,misc]
     ExprInt = None  # type: ignore[assignment,misc]
+    ExprLoc = None  # type: ignore[assignment,misc]
     get_expr_ids = None  # type: ignore[assignment]
     logger.warning(
         "miasm not installed — Miasm tools unavailable. "
@@ -40,7 +43,7 @@ except ImportError:
     )
 
 from .rpc import tool, unsafe
-from .sync import idasync, IDAError
+from .sync import idasync, IDAError, tool_timeout
 from . import compat
 from .utils import parse_address, tool_error
 
@@ -184,9 +187,27 @@ class _MiasmManager:
             return self._procname
 
     def get_bytes(self, start_ea: int, end_ea: int) -> bytes | None:
-        """Return bytes from IDA database, or None on failure."""
+        """Return bytes from IDA database, or None on failure.
+
+        Validates that the range is positive and fits inside IDA's
+        ``get_bytes(size)`` parameter (unsigned int, ~4.2 GiB cap).
+        """
         import ida_bytes
-        return ida_bytes.get_bytes(start_ea, end_ea - start_ea)
+        size = int(end_ea) - int(start_ea)
+        if size < 0:
+            raise IDAError(
+                f"Invalid byte range: end ({hex(end_ea)}) < start ({hex(start_ea)})"
+            )
+        # IDA get_bytes size is unsigned int; stay well below the theoretical
+        # max to avoid SWIG overflow TypeErrors.
+        _MAX_GET_BYTES = 0x1000_0000  # 256 MiB — generous for Miasm lifting
+        if size > _MAX_GET_BYTES:
+            raise IDAError(
+                f"Range too large: {size} bytes ({hex(size)}). "
+                f"Max allowed is {_MAX_GET_BYTES} bytes ({hex(_MAX_GET_BYTES)}). "
+                f"Tip: check your end_address — you may have added an extra digit."
+            )
+        return ida_bytes.get_bytes(int(start_ea), size)
 
     def get_mdis(self, data: bytes, base_ea: int):
         """Create a configured Miasm disassembler for the byte range starting at base_ea."""
@@ -270,8 +291,18 @@ def _ir_blocks_to_dict(ircfg) -> list[dict]:
 
 @tool
 @idasync
-def miasm_status() -> dict:
-    """Report Miasm availability and current architecture state."""
+def miasm_status(
+    probe: Annotated[
+        bool,
+        "When true, forcefully initialise the Miasm Machine and report any error. "
+        "Use this to diagnose why _manager-dependent tools are unavailable.",
+    ] = False,
+) -> dict:
+    """Report Miasm availability and current architecture state.
+
+    Set ``probe=true`` to force full Machine initialisation and surface any
+    import or architecture-detection errors via MCP (no IDA console needed).
+    """
     if not MIASM_AVAILABLE:
         return {
             "ok": True,
@@ -284,6 +315,65 @@ def miasm_status() -> dict:
     except Exception:
         ver = "unknown"
 
+    if probe:
+        # Force full initialisation and capture every step
+        probe_log: list[dict] = []
+        try:
+            probe_log.append({"step": "detect_arch", "status": "running"})
+            arch, bits, is_be, procname = _manager._detect_arch_from_ida()
+            probe_log.append({"step": "detect_arch", "status": "ok", "arch": arch, "bits": bits})
+        except Exception as e:
+            probe_log.append({"step": "detect_arch", "status": "failed", "error": f"{type(e).__name__}: {e}"})
+            return {
+                "ok": True,
+                "available": True,
+                "version": ver,
+                "probe": True,
+                "machine_ready": False,
+                "probe_log": probe_log,
+                "error": f"Architecture detection failed: {e}",
+            }
+
+        try:
+            probe_log.append({"step": "build_machine", "status": "running", "target_arch": arch})
+            machine = Machine(arch)
+            probe_log.append({"step": "build_machine", "status": "ok"})
+        except Exception as e:
+            probe_log.append({"step": "build_machine", "status": "failed", "error": f"{type(e).__name__}: {e}"})
+            return {
+                "ok": True,
+                "available": True,
+                "version": ver,
+                "probe": True,
+                "machine_ready": False,
+                "probe_log": probe_log,
+                "error": f"Machine(arch={arch!r}) failed: {e}",
+            }
+
+        # Machine built successfully — sync the manager so subsequent calls work
+        try:
+            _manager._machine = machine
+            _manager._arch_name = arch
+            _manager._bitness = bits
+            _manager._is_be = is_be
+            _manager._procname = procname
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "available": True,
+            "version": ver,
+            "probe": True,
+            "machine_ready": True,
+            "architecture": arch,
+            "bitness": bits,
+            "endianness": "big" if is_be else "little",
+            "procname": procname,
+            "probe_log": probe_log,
+        }
+
+    # Non-probe path — lightweight, no forced init
     if _manager._arch_name:
         endian = "big" if _manager._is_be else "little"
         return {
@@ -449,26 +539,112 @@ def miasm_reset() -> dict:
 
 @tool
 @idasync
+@tool_timeout(30.0)
 def miasm_lift_to_ir(
     address: Annotated[str, "Start address (hex or symbol name) of the range to lift"],
     end_address: Annotated[str, "End address (exclusive) of the range to lift (hex or symbol name)"],
+    max_blocks: Annotated[
+        int,
+        "Maximum basic blocks to lift. 1 = single block (original behaviour). "
+        "0 = unlimited within range.  Useful for compressed/undefined code regions.",
+    ] = 1,
+    follow_calls: Annotated[
+        bool,
+        "Follow call targets into additional blocks that fall inside the range (default: false).",
+    ] = False,
 ) -> dict:
-    """Disassemble an address range and lift it to Miasm IR. Returns a dict with IR blocks."""
+    """Disassemble an address range and lift it to Miasm IR.
+
+    **Single-block mode** (``max_blocks=1``, default):
+    Only the basic block containing ``address`` is lifted.  This is the original
+    behaviour and is fast and predictable.
+
+    **Multi-block mode** (``max_blocks`` > 1 or 0):
+    Performs controlled BFS disassembly starting at ``address``, following
+    intra-range branches until the block limit is reached or the range end is
+    hit.  This works on raw bytes even when IDA has not defined a function,
+    making it ideal for compressed / self-extracting / encrypted code regions.
+
+    Use ``follow_calls=true`` to also lift called targets that fall inside the
+    range (useful for small inlined helpers).
+    """
     if not MIASM_AVAILABLE:
         return {"ok": False, "error": "miasm not installed. Run: ida-pro-mcp --install-deps miasm"}
     ea = parse_address(address)
     end_ea = parse_address(end_address)
-    data = _manager.get_bytes(ea, end_ea)
+    if end_ea <= ea:
+        return {"ok": False, "error": "end_address must be greater than address"}
+
+    try:
+        data = _manager.get_bytes(ea, end_ea)
+    except IDAError as e:
+        return {"ok": False, "error": str(e)}
     if data is None:
         return {"ok": False, "error": f"Could not read bytes at {hex(ea)}-{hex(end_ea)}"}
-    mdis, loc_db = _manager.get_mdis(data, ea)
 
-    asm_block = mdis.dis_block(ea)
+    mdis, loc_db = _manager.get_mdis(data, ea)
+    mdis.follow_call = follow_calls
     lifter = _manager.machine.lifter_model_call(loc_db)
     ircfg = lifter.new_ircfg()
-    lifter.add_asmblock_to_ircfg(asm_block, ircfg)
 
-    return {"ok": True, "blocks": _ir_blocks_to_dict(ircfg)}
+    if max_blocks == 1:
+        # Original single-block fast path
+        asm_block = mdis.dis_block(ea)
+        lifter.add_asmblock_to_ircfg(asm_block, ircfg)
+        block_count = 1
+    else:
+        # Controlled multi-block BFS — no pre-existing function required
+        blocks: list = []
+        seen: set[int] = set()
+        todo: list[int] = [ea]
+        hard_limit = 1000 if max_blocks == 0 else max_blocks
+
+        while todo and len(blocks) < hard_limit:
+            blk_addr = todo.pop(0)
+            if blk_addr in seen or not (ea <= blk_addr < end_ea):
+                continue
+            seen.add(blk_addr)
+            try:
+                block = mdis.dis_block(blk_addr)
+                blocks.append(block)
+                # Extract successors from AsmConstraint objects and queue
+                # those that fall inside the requested range.
+                for cst in block.bto:
+                    offset = mdis.loc_db.get_location_offset(cst.loc_key)
+                    if offset is None or offset in seen:
+                        continue
+                    if not (ea <= offset < end_ea):
+                        continue
+                    # Optionally skip call targets
+                    if not follow_calls and block.lines:
+                        last_name = getattr(block.lines[-1], "name", "")
+                        if isinstance(last_name, str) and "CALL" in last_name.upper():
+                            if cst.c_t == AsmConstraint.c_to:
+                                continue
+                    todo.append(offset)
+            except Exception:
+                # Invalid instruction or disassembly boundary — stop this branch
+                continue
+
+        for block in blocks:
+            lifter.add_asmblock_to_ircfg(block, ircfg)
+        block_count = len(blocks)
+
+    edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+    result: dict = {
+        "ok": True,
+        "start": hex(ea),
+        "end": hex(end_ea),
+        "block_count": block_count,
+        "blocks": _ir_blocks_to_dict(ircfg),
+        "edges": edges,
+    }
+    if max_blocks != 1:
+        result["max_blocks_limit"] = max_blocks
+        result["follow_calls"] = follow_calls
+        if max_blocks > 0 and block_count >= max_blocks:
+            result["truncated"] = True
+    return result
 
 @tool
 @idasync

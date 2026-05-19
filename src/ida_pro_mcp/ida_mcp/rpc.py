@@ -77,7 +77,11 @@ def _build_download_meta(output_id: str, total_chars: int) -> dict:
         "total_chars": total_chars,
         "output_id": output_id,
         "download_url": download_url,
-        "download_hint": f"Output truncated. Run: curl -o .ida-mcp/{output_id}.json {download_url}",
+        "download_hint": (
+            f"Output truncated ({total_chars} chars). "
+            f"Retrieve with: read_mcp_output(output_id='{output_id}'). "
+            f"Or via HTTP: {download_url}"
+        ),
     }
 
 

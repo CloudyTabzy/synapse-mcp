@@ -28,10 +28,14 @@ triton   = ["triton-library>=0.10.0"]
 miasm    = ["miasm>=0.1.5", "future>=0.18.0"]
 construct = ["construct>=2.10.68"]
 cstruct  = ["dissect.cstruct>=4.0", "filetype>=1.2.0"]
+lief     = ["lief>=0.15.0"]
+yara     = ["yara-python>=4.3.0"]
 all      = [
     "triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0",
     "construct>=2.10.68",
     "dissect.cstruct>=4.0", "filetype>=1.2.0",
+    "lief>=0.15.0",
+    "yara-python>=4.3.0",
 ]
 
 [dependency-groups]
