@@ -807,6 +807,8 @@ def decompile(
     rather than the generic "Decompilation failed" string.
 
     Use ``max_pseudocode_lines`` to limit output size for very large functions.
+
+    Profile: analysis
     """
     try:
         start = parse_address(addr)
@@ -877,7 +879,10 @@ def disasm(
         bool, "Compute total instruction count (default: false)"
     ] = False,
 ) -> DisasmResult:
-    """Disassemble function with offset/max_instructions pagination and optional total count."""
+    """Disassemble function with offset/max_instructions pagination and optional total count.
+
+    Profile: analysis
+    """
 
     # Enforce max limit
     if max_instructions <= 0 or max_instructions > 50000:
@@ -1324,6 +1329,8 @@ def xrefs_to(
        to force IDA to build the xref database for the region, then retry.
     2. If callers live in undefined code, use ``add_xref`` to register
        user-defined xrefs that persist across reanalysis.
+
+    Profile: analysis
     """
     addrs = normalize_list_input(addrs)
 
@@ -1677,7 +1684,10 @@ def find_bytes(
     limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindBytesResult]:
-    """Search byte patterns (supports ??) with offset/limit pagination."""
+    """Search byte patterns (supports ??) with offset/limit pagination.
+
+    Profile: analysis
+    """
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
@@ -1765,7 +1775,10 @@ def basic_blocks(
     ] = 1000,
     offset: Annotated[int, "Skip first N blocks (default: 0)"] = 0,
 ) -> list[BasicBlocksResult]:
-    """Return function CFG blocks with offset/max_blocks pagination."""
+    """Return function CFG blocks with offset/max_blocks pagination.
+
+    Profile: analysis
+    """
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit

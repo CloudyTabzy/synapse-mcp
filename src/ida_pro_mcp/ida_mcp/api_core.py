@@ -21,7 +21,7 @@ import idc
 
 import json
 
-from .rpc import tool, get_cached_output
+from .rpc import tool, get_cached_output, MCP_PROFILES
 from .sync import idasync, IDAError
 from .utils import (
     tool_error,
@@ -59,6 +59,7 @@ class ServerHealthResult(TypedDict):
     hexrays_ready: bool
     strings_cache_ready: bool
     strings_cache_size: int
+    profiles: NotRequired[dict[str, int]]
 
 
 class ServerWarmupStep(TypedDict, total=False):
@@ -373,7 +374,7 @@ def _build_health_payload() -> dict:
     except Exception:
         idb_path = None
 
-    return {
+    result: dict = {
         "status": "ok",
         "uptime_sec": round(time.time() - _server_started_at, 3),
         "idb_path": idb_path,
@@ -385,12 +386,20 @@ def _build_health_payload() -> dict:
         "strings_cache_ready": _strings_cache is not None,
         "strings_cache_size": len(_strings_cache) if _strings_cache is not None else 0,
     }
+    if MCP_PROFILES:
+        result["profiles"] = {
+            name: len(tools) for name, tools in sorted(MCP_PROFILES.items())
+        }
+    return result
 
 
 @tool
 @idasync
 def server_health() -> ServerHealthResult:
-    """Health/ready probe for MCP server and current IDB state."""
+    """Health/ready probe for MCP server and current IDB state.
+
+    Profile: core
+    """
     return _build_health_payload()
 
 

@@ -60,12 +60,14 @@ except ImportError:
         sys.path.pop(0)
 
 try:
-    from .ida_mcp.rpc import MCP_SERVER_NAME
+    from .ida_mcp.rpc import MCP_SERVER_NAME, get_tool_group
 except ImportError:
     try:
-        from ida_mcp.rpc import MCP_SERVER_NAME
+        from ida_mcp.rpc import MCP_SERVER_NAME, get_tool_group
     except ImportError:
         MCP_SERVER_NAME = "synapse-mcp"
+        def get_tool_group(name: str) -> str:
+            return "core"
 
 class ProxyInstanceInfo(TypedDict, total=False):
     host: str
@@ -326,129 +328,6 @@ def _get_lazy_module_cache() -> dict[str, list[dict]]:
 
 
 # Prefix-based module mapping for _tool_module().
-_TOOL_MODULE_PREFIXES: tuple[tuple[str, str], ...] = (
-    ("triton_", "symbolic"),
-    ("miasm_", "symbolic"),
-    ("angr_", "symbolic"),
-    ("lief_", "formats"),
-    ("yara_", "formats"),
-    ("construct_", "formats"),
-    ("cstruct_", "formats"),
-    ("filetype_", "formats"),
-    ("nx_", "recon"),
-    ("flirt_", "recon"),
-    ("sig_", "recon"),
-    ("recon_", "recon"),
-    ("dbg_", "recon"),
-)
-
-# Tools without a distinctive prefix that belong to a specific module.
-_TOOL_MODULE_EXACT: dict[str, str] = {
-    # analysis
-    "decompile": "analysis",
-    "disasm": "analysis",
-    "func_profile": "analysis",
-    "analyze_batch": "analysis",
-    "xrefs_to": "analysis",
-    "xref_query": "analysis",
-    "xrefs_to_field": "analysis",
-    "callees": "analysis",
-    "find_bytes": "analysis",
-    "basic_blocks": "analysis",
-    "find": "analysis",
-    "insn_query": "analysis",
-    "export_funcs": "analysis",
-    "callgraph": "analysis",
-    "get_cfg_dot": "analysis",
-    "find_similar_functions": "analysis",
-    "trace_data_chain": "analysis",
-    "get_bytes": "analysis",
-    "read_local_file": "analysis",
-    "get_int": "analysis",
-    "get_string": "analysis",
-    "get_global_value": "analysis",
-    "patch": "analysis",
-    "put_int": "analysis",
-    "survey_binary": "analysis",
-    # modify
-    "set_comments": "modify",
-    "append_comments": "modify",
-    "patch_asm": "modify",
-    "rename": "modify",
-    "define_func": "modify",
-    "analyze_range": "modify",
-    "scan_and_define_funcs": "modify",
-    "add_xref": "modify",
-    "define_code": "modify",
-    "undefine": "modify",
-    "remove_type": "modify",
-    "declare_type": "modify",
-    "enum_upsert": "modify",
-    "read_struct": "modify",
-    "search_structs": "modify",
-    "type_query": "modify",
-    "type_inspect": "modify",
-    "set_type": "modify",
-    "type_apply_batch": "modify",
-    "infer_types": "modify",
-    "analyze_constructor": "modify",
-    "type_propagate": "modify",
-    "stack_frame": "modify",
-    "declare_stack": "modify",
-    "delete_stack": "modify",
-    # recon
-    "get_binary_sections": "recon",
-    "find_global_writers": "recon",
-    "find_vtable_candidates": "recon",
-    "list_functions_in_range": "recon",
-    "find_indirect_calls": "recon",
-    "identify_vtable_call": "recon",
-    "analyze_cleanup_function": "recon",
-    "find_function_prologues": "recon",
-    "apply_flirt_signature": "recon",
-    "load_type_library": "recon",
-    "list_type_libraries": "recon",
-    "sig_suggest_candidates": "recon",
-    "make_signature": "recon",
-    "make_signature_for_function": "recon",
-    "make_signature_for_range": "recon",
-    "find_xref_signatures": "recon",
-    "scan_signature": "recon",
-    "sync_debugger_to_idb": "recon",
-    "list_breakpoints": "recon",
-    "py_eval": "recon",
-    "py_exec_file": "recon",
-    # symbolic (composite tools without distinctive prefixes)
-    "analyze_function": "symbolic",
-    "analyze_component": "symbolic",
-    "diff_before_after": "symbolic",
-    "trace_data_flow": "symbolic",
-    "hybrid_analyze_function": "symbolic",
-    "hybrid_deobfuscate_and_patch": "symbolic",
-    "hybrid_iterative_deobfuscate": "symbolic",
-    "deobfuscate_segment": "symbolic",
-    # formats (hybrid format tools)
-    "hybrid_lief_checksec_exploit_assess": "formats",
-    "hybrid_lief_sync_symbols": "formats",
-    "hybrid_lief_yara_section_scan": "formats",
-    "hybrid_nx_lief_import_graph": "formats",
-    "hybrid_yara_lief_profile": "formats",
-    "hybrid_yara_miasm_deobfuscate": "symbolic",
-    "hybrid_yara_triton_verify_crypto": "symbolic",
-    "hybrid_nx_angr_target_ranking": "symbolic",
-    "hybrid_nx_triton_taint_graph": "symbolic",
-    "hybrid_nx_yara_cluster_detection": "formats",
-    "hybrid_angr_miasm_path": "symbolic",
-    "hybrid_angr_stdin_fuzz": "symbolic",
-    "hybrid_angr_triton_decompile": "symbolic",
-    "hybrid_angr_triton_solve": "symbolic",
-    "hybrid_angr_z3_formula": "symbolic",
-    # recon workflows
-    "workflow_binary_diff_summary": "recon",
-    "workflow_find_critical_paths": "recon",
-    "workflow_reveng_overview": "recon",
-}
-
 # Known core tools; used by _validate_groups() to avoid false-positive warnings.
 _CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "server_health", "server_warmup", "lookup_funcs", "int_convert",
@@ -463,20 +342,7 @@ _CORE_TOOL_NAMES: frozenset[str] = frozenset({
 
 def _tool_module(name: str) -> str:
     """Map a tool name to a logical module group for list_modules grouping."""
-    if name in _TOOL_MODULE_EXACT:
-        return _TOOL_MODULE_EXACT[name]
-    for prefix, module in _TOOL_MODULE_PREFIXES:
-        if name.startswith(prefix):
-            return module
-    if name.startswith("hybrid_"):
-        if any(x in name for x in ("triton", "miasm", "angr")):
-            return "symbolic"
-        if any(x in name for x in ("lief", "yara", "construct", "cstruct")):
-            return "formats"
-        return "core"
-    if name.startswith("workflow_"):
-        return "symbolic"
-    return "core"
+    return get_tool_group(name)
 
 
 def _proxy_to_ida(payload: bytes | str | dict) -> dict:

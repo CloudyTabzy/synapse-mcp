@@ -143,9 +143,35 @@ except Exception as _e:
     )
     api_networkx = None  # type: ignore[assignment]
 
+# Build tool profiles after all api_*.py modules have loaded and registered tools.
+# Profiles group tools into logical domains used by server_health and lazy mode.
+from .rpc import MCP_SERVER, register_profile, get_tool_group  # noqa: E402
+
+
+def _build_profiles() -> None:
+    """Dynamically assign every registered tool to a profile group."""
+    all_tools = set(MCP_SERVER.tools.methods.keys())
+    groups: dict[str, set[str]] = {
+        "core": set(),
+        "analysis": set(),
+        "modify": set(),
+        "symbolic": set(),
+        "formats": set(),
+        "recon": set(),
+    }
+    for name in all_tools:
+        groups[get_tool_group(name)].add(name)
+    for group, tools in groups.items():
+        if tools:
+            register_profile(group, tools)
+    register_profile("all", all_tools)
+
+
+_build_profiles()
+
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
-from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
+from .rpc import MCP_UNSAFE, tool, unsafe, resource
 from .http import IdaMcpHttpRequestHandler
 from .api_core import init_caches
 from .api_discovery import set_local_instance
@@ -188,9 +214,13 @@ __all__ = [
     "CancelledError",
     "MCP_SERVER",
     "MCP_UNSAFE",
+    "MCP_PROFILES",
+    "MCP_DEFAULT_PROFILE",
     "tool",
     "unsafe",
     "resource",
+    "register_profile",
+    "get_tool_group",
     "IdaMcpHttpRequestHandler",
     "init_caches",
     "set_local_instance",

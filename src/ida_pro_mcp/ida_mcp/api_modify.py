@@ -127,7 +127,10 @@ class XrefItem(TypedDict, total=False):
 @tool
 @idasync
 def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
-    """Set comments at addresses (both disassembly and decompiler views)"""
+    """Set comments at addresses (both disassembly and decompiler views).
+
+    Profile: modify
+    """
     if isinstance(items, dict):
         items = [items]
 
@@ -289,7 +292,10 @@ def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[
 @tool
 @idasync
 def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
-    """Patch assembly instructions at addresses"""
+    """Patch assembly instructions at addresses.
+
+    Profile: modify
+    """
     if isinstance(items, dict):
         items = [items]
 
@@ -352,7 +358,10 @@ def rename(
         "Rename batch with func/data/local/stack fields (at least one required)",
     ],
 ) -> RenameResult:
-    """Batch-rename funcs/globals/locals/stack vars with dry-run options."""
+    """Batch-rename funcs/globals/locals/stack vars with dry-run options.
+
+    Profile: modify
+    """
 
     stop_on_error = bool(batch.get("stop_on_error", False))
     dry_run = bool(batch.get("dry_run", False))

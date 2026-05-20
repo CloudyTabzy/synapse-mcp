@@ -573,6 +573,7 @@ class McpServer:
         self._enabled_extensions = threading.local()  # set[str] per request
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
         self.require_streamable_http_session = False
+        self._tools_list_cache: dict[str, list[dict]] = {}
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -589,6 +590,9 @@ class McpServer:
         self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
 
     def tool(self, func: Callable) -> Callable:
+        # Invalidate schema cache when a new tool is registered so the next
+        # tools/list call reflects the current registry.
+        self._tools_list_cache.clear()
         return self.tools.method(func)
 
     def resource(self, uri: str) -> Callable[[Callable], Callable]:
@@ -774,8 +778,26 @@ class McpServer:
             },
         }
 
+    def _get_tools_list_cache_key(self) -> str:
+        """Build a cache key for the current request context.
+
+        The key is based on enabled extension groups and (when profiles are
+        active) the active profile. This makes the cache safe across requests
+        with different extension/profile filters.
+        """
+        enabled = frozenset(getattr(self._enabled_extensions, "data", set()))
+        profile = getattr(getattr(self, "_active_profile", None), "data", None)
+        parts: list[str] = [f"ext:{','.join(sorted(enabled))}"]
+        if profile:
+            parts.append(f"profile:{profile}")
+        return "|".join(parts)
+
     def _mcp_tools_list(self, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""
+        cache_key = self._get_tools_list_cache_key()
+        if cache_key in self._tools_list_cache:
+            return {"tools": self._tools_list_cache[cache_key]}
+
         enabled = getattr(self._enabled_extensions, "data", set())
         tools = []
         for func_name, func in self.tools.methods.items():
@@ -793,6 +815,7 @@ class McpServer:
                     type(e).__name__,
                     e,
                 )
+        self._tools_list_cache[cache_key] = tools
         return {"tools": tools}
 
     def _get_tool_extension(self, func_name: str) -> str | None:
