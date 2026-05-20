@@ -2,7 +2,11 @@
 
 > **One MCP server. Nine analysis engines. 290+ tools. Zero configuration overhead.**
 
-Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, graph-theoretic analysis, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
+A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: nine distinct engines and nearly three hundred tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
+
+Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all nine engines at once.
+
+This is not a monolithic "powerhouse" that blasts every capability into memory regardless of need. It is a digital nervous system: situational, adaptive, and ruthlessly efficient. Lazy profiles route each signal to the right synapse, so the context window stays clean for thinking — not cataloging.
 
 | Engine | Status | Tools |
 |--------|--------|-------|
