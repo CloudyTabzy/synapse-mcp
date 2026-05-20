@@ -248,8 +248,10 @@ Requires: `pip install miasm`
 | `miasm_patch_instruction` | Assemble + patch directly into IDA database (`@unsafe`) |
 | `miasm_solve_path_constraints` | Enumerate CFG paths; Z3 solve via Triton when available |
 
-### 🐍 Angr — Symbolic Execution (`angr_*`)
+### 🐍 Angr — Symbolic Execution (`angr_*`)  ⚠️ Known Issues / TBD
 Requires: `pip install angr` (~200 MB; NOT included in `--install-deps all`)
+
+> **Status:** Integrated but **fragile** with angr 9.2+. `CFGEmulated` crashes during LMDB node serialization, `SpillingCFG` lacks `.neighbors()` (affects path exploration), and SIGINT handler assertions can fail in daemon threads. Defensive patches are in place, but tools below marked with ⚠️ may error or hang on real binaries. Treat this module as **experimental / TBD** — the infrastructure is here but needs angr-version-specific hardening before production use.
 
 **Status probe** (always available, even without angr installed):
 
@@ -391,8 +393,10 @@ Requires: `pip install lief`
 | `hybrid_lief_checksec_exploit_assess` | One-call exploit-surface rating: checksec + CFG + signature + overlay → HIGH/MEDIUM/LOW |
 | `hybrid_lief_sync_symbols` | Import LIEF export/dynamic/DWARF symbol names into the IDA database (dry_run=true by default) |
 
-### 🕸️ NetworkX — Graph Metrics (`nx_*`)
+### 🕸️ NetworkX — Graph Metrics (`nx_*`) 🧪 Needs More Testing
 Requires: `pip install networkx>=3.0`
+
+> **Status:** Core graph construction (call graph, CFG, xref graph) and metrics (centrality, communities, cycles) are implemented. Address resolution includes a bare-hex fallback for node IDs, but the module has not yet been battle-tested in extended crackme-solving sessions. Report odd behavior.
 
 | Tool | What it does |
 |------|-------------|
@@ -758,25 +762,34 @@ uv run coverage report --show-missing
 
 ---
 
-## 🔮 Roadmap
+## 🔮 Refinement & Improvement Plan
 
-The project is actively evolving. Here's what's on the horizon:
+Feature freeze is in effect. The focus is now on **stability, accuracy, and hardening** of the existing 290+ tools rather than adding new engines.
 
-### Phase 4 — Surgical Analysis & Workflow Automation ✅ *(complete)*
+### Active Focus Areas
 
-Stripped-binary recovery with FLIRT + prologue scoring, type propagation from malloc traces, batch segment-level deobfuscation, and multi-hop data-flow tracing across function boundaries.
+| Priority | Area | What needs work |
+|----------|------|----------------|
+| **P0** | Angr integration | `CFGEmulated` / `SpillingCFG` crashes on angr 9.2+. Need version-gated code paths or stricter angr-version pinning. |
+| **P0** | NetworkX address resolution | Bare-hex fallback is implemented but not yet stress-tested across large call graphs with real malware samples. |
+| **P1** | Triton workflow polish | `workflow_solve_crackme` could benefit from a Triton-only fallback path when angr is unavailable or broken. |
+| **P1** | Schema robustness | One malformed tool must never crash `tools/list` — defensive wrapping already in `zeromcp`, but keep auditing new tools. |
+| **P2** | HTTP handler polish | Optional: URL-level `?profile=` filtering to reduce tool schema payload for lightweight clients. |
+| **P2** | Test coverage | Standalone pytest tests (no IDA) cover transport and protocol compliance; IDA-side tests need more edge cases for composite/hybrid workflows. |
 
-### Phase 5–6 — Scientific Computing & Graph-Theoretic RE 🚧 *(in progress)*
+### Deferred / Backlog
 
-We prioritized **Angr** (symbolic path exploration, stdin modeling, crackme solving) and **NetworkX** (PageRank centrality, community detection, call-graph metrics) because they unlock immediate value for AI agents navigating large binaries.
+These ideas are documented but **not scheduled**. They will only be picked up if a concrete use-case demands them.
 
-**Already integrated:** Construct, LIEF, YARA, cstruct, filetype, Angr, NetworkX.
+- **Numpy / SciPy integration** — entropy heatmaps, byte-histogram similarity, spectral analysis for crypto constants.
+- **Capstone / Keystone** — independent disassembly/assembly outside IDA's state.
+- **Unicorn Engine** — concrete emulation of decrypt stubs and VM interpreters.
+- **Standalone Z3 bridge** — direct SMT solving without pulling in Triton or Angr.
+- **angr hardening** — full `SpillingCFG` compatibility layer or migration to angr's newer `Decompiler` APIs.
 
-**Next up:** Numpy-powered entropy heatmaps and byte-histogram similarity for clone detection — followed by SciPy signal processing for spotting periodic crypto constants in raw binary data.
+### Contributing
 
-### Phase 7 — Deep Analysis Engines *(planned)*
-
-For hostile, encrypted, and VM-obfuscated binaries that IDA alone cannot crack: Capstone/Keystone for independent disassembly and assembly outside IDA's state, Unicorn for concrete CPU emulation of decrypt stubs and VM interpreters, and standalone Z3 SMT solving without Triton dependency. These engines close the gap between static analysis and runtime behavior — letting agents decrypt code, emulate packers, and reason about obfuscated control flow without manual intervention.
+If you hit a bug in any existing tool, open an issue with the tool name + IDA version + binary type. PRs that improve stability of existing tools are strongly preferred over new engine proposals during this consolidation phase.
 
 ---
 
