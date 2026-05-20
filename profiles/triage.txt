@@ -1,4 +1,4 @@
-# Minimal triage profile for ida-pro-mcp
+# Minimal triage profile for synapse-mcp
 #
 # A focused starter set for first-pass binary assessment:
 # enumerate, decompile, trace xrefs.

@@ -7,10 +7,11 @@ Guidance for working in this repository.
 Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that evolves IDA Pro into a **comprehensive binary analysis powerhouse** for AI agents. Built-in symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, and cross-engine hybrid workflows — all as native MCP tool modules, with no separate servers required.
 
 Main pieces:
-- `src/ida_pro_mcp/server.py`: MCP server entrypoint
+- `src/ida_pro_mcp/server.py`: MCP server entrypoint (proxy to IDA plugin)
 - `src/ida_pro_mcp/idalib_server.py`: headless idalib server
 - `src/ida_pro_mcp/idalib_supervisor.py`: multi-worker supervisor for headless mode
-- `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs (21 modules, 120+ tools)
+- `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs (25 modules, 160+ tools)
+- `src/ida_pro_mcp/installer.py`: MCP client config generation and plugin installation
 
 Core API modules (upstream + enhanced):
 - `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries
@@ -39,10 +40,12 @@ Optional analysis engine modules (this fork):
 - `api_filetype.py`: Magic-byte file type identification — 79+ format detection from buffers, IDA addresses, or segments. Requires `pip install filetype`.
 - `api_lief.py`: LIEF binary format analysis — `lief_info`, `lief_checksec`, `lief_sections`, `lief_imports`, `lief_exports`, `lief_strings`, `lief_tls_callbacks`, `lief_verify_signature` (Authenticode chain verification), `lief_rich_header` (PE compiler fingerprinting), `lief_pe_overlay` (packed/SFX detection), `lief_guard_functions` (CFG table), `lief_compare_to_idb` (raw file vs IDB diff), `lief_add_section`, `lief_patch_import`, `lief_strip_metadata`, `hybrid_lief_yara_section_scan`, `hybrid_lief_checksec_exploit_assess`, `hybrid_lief_sync_symbols`. Requires `pip install lief`. Extended features (DWARF/PDB debug symbols) require LIEF Extended (commercial).
 - `api_yara.py`: YARA signature-based scanning — `yara_scan` (custom rules against IDB range, whole binary, or raw file), `yara_scan_builtin_crypto` (AES/MD5/SHA/CRC32/RC4 constants, no external files), `yara_scan_builtin_threats` (packers, C2 frameworks, hack tools, shellcode), `yara_rule_validate` (syntax check without scanning), `yara_generate_rule` (generate rule from IDA function bytes with pointer wildcarding ⭐), `yara_idb_annotate` (scan all functions + auto-annotate/rename with YARA-derived names ⭐ KILLER FEATURE), `yara_function_classifier` (per-function category heat map), `hybrid_yara_lief_profile` (section-isolated YARA + LIEF checksec → threat profile), `hybrid_yara_triton_verify_crypto` (YARA finds crypto → Triton confirms via symbolic execution), `hybrid_yara_miasm_deobfuscate` (YARA detects packer stubs → Miasm lifts and simplifies). Requires `pip install yara-python`.
+- `api_angr.py`: Angr symbolic execution engine — `angr_status`, `angr_load_segment`, `angr_cfg_fast`, `angr_cfg_from_ida`, `angr_diff_cfg`, `angr_find_paths` (⭐ KILLER FEATURE — stdin/argv symbolic modeling solves serial-key crackmes Triton cannot), `angr_enumerate_reachable`, `angr_state_evaluate`, `angr_hook_function` (skip/observe SimProcedures), `angr_backward_slice` (CFG-only fast path or DDG-backed precise mode), `angr_value_set`, `angr_snapshot_save`/`angr_snapshot_restore`, `hybrid_angr_triton_solve` (angr finds the path → Triton enriches with deep register-level state), `hybrid_angr_stdin_fuzz` (char-class-constrained input enumeration), `hybrid_angr_miasm_path`, `hybrid_angr_triton_decompile`, `hybrid_angr_z3_formula` (export SMT-LIB2 path constraints), `workflow_solve_crackme` (⭐ one-call end-to-end serial solver with auto-detect via IDB string xrefs), `workflow_trace_data_flow`, `workflow_find_gadgets` (ROP/JOP), `workflow_enum_code_hints` (prefix constraints across paths). Requires `pip install angr` (~200 MB; NOT in `--install-deps all`). Unicorn hybrid (`hybrid_angr_unicorn_concrete`) is pending Phase 6.3.
+- `api_networkx.py`: Graph analysis engine — `nx_status`, `nx_call_graph` (cached LRU), `nx_function_cfg`, `nx_xref_graph`, `nx_subgraph`, `nx_graph_metrics`, `nx_central_functions` (PageRank + betweenness + degree centrality ranking), `nx_shortest_path`, `nx_all_paths`, `nx_cycles`, `nx_strongly_connected`, `nx_neighborhood`, `nx_dominators` (with natural loop header detection), `nx_communities` (Louvain / label-prop / modularity), `nx_topological_order`, `nx_graph_diff` (with name_alignment for cross-binary diffs), `nx_export_graph` (DOT/GraphML/GML/JSON), `hybrid_nx_angr_target_ranking` (centrality-driven symex target recommendations), `hybrid_nx_yara_cluster_detection` (YARA categories + community detection → behavior-labeled clusters), `hybrid_nx_lief_import_graph` (module-centrality), `hybrid_nx_triton_taint_graph`, `workflow_reveng_overview` (⭐ KILLER FEATURE — one-call first-pass binary overview: ranked function importance + SCCs + Louvain communities + YARA labels + prioritized recommendations), `workflow_find_critical_paths` (entry → dangerous-import paths), `workflow_binary_diff_summary` (structural diff with similarity score). Requires `pip install networkx>=3.0` (small, pure-Python; included in `--install-deps all`).
 
 **Instruction trace (Triton):** Each session maintains a `deque` of executed instruction addresses (max 10,000). On `triton_snapshot_save`, the trace is stored in the snapshot. On `triton_snapshot_restore`, it is replayed to rebuild the path predicate. The `triton_replay_instructions` tool gives AI agents manual control over custom instruction sequences.
 
-**Server name:** The MCP server identifies itself to clients as `ida-pro-triton-miasm-mcp`. The canonical name is defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME` and imported by `server.py`, `idalib_supervisor.py`, and `installer.py` — no duplication.
+**Server name:** The MCP server identifies itself to clients as `synapse-mcp`. The canonical name is defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME` and imported by `server.py`, `idalib_supervisor.py`, and `installer.py` — no duplication.
 
 **Return-type design principle:**
 Every tool in this fork returns a **structured `dict` / `TypedDict`**, never raw strings or untyped lists. This is intentional:
@@ -149,22 +152,58 @@ def dangerous_op(...):
 
 ### Run
 ```bash
+# Normal mode — exposes all 160+ tools (default; backward compatible)
 uv run ida-pro-mcp
+
+# Lazy mode — exposes 4 meta-tools only (~95% context reduction, recommended for agents)
+uv run ida-pro-mcp --lazy
+
+# Override a saved --lazy config back to full tools for one session
+uv run ida-pro-mcp --no-lazy
+
+# HTTP transport
 uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
+uv run ida-pro-mcp --lazy --transport http://127.0.0.1:8744/sse
+
+# Headless idalib
 uv run idalib-mcp --stdio path/to/binary
 uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/binary
 uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/binary
+
+# Unsafe mode (enables debugger tools etc.)
 uv run ida-pro-mcp --unsafe
 ```
+
+### Lazy mode meta-tools
+When running with `--lazy`, the server exposes exactly 4 tools instead of 160+:
+
+| Tool | Purpose |
+|---|---|
+| `list_modules` | List tool groups: `core`, `symbolic`, `graph`, `formats` |
+| `list_tools(module=...)` | List tools in a group with one-line descriptions |
+| `describe_tool(name)` | Get the full input schema for a specific tool |
+| `invoke_tool(tool, args)` | Call any tool by name; returns structured result |
+
+The cache of IDA tool schemas is populated on first `list_tools` or `describe_tool` call. If IDA loads a new IDB at runtime, restart the server (or call `invoke_tool` on a non-existent tool to trigger a cache miss reset).
 
 ### MCP inspector
 ```bash
 uv run mcp dev src/ida_pro_mcp/server.py
 ```
 
+### Generate MCP client config
+```bash
+# Normal mode config (all tools)
+uv run ida-pro-mcp --config
+
+# Lazy mode config (4 meta-tools, --lazy in args)
+uv run ida-pro-mcp --config --lazy
+```
+
 ### Install / uninstall plugin
 ```bash
 uv run ida-pro-mcp --install
+uv run ida-pro-mcp --install --lazy   # writes --lazy into the generated MCP client config
 uv run ida-pro-mcp --uninstall
 ```
 
@@ -182,7 +221,11 @@ uv run ida-pro-mcp --install-deps cstruct
 uv run ida-pro-mcp --install-deps lief
 # YARA signature scanning
 uv run ida-pro-mcp --install-deps yara
-# All at once
+# NetworkX graph analysis (small; INCLUDED in --install-deps all)
+uv run ida-pro-mcp --install-deps networkx
+# Angr symbolic execution (~200 MB; NOT in --install-deps all)
+pip install angr
+# All at once (excludes angr)
 uv run ida-pro-mcp --install-deps all
 ```
 
@@ -196,6 +239,8 @@ cstruct_status     # → {"ok": true, "available": true, ...}
 filetype_status    # → {"ok": true, "available": true, ...}
 lief_status        # → {"ok": true, "available": true, "version": "0.17.x", ...}
 yara_status        # → {"ok": true, "available": true, "version": "4.5.x", ...}
+angr_status        # → {"ok": true, "available": true, "version": "9.2.x", "claripy_version": "9.2.x", ...}
+nx_status          # → {"ok": true, "available": true, "version": "3.x", "cached_graphs": 0, ...}
 ```
 
 ## Testing and coverage
@@ -286,6 +331,7 @@ Lower priority:
 - `dissect.cstruct>=4.0`: Pure-Python. C-syntax struct/enum parsing with per-endian registry isolation.
 - `filetype>=1.2.0`: Pure-Python. Magic-byte detection (79+ formats).
 - `yara-python>=4.3.0`: C-extension YARA binding. Built-in crypto and threat rules are embedded as Python string constants — no external `.yar` files needed. The `yara_idb_annotate` killer feature maps matches back to IDA virtual addresses and cannot be replicated by standalone YARA.
+- `networkx>=3.0`: Pure-Python graph algorithms. Powers call-graph centrality (PageRank, betweenness), community detection (Louvain), SCC analysis, shortest paths, dominators, graph diff. The `workflow_reveng_overview` killer feature combines all of these into a one-call structural binary analysis with prioritized recommendations.
 - All engines are optional. The plugin loads cleanly without them; only the `*_status` probe tools report `"available": false`.
 
 ### Return-type design principle

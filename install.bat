@@ -2,8 +2,8 @@
 setlocal EnableDelayedExpansion
 
 echo ============================================================
-echo  IDA Pro Triton ^& Miasm MCP - Enhanced Fork Installer
-echo  https://github.com/CloudyTabzy/ida-pro-triton-miasm-mcp
+echo  Synapse MCP Installer
+echo  https://github.com/CloudyTabzy/synapse-mcp
 echo ============================================================
 echo.
 
@@ -22,13 +22,13 @@ echo [OK] Python %PY_VER% detected.
 echo.
 
 :: --- Uninstall conflicting upstream packages --------------------------------
-echo [1/4] Removing conflicting upstream packages...
-pip uninstall -y ida-pro-mcp ida-pro-mcp-xjoker >nul 2>&1
+echo [1/5] Removing conflicting upstream packages...
+pip uninstall -y ida-pro-mcp ida-pro-mcp >nul 2>&1
 echo [OK] Done.
 echo.
 
 :: --- Install this fork in editable mode -------------------------------------
-echo [2/4] Installing ida-pro-triton-miasm-mcp from source...
+echo [2/5] Installing synapse-mcp from source...
 cd /d "%~dp0"
 pip install -e . >nul 2>&1
 if errorlevel 1 (
@@ -40,16 +40,53 @@ if errorlevel 1 (
 echo [OK] Fork installed successfully.
 echo.
 
+:: --- Context mode selection --------------------------------------------------
+echo [3a/5] Context Window Mode
+echo -------------------------------------------------------
+echo synapse-mcp exposes 160+ tools. Without lazy mode, ALL schemas are sent
+echo to the agent on every session start, consuming ~40K tokens before any
+echo real work begins. Lazy mode cuts that to ~800 tokens.
+echo.
+echo  LAZY MODE  (recommended)
+echo    The agent sees 4 meta-tools at startup:
+echo      list_modules   - discover groups: core / symbolic / graph / formats
+echo      list_tools     - list tools in a group with one-line descriptions
+echo      describe_tool  - get full schema for any single tool
+echo      invoke_tool    - call any tool by name
+echo    Context usage: ~800 tokens at startup, schemas fetched on demand.
+echo    Works with all MCP clients. No extra dependencies.
+echo.
+echo  NORMAL MODE
+echo    All 160+ tools exposed upfront.
+echo    Use only if your AI client has a very large context window
+echo    or you need direct tool access without the invoke_tool wrapper.
+echo.
+
+set LAZY_MODE=N
+set /p LAZY_CHOICE="Enable lazy mode? [Y/N] (default Y): "
+if /i "!LAZY_CHOICE!"=="" set LAZY_CHOICE=Y
+if /i "!LAZY_CHOICE!"=="Y" (
+    set LAZY_MODE=Y
+    echo [OK] Lazy mode selected.
+) else (
+    echo [OK] Normal mode selected.
+)
+echo.
+
 :: --- Install the IDA plugin (with interactive TUI) --------------------------
-echo [3/4] Installing IDA Pro plugin...
+echo [3b/5] Installing IDA Pro plugin...
 echo.
 echo The installer will now launch the IDA plugin installer.
 echo If prompted, use arrow keys + space to select optional engines
-echo (Triton / Miasm), then press Enter to confirm.
+echo (Triton / Miasm / Angr), then press Enter to confirm.
 echo.
 pause
 
-call ida-pro-mcp --install
+if "!LAZY_MODE!"=="Y" (
+    call ida-pro-mcp --install --lazy
+) else (
+    call ida-pro-mcp --install
+)
 if errorlevel 1 (
     echo.
     echo [WARNING] IDA plugin installation may have encountered an issue.
@@ -61,7 +98,7 @@ if errorlevel 1 (
 
 :: --- Optional analysis engine libraries --------------------------------
 echo.
-echo [4/4] Optional analysis engines and binary tools
+echo [4/5] Optional analysis engines and binary tools
 echo ----------------------------------------------------
 echo These libraries add advanced binary analysis capabilities to the plugin.
 echo Each is independently optional.
@@ -75,6 +112,11 @@ echo   lief           - lief_*      tools  (PE/ELF/Mach-O analysis, Authenticode
 echo                                          Rich Header, CFG guard table, IDB diff)
 echo   yara           - yara_*      tools  (signature-based scanning, crypto detection,
 echo                                          threat profiling, function annotation)
+echo   angr           - angr_*      tools  (symbolic execution, path exploration,
+echo                                          crackme solving, CFG recovery)
+echo                    NOTE: angr is ~200 MB - the install will show live progress.
+echo   networkx       - nx_*        tools  (call-graph centrality, community detection,
+echo                                          SCCs, paths, dominators, graph diff)
 echo.
 
 set INSTALL_TRITON=N
@@ -84,8 +126,10 @@ set INSTALL_CSTRUCT=N
 set INSTALL_FILETYPE=N
 set INSTALL_LIEF=N
 set INSTALL_YARA=N
+set INSTALL_ANGR=N
+set INSTALL_NETWORKX=N
 
-set /p CHOICE="Install ALL seven libraries? [Y/N] (default N): "
+set /p CHOICE="Install ALL nine libraries? [Y/N] (default N): "
 if /i "!CHOICE!"=="Y" (
     set INSTALL_TRITON=Y
     set INSTALL_MIASM=Y
@@ -94,6 +138,8 @@ if /i "!CHOICE!"=="Y" (
     set INSTALL_FILETYPE=Y
     set INSTALL_LIEF=Y
     set INSTALL_YARA=Y
+    set INSTALL_ANGR=Y
+    set INSTALL_NETWORKX=Y
 ) else (
     echo.
     set /p TRITON_CHOICE="  Install triton           (triton_*    tools)?  [Y/N]: "
@@ -102,20 +148,26 @@ if /i "!CHOICE!"=="Y" (
     set /p MIASM_CHOICE="  Install miasm            (miasm_*     tools)?  [Y/N]: "
     if /i "!MIASM_CHOICE!"=="Y" set INSTALL_MIASM=Y
 
-    set /p CONSTRUCT_CHOICE="  Install construct       (construct_*  tools)?  [Y/N]: "
+    set /p ANGR_CHOICE="  Install angr             (angr_*      tools)?  [Y/N]: "
+    if /i "!ANGR_CHOICE!"=="Y" set INSTALL_ANGR=Y
+
+    set /p CONSTRUCT_CHOICE="  Install construct        (construct_* tools)?  [Y/N]: "
     if /i "!CONSTRUCT_CHOICE!"=="Y" set INSTALL_CONSTRUCT=Y
 
-    set /p CSTRUCT_CHOICE="  Install dissect.cstruct (cstruct_*  tools)?   [Y/N]: "
+    set /p CSTRUCT_CHOICE="  Install dissect.cstruct  (cstruct_*   tools)?  [Y/N]: "
     if /i "!CSTRUCT_CHOICE!"=="Y" set INSTALL_CSTRUCT=Y
 
-    set /p FILETYPE_CHOICE="  Install filetype        (filetype_*  tools)?  [Y/N]: "
+    set /p FILETYPE_CHOICE="  Install filetype         (filetype_*  tools)?  [Y/N]: "
     if /i "!FILETYPE_CHOICE!"=="Y" set INSTALL_FILETYPE=Y
 
-    set /p LIEF_CHOICE="  Install lief            (lief_*      tools)?     [Y/N]: "
+    set /p LIEF_CHOICE="  Install lief             (lief_*      tools)?  [Y/N]: "
     if /i "!LIEF_CHOICE!"=="Y" set INSTALL_LIEF=Y
 
-    set /p YARA_CHOICE="  Install yara-python    (yara_*      tools)?     [Y/N]: "
+    set /p YARA_CHOICE="  Install yara-python      (yara_*      tools)?  [Y/N]: "
     if /i "!YARA_CHOICE!"=="Y" set INSTALL_YARA=Y
+
+    set /p NETWORKX_CHOICE="  Install networkx         (nx_*        tools)?  [Y/N]: "
+    if /i "!NETWORKX_CHOICE!"=="Y" set INSTALL_NETWORKX=Y
 )
 
 echo.
@@ -198,10 +250,45 @@ if "!INSTALL_YARA!"=="Y" (
     )
 )
 
+if "!INSTALL_ANGR!"=="Y" (
+    echo/
+    echo ----------------------------------------------------------------
+    echo  angr requires Visual Studio Build Tools to compile on Windows
+    echo  and is therefore deferred. Install it manually after VS is set up:
+    echo    pip install angr
+    echo ----------------------------------------------------------------
+    echo   [SKIP] angr deferred.
+)
+
+if "!INSTALL_NETWORKX!"=="Y" (
+    echo Installing networkx...
+    pip install "networkx>=3.0" >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARNING] networkx install failed. Run manually: pip install networkx
+    ) else (
+        echo   [OK] networkx installed.
+        set ANY_INSTALLED=Y
+    )
+)
+
 if "!ANY_INSTALLED!"=="N" (
-    if "!INSTALL_TRITON!!INSTALL_MIASM!!INSTALL_CONSTRUCT!!INSTALL_CSTRUCT!!INSTALL_FILETYPE!!INSTALL_LIEF!!INSTALL_YARA!"=="NNNNNNN" (
+    if "!INSTALL_TRITON!!INSTALL_MIASM!!INSTALL_CONSTRUCT!!INSTALL_CSTRUCT!!INSTALL_FILETYPE!!INSTALL_LIEF!!INSTALL_YARA!!INSTALL_ANGR!!INSTALL_NETWORKX!"=="NNNNNNNNN" (
         echo   [SKIP] No optional libraries selected.
     )
+)
+
+:: --- Show MCP config to paste ------------------------------------------------
+echo.
+echo [5/5] MCP Client Configuration
+echo -------------------------------------------------------
+echo Copy the JSON below into your MCP client's config file.
+echo (Claude Desktop: claude_desktop_config.json -- Claude Code: .claude/settings.json)
+echo.
+
+if "!LAZY_MODE!"=="Y" (
+    ida-pro-mcp --config --lazy
+) else (
+    ida-pro-mcp --config
 )
 
 echo.
@@ -211,19 +298,30 @@ echo ============================================================
 echo.
 echo Available commands:
 echo   ida-pro-mcp           (drop-in replacement for upstream)
-echo   ida-triton-miasm-mcp  (fork alias)
-echo   ida-pro-mcp-enhanced  (fork alias)
+echo   synapse-mcp           (primary command)
 echo   idalib-mcp            (headless mode)
 echo   ida-mcp-trace-dump    (trace export utility)
+echo.
+if "!LAZY_MODE!"=="Y" (
+    echo Mode: LAZY   -- 4 meta-tools at startup. Agents call invoke_tool^("name", args^) to use any tool.
+    echo Switch off:     add --no-lazy to the MCP config args for a session, or reinstall without lazy.
+    echo Regenerate:     ida-pro-mcp --config --lazy
+) else (
+    echo Mode: NORMAL -- 160+ tools exposed at startup.
+    echo Switch on:      add --lazy to the MCP config args, or reinstall with lazy mode.
+    echo Regenerate:     ida-pro-mcp --config
+)
 echo.
 echo Next steps:
 echo   1. Restart IDA Pro completely
 echo   2. The MCP server auto-starts on http://127.0.0.1:13337
-echo   3. Configure your MCP client to connect
+echo   3. Paste the config above into your MCP client
 echo.
-echo Tip: To install analysis engines later, run:
+echo To install analysis engines later:
 echo   ida-pro-mcp --install-deps triton
 echo   ida-pro-mcp --install-deps miasm
+echo   ida-pro-mcp --install-deps lief
 echo   ida-pro-mcp --install-deps yara
-echo   pip install construct dissect.cstruct filetype lief yara-python
+echo   ida-pro-mcp --install-deps networkx
+echo   pip install angr construct dissect.cstruct filetype
 pause

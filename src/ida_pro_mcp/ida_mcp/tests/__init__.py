@@ -37,6 +37,11 @@ except Exception:
     pass
 
 try:
+    from . import test_api_angr
+except Exception:
+    pass
+
+try:
     from . import test_hybrid
 except Exception:
     pass

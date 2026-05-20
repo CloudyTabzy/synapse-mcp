@@ -1,6 +1,6 @@
-# IDA Pro Binary Analysis MCP
+# Synapse MCP
 
-> **One MCP server. Seven analysis engines. 140+ tools. Zero configuration overhead.**
+> **One MCP server. Eight analysis engines. 180+ tools. Zero configuration overhead.**
 
 Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
 
@@ -8,11 +8,13 @@ Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — s
 |--------|--------|-------|
 | 🧠 Triton Symbolic Execution | `pip install triton-library` | 30+ |
 | 🔬 Miasm IR Analysis | `pip install miasm` | 20+ |
+| 🐍 Angr Symbolic Execution | `pip install angr` | 22 |
 | 📦 Construct Format Parsing | `pip install construct` | 10 |
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
 | 🔍 LIEF Binary Analysis | `pip install lief` | 19 |
 | 🎯 YARA Signature Scanning | `pip install yara-python` | 15+ |
+| 🕸️ NetworkX Graph Metrics | `pip install networkx>=3.0` | 22 |
 | 🛡️ Native IDA (core + recon + hybrid) | Built-in | 60+ |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
@@ -57,11 +59,13 @@ ida-pro-mcp --install-deps all       # optional engines
 ```
 triton_status      → {"ok": true, "available": true, ...}
 miasm_status       → {"ok": true, "available": true, ...}
+angr_status        → {"ok": true, "available": true, ...}
 construct_status   → {"ok": true, "available": true, ...}
 cstruct_status     → {"ok": true, "available": true, ...}
 filetype_status    → {"ok": true, "available": true, ...}
 lief_status        → {"ok": true, "available": true, "version": "0.17.x", ...}
 yara_status        → {"ok": true, "available": true, ...}
+nx_status          → {"ok": true, "available": true, ...}
 ```
 
 ---
@@ -89,11 +93,13 @@ flowchart TB
     subgraph Engines["Optional Analysis Engines"]
         H[Triton<br/>Symbolic Execution]
         I[Miasm<br/>IR Lifting]
+        I2[Angr<br/>Symbolic Execution]
         J[Construct<br/>Format Parsing]
         K[dissect.cstruct<br/>C Syntax]
         L[filetype<br/>Magic Bytes]
         M[LIEF<br/>Binary Analysis]
         N[YARA<br/>Signature Scanning]
+        N2[NetworkX<br/>Graph Metrics]
     end
 
     A --> B
@@ -104,11 +110,13 @@ flowchart TB
     F --> G
     F -.-> H
     F -.-> I
+    F -.-> I2
     F -.-> J
     F -.-> K
     F -.-> L
     F -.-> M
     F -.-> N
+    F -.-> N2
 ```
 
 **Execution modes:**
@@ -120,36 +128,43 @@ flowchart TB
 
 ## 🎯 Capability Matrix
 
-| Capability | Triton | Miasm | Construct | cstruct | filetype | LIEF | Native |
-|-----------|:------:|:-----:|:---------:|:-------:|:--------:|:----:|:------:|
-| Symbolic execution | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| SMT constraint solving | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| PE/ELF header parsing | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ |
-| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
-| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Capability | Triton | Miasm | Angr | Construct | cstruct | filetype | LIEF | Native |
+|-----------|:------:|:-----:|:----:|:---------:|:-------:|:--------:|:----:|:------:|
+| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ |
+| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Call-graph analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| CFG metrics / dominators | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Community detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Graph diff / ROP gadget graph | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
 
 ---
 
 ## 🎓 Specialized AI Skills
 
-Beyond the raw tool surface, the project ships **12+ focused workflow skills** under `skills/`. Each skill is a mini-playbook that teaches an AI agent how to tackle a specific reverse-engineering scenario — with exact tool calls, decision branches, and report templates.
+Beyond the raw tool surface, the project ships **13+ focused workflow skills** under `skills/`. Each skill is a mini-playbook that teaches an AI agent how to tackle a specific reverse-engineering scenario — with exact tool calls, decision branches, and report templates.
 
 | Skill | What it does |
 |-------|-------------|
@@ -157,6 +172,7 @@ Beyond the raw tool surface, the project ships **12+ focused workflow skills** u
 | `function-deep-dive` | Systematic single-function analysis — decompile, disasm, CFG, stack frame, xrefs, rename, type, comment |
 | `stripped-binary-recovery` | Rebuild semantics from `FUN_xxxx` binaries — FLIRT, prologue scanning, VTables, string xref triage, call-graph hub analysis |
 | `triton-symbolic-exec` | Symbolic execution workflows — one-shot analysis, instruction-by-instruction control, taint tracking, branch solving, snapshots |
+| `angr-symbolic-exec` | Symbolic path exploration workflows — stdin/argv modeling, crackme solving, CFG recovery, backward slicing, snapshot management |
 | `miasm-ir-analysis` | IR lifting, SSA, CFG metrics, dead-code elimination, data-flow tracing, cross-arch assembly |
 | `hybrid-deobfuscate` | Cross-engine deobfuscation — Miasm simplify → Triton verify → optional patching |
 | `construct-format-parsing` | PE/ELF/protocol parsing, C-syntax structs, magic-byte identification, heuristic guessing |
@@ -207,6 +223,60 @@ Requires: `pip install miasm`
 | `miasm_assemble` | Cross-arch assembly to hex bytes |
 | `miasm_patch_instruction` | Assemble + patch directly into IDA database (`@unsafe`) |
 | `miasm_solve_path_constraints` | Enumerate CFG paths; Z3 solve via Triton when available |
+
+### 🐍 Angr — Symbolic Execution (`angr_*`)
+Requires: `pip install angr` (~200 MB; NOT included in `--install-deps all`)
+
+**Status probe** (always available, even without angr installed):
+
+| Tool | What it does |
+|------|-------------|
+| `angr_status` | Probe angr availability, version, and engine flags |
+
+**Core — Load & CFG:**
+
+| Tool | What it does |
+|------|-------------|
+| `angr_load_segment` | Load binary into a cached angr Project (LRU eviction, max 3) |
+| `angr_cfg_fast` | Static CFG via CFGFast — functions, blocks, edges, indirect jumps |
+| `angr_cfg_from_ida` | Build CFG from IDA's FlowChart for a single function |
+| `angr_diff_cfg` | Compare IDA FlowChart vs angr CFGFast block-by-block |
+
+**Core — Symbolic Execution:**
+
+| Tool | What it does |
+|------|-------------|
+| `angr_find_paths` ⭐ | **KILLER FEATURE** — solve for stdin/argv/register inputs that reach a target address |
+| `angr_enumerate_reachable` | BFS reachable addresses from a source over the CFG |
+| `angr_state_evaluate` | Evaluate register/arithmetic/memory expression at a blank state |
+| `angr_hook_function` | Skip, observe, or unhook SimProcedures during symbolic execution |
+
+**Core — Analysis:**
+
+| Tool | What it does |
+|------|-------------|
+| `angr_backward_slice` | Data-flow origin of a register (CFG-only fast or DDG-backed precise) |
+| `angr_value_set` | Register value bounds (min/max) at a program point |
+| `angr_snapshot_save` / `angr_snapshot_restore` | Save/restore SimState snapshots |
+
+**Hybrid — Cross-Engine:**
+
+| Tool | What it does |
+|------|-------------|
+| `hybrid_angr_triton_solve` | angr finds the path → Triton enriches with deep register-level state |
+| `hybrid_angr_stdin_fuzz` | Char-class-constrained stdin enumeration (multiple distinct inputs) |
+| `hybrid_angr_miasm_path` | Miasm deobfuscation context → angr solve |
+| `hybrid_angr_triton_decompile` | Decompile + annotate with symbolic register state |
+| `hybrid_angr_z3_formula` | Export path constraints as SMT-LIB2 for external verification |
+
+**Workflows — High-Level:**
+
+| Tool | What it does |
+|------|-------------|
+| `workflow_solve_crackme` ⭐ | One-call end-to-end serial-key solver (auto-detects success/fail strings) |
+| `workflow_trace_data_flow` | Cross-function backward data-flow trace (slice + IDA xrefs) |
+| `workflow_find_gadgets` | ROP/JOP gadget enumeration in a segment |
+| `workflow_enum_code_hints` | Path constraint hints — which bytes are fixed across all paths |
 
 ### 📦 Construct — Declarative Parsing (`construct_*`)
 Requires: `pip install construct`
@@ -297,6 +367,41 @@ Requires: `pip install lief`
 | `hybrid_lief_checksec_exploit_assess` | One-call exploit-surface rating: checksec + CFG + signature + overlay → HIGH/MEDIUM/LOW |
 | `hybrid_lief_sync_symbols` | Import LIEF export/dynamic/DWARF symbol names into the IDA database (dry_run=true by default) |
 
+### 🕸️ NetworkX — Graph Metrics (`nx_*`)
+Requires: `pip install networkx>=3.0`
+
+| Tool | What it does |
+|------|-------------|
+| `nx_status` | Probe availability and cache stats |
+| `nx_call_graph` | Build a call graph (functions = nodes, calls = edges) |
+| `nx_function_cfg` | Build a per-function CFG with basic-block nodes |
+| `nx_xref_graph` | Cross-reference graph (data + code xrefs as edges) |
+| `nx_central_functions` | PageRank / betweenness / degree centrality scores |
+| `nx_communities` | Louvain community detection — auto-partition malware modules |
+| `nx_cycles` | Find elementary cycles (loop detection) |
+| `nx_dominators` | Immediate dominator tree for a function |
+| `nx_strongly_connected` | Tarjan SCCs — find tightly-coupled component clusters |
+| `nx_topological_order` | Topological sort of the call graph |
+| `nx_shortest_path` | Shortest path between two functions over call graph |
+| `nx_all_paths` | Enumerate all simple paths up to a limit |
+| `nx_neighborhood` | k-hop subgraph around a target function |
+| `nx_subgraph` | Extract induced subgraph from a node list |
+| `nx_graph_diff` | Diff two graphs (e.g., before/after patching) |
+| `nx_graph_metrics` | Global metrics: density, clustering, assortativity, etc. |
+| `nx_export_graph` | Export to Graphviz DOT, GEXF, or adjacency JSON |
+
+**Hybrid workflows:**
+
+| Tool | What it does |
+|------|-------------|
+| `hybrid_nx_triton_taint_graph` | Build a taint-propagation graph from Triton results |
+| `hybrid_nx_angr_target_ranking` | Rank functions by reachability from angr's CFG |
+| `hybrid_nx_lief_import_graph` | Import-dependency graph with LIEF metadata |
+| `hybrid_nx_yara_cluster_detection` | Cluster functions by YARA match similarity |
+| `workflow_binary_diff_summary` | High-level diff report between two binaries |
+| `workflow_find_critical_paths` | Find bottleneck edges whose removal disconnects subgraphs |
+| `workflow_reveng_overview` | One-call RE overview: centrality + communities + top functions |
+
 ### 🎯 Native IDA — Reconnaissance (`api_recon.py`)
 No extra dependencies.
 
@@ -368,7 +473,7 @@ cstruct_define_struct(name="CustomHeader", c_definition="...")
 cstruct_parse_at_address(struct_name="CustomHeader", address="0x405014")
 ```
 
-### Workflow 4: Symbolic Exploit Path Finding
+### Workflow 4: Symbolic Exploit Path Finding (Triton)
 ```
 triton_init()
   ↓
@@ -379,6 +484,28 @@ triton_process_function(address="0x401230", max_insns=500)
 triton_get_path_constraints()
   ↓
 triton_solve_path_constraints(timeout_ms=30000)
+```
+
+### Workflow 4b: Crackme Serial Solving (Angr)
+For binaries where the serial arrives via **stdin** (Triton's blind spot):
+```
+# 1. Auto-detect the success path from IDB string xrefs
+workflow_solve_crackme(target_address="auto-detect", input_mode="stdin", input_size=32)
+  → serial_found: true, serial: "SOSNEAKY", serial_hex: "53 4f 53..."
+
+# 2. Or manually target the check and avoid the failure branch
+angr_find_paths(
+  target_address="0x4012a0",
+  avoid_addresses=["0x4012c0"],
+  input_mode="stdin",
+  char_constraint="alphanumeric",
+  max_paths=3
+)
+  → paths: [{input_bytes: "SOSNEAKY", input_hex: "53 4f 53...", constraint_count: 47}]
+
+# 3. Export the path constraints for external Z3 analysis
+hybrid_angr_z3_formula(path_id=0, include_full_smt2=True)
+  → smt2_formula: "(set-logic QF_BV) ...", constraint_count: 47
 ```
 
 ### Workflow 5: PE Malware Triage (LIEF)
@@ -489,6 +616,26 @@ uv run idalib-mcp --host 127.0.0.1 --port 8745 --max-workers 4
 ```bash
 uv run idalib-mcp --isolated-contexts --stdio
 ```
+
+### Lazy mode (reduce agent context by ~95%)
+```bash
+uv run ida-pro-mcp --lazy
+# or
+uv run idalib-mcp --stdio --lazy path/to/binary
+```
+
+In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 180+ tools:
+
+| Meta-Tool | Purpose |
+|-----------|---------|
+| `list_modules` | Discover 6 tool groups: `core`, `analysis`, `modify`, `symbolic`, `formats`, `recon` |
+| `list_tools(module=..., limit=50, offset=0)` | Paginated tool discovery within a group |
+| `describe_tool(name)` | Full JSON schema for a single tool |
+| `invoke_tool(tool, args)` | Invoke any tool by name |
+
+**Why use it:** Agents with limited context windows fail when 180 tool schemas consume 24–48K tokens before any analysis begins. Lazy mode defers schema loading until the agent actually needs a tool.
+
+**Cache behavior:** The proxy caches the IDA tool list after the first `list_modules` / `list_tools` call. If IDA reloads a new binary mid-session, `invoke_tool` automatically clears the cache and retries on "not found" errors. Agents can also force a refresh with `invoke_tool("__reset_cache__")`.
 
 Dynamic database management in headless mode:
 ```python
@@ -661,20 +808,31 @@ This project is a fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida
 
 ### Project License
 
-The `ida-pro-triton-miasm-mcp` plugin and server code itself retains the same license as upstream. See the `LICENSE` file in the repository root for the exact terms.
+The `synapse-mcp` plugin and server code itself retains the same license as upstream. See the `LICENSE` file in the repository root for the exact terms.
 
 ### Third-Party Engine Licenses
 
 The following optional analysis engines are **not** bundled with this project. They are installed separately by the user via `pip` and loaded dynamically at runtime. This project does not modify their source code.
 
-| Engine | PyPI Package | License |
-|--------|-------------|---------|
-| Triton | `triton-library` | [Apache-2.0](https://github.com/JonathanSalwan/Triton/blob/master/LICENSE) |
-| Miasm | `miasm` | [GPL-2.0](https://github.com/cea-sec/miasm) |
-| Construct | `construct` | [MIT](https://github.com/construct/construct) |
-| dissect.cstruct | `dissect.cstruct` | [Apache-2.0](https://github.com/fox-it/dissect.cstruct/blob/main/LICENSE) |
-| filetype | `filetype` | [MIT](https://github.com/h2non/filetype.py) |
-| LIEF | `lief` | [Apache-2.0](https://github.com/lief-project/LIEF/blob/main/LICENSE) (standard tier); commercial for LIEF Extended |
+| Engine | PyPI Package | License | Notes |
+|--------|-------------|---------|-------|
+| Triton | `triton-library` | [Apache-2.0](https://github.com/JonathanSalwan/Triton/blob/master/LICENSE) | |
+| Miasm | `miasm` | [GPL-2.0](https://github.com/cea-sec/miasm) | Dynamically loaded; does not affect this plugin's license |
+| Angr | `angr` | [BSD-2-Clause](https://github.com/angr/angr/blob/master/LICENSE) | ~200 MB install with native C extensions |
+| Construct | `construct` | [MIT](https://github.com/construct/construct) | |
+| dissect.cstruct | `dissect.cstruct` | [Apache-2.0](https://github.com/fox-it/dissect.cstruct/blob/main/LICENSE) | |
+| filetype | `filetype` | [MIT](https://github.com/h2non/filetype.py) | |
+| LIEF | `lief` | [Apache-2.0](https://github.com/lief-project/LIEF/blob/main/LICENSE) (standard tier); commercial for LIEF Extended | |
+| YARA | `yara-python` | [Apache-2.0](https://github.com/VirusTotal/yara-python) | |
+
+**Transitive dependencies of note:**
+
+| Package | License | Why it matters |
+|---------|---------|---------------|
+| `z3-solver` | [MIT](https://github.com/Z3Prover/z3) | SMT solver used by both Triton and Angr (via Claripy) |
+| `claripy` | [BSD-2-Clause](https://github.com/angr/claripy) | Angr's AST/constraint layer; bundled with angr |
+| `pyvex` | [BSD-2-Clause](https://github.com/angr/pyvex) | Angr's VEX IR lifter; bundled with angr |
+| `cle` | [BSD-2-Clause](https://github.com/angr/cle) | Angr's binary loader; bundled with angr |
 
 > **Note:** Miasm is licensed under GPL-2.0. Because this project loads Miasm as an unmodified, independently-installed optional dependency (dynamic import at runtime, no source modification, no static linking), the GPL-2.0 terms apply to Miasm itself and any derivative works of Miasm, but do not extend to this plugin or to the user's own analysis scripts. If you redistribute a modified version of Miasm itself, GPL-2.0 obligations would apply to that modification.
 >

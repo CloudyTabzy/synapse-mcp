@@ -123,6 +123,26 @@ except Exception as _e:
     )
     api_yara = None  # type: ignore[assignment]
 
+try:
+    from . import api_angr
+except Exception as _e:
+    _log.warning(
+        "api_angr failed to load (%s: %s) — all angr_* tools unavailable. "
+        "Install with: pip install angr  (large ~200 MB)\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_angr = None  # type: ignore[assignment]
+
+try:
+    from . import api_networkx
+except Exception as _e:
+    _log.warning(
+        "api_networkx failed to load (%s: %s) — all nx_* tools unavailable. "
+        "Install with: pip install networkx>=3.0\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_networkx = None  # type: ignore[assignment]
+
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
 from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
@@ -159,6 +179,8 @@ __all__ = [
     "api_miasm",
     "api_lief",
     "api_yara",
+    "api_angr",
+    "api_networkx",
     # Re-exported components
     "idasync",
     "IDAError",

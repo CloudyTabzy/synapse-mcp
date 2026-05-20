@@ -77,7 +77,7 @@ def _import_rpc_name():
     try:
         from rpc import MCP_SERVER_NAME  # type: ignore
     except ImportError:
-        MCP_SERVER_NAME = "ida-pro-triton-miasm-mcp"
+        MCP_SERVER_NAME = "synapse-mcp"
     finally:
         sys.path.remove(str(pkg_dir))
     return MCP_SERVER_NAME

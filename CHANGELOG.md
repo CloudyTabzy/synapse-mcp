@@ -392,7 +392,7 @@ Added 8 modular workflow skills under `skills/`:
 #### Project Bootstrap
 - Forked from `mrexodia/ida-pro-mcp` upstream
 - Added `[project.optional-dependencies]` groups: `triton`, `miasm`, `all`
-- Added `ida-triton-miasm-mcp` script alias
+- Added `synapse-mcp` script alias (replaced `ida-triton-miasm-mcp` and `ida-pro-mcp-enhanced`)
 - Wired optional imports in `ida_mcp/__init__.py`
 
 #### Triton Symbolic Execution (37 tools)

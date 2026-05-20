@@ -37,7 +37,7 @@ except ImportError:
     try:
         from ida_mcp.rpc import MCP_SERVER_NAME
     except ImportError:
-        MCP_SERVER_NAME = "ida-pro-triton-miasm-mcp"
+        MCP_SERVER_NAME = "synapse-mcp"
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server.py")
@@ -143,7 +143,8 @@ def infer_http_transport_type(transport_url: str) -> str:
     return "sse" if urlparse(transport_url).path.rstrip("/") == "/sse" else "http"
 
 
-def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
+def generate_mcp_config(*, client_name: str, transport: str = "stdio", lazy: bool = False):
+    lazy_flags = ["--lazy"] if lazy else []
     if transport == "stdio":
         # No --ida-rpc: server auto-discovers running IDA instances
         if client_name == "Opencode":
@@ -152,6 +153,7 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
                 "command": [
                     get_python_executable(),
                     SERVER_SCRIPT,
+                    *lazy_flags,
                 ],
             }
         elif client_name == "Kilo Code":
@@ -160,6 +162,7 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
                 "command": [
                     get_python_executable(),
                     SERVER_SCRIPT,
+                    *lazy_flags,
                 ],
                 "enabled": True,
             }
@@ -168,6 +171,7 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
                 "command": get_python_executable(),
                 "args": [
                     SERVER_SCRIPT,
+                    *lazy_flags,
                 ],
             }
         env = {}
@@ -195,21 +199,22 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
     return {"type": "http", "url": force_mcp_path(transport_url)}
 
 
-def print_mcp_config():
-    print("[STDIO MCP CONFIGURATION]")
+def print_mcp_config(*, lazy: bool = False):
+    mode_tag = " [LAZY MODE — 4 meta-tools]" if lazy else ""
+    print(f"[STDIO MCP CONFIGURATION{mode_tag}]")
     print(
         json.dumps(
             {
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
-                        client_name="Generic", transport="stdio"
+                        client_name="Generic", transport="stdio", lazy=lazy
                     )
                 }
             },
             indent=2,
         )
     )
-    print("\n[STREAMABLE HTTP MCP CONFIGURATION]")
+    print(f"\n[STREAMABLE HTTP MCP CONFIGURATION{mode_tag}]")
     print(
         json.dumps(
             {
@@ -217,13 +222,14 @@ def print_mcp_config():
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
                         transport=f"http://{IDA_HOST}:{IDA_PORT}/mcp",
+                        lazy=lazy,
                     )
                 }
             },
             indent=2,
         )
     )
-    print("\n[SSE MCP CONFIGURATION]")
+    print(f"\n[SSE MCP CONFIGURATION{mode_tag}]")
     print(
         json.dumps(
             {
@@ -231,6 +237,7 @@ def print_mcp_config():
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
                         transport=f"http://{IDA_HOST}:{IDA_PORT}/sse",
+                        lazy=lazy,
                     )
                 }
             },
@@ -374,6 +381,7 @@ def install_mcp_servers(
     quiet: bool = False,
     only: list[str] | None = None,
     project: bool = False,
+    lazy: bool = False,
 ):
     configs, special_json_structures = _get_scope_config_spec(project=project)
     if not configs:
@@ -436,6 +444,7 @@ def install_mcp_servers(
             mcp_servers[MCP_SERVER_NAME] = generate_mcp_config(
                 client_name=name,
                 transport=transport,
+                lazy=lazy,
             )
 
         _write_config_file(config_path, config, is_toml=is_toml)
@@ -450,10 +459,10 @@ def install_mcp_servers(
         print(
             "No MCP servers installed. For unsupported MCP clients, use the following config:\n"
         )
-        print_mcp_config()
+        print_mcp_config(lazy=lazy)
 
 
-def _build_client_export_config(client_name: str, transport: str) -> dict:
+def _build_client_export_config(client_name: str, transport: str, *, lazy: bool = False) -> dict:
     """Build a complete config dict for a specific client in the format it expects."""
     special = {}
     if client_name in GLOBAL_SPECIAL_JSON_STRUCTURES:
@@ -469,7 +478,7 @@ def _build_client_export_config(client_name: str, transport: str) -> dict:
         special_json_structures=special,
     )
     mcp_servers[MCP_SERVER_NAME] = generate_mcp_config(
-        client_name=client_name, transport=transport
+        client_name=client_name, transport=transport, lazy=lazy
     )
     return config
 
@@ -491,6 +500,7 @@ def export_mcp_configs(
     transport: str = "stdio",
     only: list[str] | None = None,
     project_dir: str | None = None,
+    lazy: bool = False,
 ) -> None:
     """Export MCP config JSON files to the project folder for manual IDE setup."""
     clients = _get_all_export_clients()
@@ -513,7 +523,7 @@ def export_mcp_configs(
 
     written = 0
     for name, filename in clients.items():
-        config = _build_client_export_config(name, transport)
+        config = _build_client_export_config(name, transport, lazy=lazy)
         out_path = os.path.join(out_dir, filename)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -870,6 +880,7 @@ def _apply_client_install(
     transport: str,
     uninstall: bool,
     client_targets: list[str],
+    lazy: bool = False,
 ) -> None:
     if not client_targets:
         return
@@ -880,13 +891,14 @@ def _apply_client_install(
                 shutil.rmtree(out_dir)
                 print(f"Removed exported configs: {out_dir}")
             return
-        export_mcp_configs(transport=transport, only=client_targets)
+        export_mcp_configs(transport=transport, only=client_targets, lazy=lazy)
         return
     install_mcp_servers(
         transport=transport,
         uninstall=uninstall,
         only=client_targets,
         project=(scope == "project"),
+        lazy=lazy,
     )
 
 
@@ -920,11 +932,13 @@ def _interactive_install(*, uninstall: bool, args):
         print("Cancelled.")
         return
 
+    lazy = getattr(args, "lazy", False)
     _apply_client_install(
         scope=scope,
         transport=transport,
         uninstall=uninstall,
         client_targets=selected,
+        lazy=lazy,
     )
 
     if not uninstall:
@@ -935,6 +949,7 @@ def _interactive_install(*, uninstall: bool, args):
 def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
     install_ida_plugin(uninstall=uninstall, allow_ida_free=args.allow_ida_free)
 
+    lazy = getattr(args, "lazy", False)
     if targets_str:
         _apply_client_install(
             scope=_get_install_scope(args, interactive=False),
@@ -943,6 +958,7 @@ def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
             ),
             uninstall=uninstall,
             client_targets=_parse_client_targets(targets_str),
+            lazy=lazy,
         )
         return
 

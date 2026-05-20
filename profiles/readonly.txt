@@ -1,4 +1,4 @@
-# Read-only profile for ida-pro-mcp
+# Read-only profile for synapse-mcp
 #
 # Exposes analysis tools that never mutate the IDB: decompilation, disassembly,
 # xrefs, queries, reads. No renaming, commenting, typing, or patching.

@@ -1448,6 +1448,9 @@ def _hybrid_iterative_deobfuscate_core(
         return {"ok": False, "error": f"No function at {hex(func_start)}"}
 
     prev_signature: tuple[int, int, int] | None = None
+    _last_candidates_found: bool = False
+    _prev_cand_sig: tuple | None = None
+    _dup_iter_count: int = 0
 
     for iter_idx in range(1, max_iterations + 1):
         func = ida_funcs.get_func(func_start) or func
@@ -1506,42 +1509,34 @@ def _hybrid_iterative_deobfuscate_core(
             (ir_stmt_before - ir_stmt_after) / ir_stmt_before * 100, 1
         ) if ir_stmt_before > 0 else 0.0
 
-        block_count_final = block_count_after
-        edge_count_final = edge_count_after
-        ir_stmt_final = ir_stmt_after
-
-        signature = (block_count_final, ir_stmt_final, edge_count_final)
-
-        if prev_signature is not None and signature == prev_signature:
-            iterations.append({
-                "iteration": iter_idx,
-                "block_count_before": prev_signature[0],
-                "block_count_after": block_count_final,
-                "edge_count_before": prev_signature[2],
-                "edge_count_after": edge_count_final,
-                "ir_statements_before": prev_signature[1],
-                "ir_statements_after": ir_stmt_final,
-                "ir_reduction_pct": ir_reduction_pct,
-                "candidates": [],
-                "blocks_removed": 0,
-                "patches_applied": 0,
-                "bytes_nopped": 0,
-                "patch_errors": [],
-                "verified": None,
-                "verification_mismatches": [],
-                "converged": True,
-                "note": "signature unchanged — converged",
-            })
-            converged = True
-            break
-        prev_signature = signature
-        block_count_final = block_count_after
-        edge_count_final = edge_count_after
-        ir_stmt_final = ir_stmt_after
+        signature = (block_count_after, ir_stmt_after, edge_count_after)
 
         candidates = _identify_dead_candidates(asmcfg, ircfg, lifter, func.start_ea)
 
-        signature = (block_count_final, ir_stmt_final, edge_count_final)
+        if (prev_signature is not None and signature == prev_signature):
+            if not candidates or (verify_with_triton and verified is False):
+                iterations.append({
+                    "iteration": iter_idx,
+                    "block_count_before": prev_signature[0],
+                    "block_count_after": block_count_after,
+                    "edge_count_before": prev_signature[2],
+                    "edge_count_after": edge_count_after,
+                    "ir_statements_before": prev_signature[1],
+                    "ir_statements_after": ir_stmt_after,
+                    "ir_reduction_pct": ir_reduction_pct,
+                    "candidates": [],
+                    "blocks_removed": 0,
+                    "patches_applied": 0,
+                    "bytes_nopped": 0,
+                    "patch_errors": [],
+                    "verified": None,
+                    "verification_mismatches": [],
+                    "converged": True,
+                    "note": "signature unchanged — converged",
+                })
+                converged = True
+                break
+        prev_signature = signature
 
         verified: bool | None = None
         mismatches: list[str] = []
@@ -1567,7 +1562,7 @@ def _hybrid_iterative_deobfuscate_core(
                     "patches applied without verification"
                 )
 
-        if candidates and not dry_run:
+        if candidates:
             if verify_with_triton and verified is False:
                 note_parts.append("patches skipped: Triton verification mismatch")
             else:
@@ -1578,7 +1573,11 @@ def _hybrid_iterative_deobfuscate_core(
                         if size <= 0:
                             continue
                         sled = _nop_sled(nop_bytes, size)
-                        if ida_bytes.patch_bytes(addr, sled):
+                        if not dry_run:
+                            if ida_bytes.patch_bytes(addr, sled):
+                                patches_applied += 1
+                                bytes_nopped_iter += size
+                        else:
                             patches_applied += 1
                             bytes_nopped_iter += size
                     except RuntimeError as exc:
@@ -1589,7 +1588,7 @@ def _hybrid_iterative_deobfuscate_core(
                         patch_errors.append(
                             f"{cand['address']}: {type(exc).__name__}: {exc}"
                         )
-                if patches_applied:
+                if patches_applied and not dry_run:
                     idaapi.auto_wait()
                 total_patches += patches_applied
                 total_bytes_nopped += bytes_nopped_iter
@@ -1617,14 +1616,31 @@ def _hybrid_iterative_deobfuscate_core(
             "note": "; ".join(note_parts),
         })
 
-        if not candidates and block_count_after == block_count_before \
-                and ir_stmt_after == ir_stmt_before \
-                and edge_count_after == edge_count_before:
+        prev_signature = (block_count_after, ir_stmt_after, edge_count_after)
+
+        _cand_sig = tuple(sorted(c["address"] for c in candidates)) + (verified,)
+        if _cand_sig == _prev_cand_sig:
+            _dup_iter_count += 1
+        else:
+            _dup_iter_count = 0
+        _prev_cand_sig = _cand_sig
+
+        if _dup_iter_count >= 3:
+            converged = True
+            iterations[-1]["converged"] = True
+            iterations[-1]["note"] = (
+                "converged after repeated identical candidate+verification signatures; "
+                "Triton mismatch all-or-nothing limitation may prevent deobfuscation"
+            )
+            break
+
+        if (not candidates
+                and block_count_after == block_count_before
+                and ir_stmt_after == ir_stmt_before
+                and edge_count_after == edge_count_before):
             converged = True
             iterations[-1]["converged"] = True
             break
-
-        prev_signature = (block_count_final, ir_stmt_final, edge_count_final)
 
     if converged:
         final_state = "converged"

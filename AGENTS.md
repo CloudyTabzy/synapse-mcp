@@ -6,7 +6,7 @@ Guidance for AI agents and contributors working in this repository.
 
 ## What this project is
 
-**ida-pro-triton-miasm-mcp** is a fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that extends the IDA Pro MCP server with built-in support for seven optional binary analysis engines:
+**Synapse MCP** (`synapse-mcp` on PyPI) is a fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that extends the IDA Pro MCP server with built-in support for seven optional binary analysis engines:
 
 - **Triton** (`triton-library`) — dynamic symbolic execution, taint analysis, SMT constraint solving
 - **Miasm** (`miasm`) — binary IR lifting, SSA transformation, deobfuscation, cross-architecture assembly
@@ -33,7 +33,7 @@ All engines are **optional built-in modules**, not separate servers. They regist
 ## Project layout
 
 ```
-ida-pro-triton-miasm-mcp-main/
+synapse-mcp/
 ├── CLAUDE.md                        ← IDA-specific dev rules (authoritative)
 ├── pyproject.toml                   ← package metadata, optional deps, scripts
 ├── uv.lock                          ← locked dependencies
@@ -72,24 +72,31 @@ ida-pro-triton-miasm-mcp-main/
         ├── api_composite.py         ← multi-step composite operations
         ├── api_discovery.py         ← instance discovery tools
         ├── api_sigmaker.py          ← FLIRT signature tools
+        ├── api_recon.py             ← stripped binary reconnaissance
+        ├── api_tasks.py             ← async task queue
+        ├── api_flirt.py             ← FLIRT signature application
         │
-        ├── api_triton.py            ← [NEW] Triton symbolic execution (optional)
-        ├── api_miasm.py             ← [NEW] Miasm IR analysis (optional)
-        ├── api_construct.py         ← [NEW] Construct declarative parsing (optional)
-        ├── api_cstruct.py           ← [NEW] C-syntax struct parsing (optional)
-        ├── api_filetype.py          ← [NEW] Magic-byte file type ID (optional)
-        ├── api_lief.py              ← [NEW] LIEF binary analysis (optional)
-        ├── api_yara.py              ← [NEW] YARA signature scanning (optional)
+        ├── api_triton.py            ← Triton symbolic execution (optional)
+        ├── api_miasm.py             ← Miasm IR analysis (optional)
+        ├── api_construct.py         ← Construct declarative parsing (optional)
+        ├── api_cstruct.py           ← C-syntax struct parsing (optional)
+        ├── api_filetype.py          ← Magic-byte file type ID (optional)
+        ├── api_lief.py              ← LIEF binary analysis (optional)
+        ├── api_yara.py              ← YARA signature scanning (optional)
+        ├── api_angr.py              ← Angr symbolic execution (optional)
+        ├── api_networkx.py          ← NetworkX graph metrics (optional)
         │
         └── tests/                   ← IDA-side tests (run via ida-mcp-test)
             ├── test_api_core.py
             ├── test_api_analysis.py
             ├── ... (one file per api_*.py)
-            ├── test_api_triton.py   ← [NEW] auto-skip if triton-library absent
-            ├── test_api_miasm.py    ← [NEW] auto-skip if miasm absent
-            ├── test_api_construct.py ← [NEW] auto-skip if construct absent
-            ├── test_api_lief.py     ← [NEW] auto-skip if lief absent
-            └── test_api_yara.py     ← [NEW] auto-skip if yara-python absent
+            ├── test_api_triton.py   ← auto-skip if triton-library absent
+            ├── test_api_miasm.py    ← auto-skip if miasm absent
+            ├── test_api_construct.py ← auto-skip if construct absent
+            ├── test_api_lief.py     ← auto-skip if lief absent
+            ├── test_api_yara.py     ← auto-skip if yara-python absent
+            ├── test_api_angr.py     ← auto-skip if angr absent
+            └── test_api_networkx.py ← auto-skip if networkx absent
 ```
 
 ---
@@ -425,7 +432,7 @@ The script is the **single source of truth** for the deploy step — do not copy
 
 ### Server name
 
-The MCP server advertises itself to clients as `ida-pro-triton-miasm-mcp`. The canonical name is defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME` and imported by `server.py`, `idalib_supervisor.py`, and `installer.py`. Do not hardcode the string elsewhere — if you need it, import it.
+The MCP server advertises itself to clients as `synapse-mcp`. The canonical name is defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME` and imported by `server.py`, `idalib_supervisor.py`, and `installer.py`. Do not hardcode the string elsewhere — if you need it, import it.
 
 ### Error handling principle
 
@@ -448,6 +455,29 @@ Every tool returns a structured `dict`. On success, it includes `{"ok": true, ..
 5. In `pyproject.toml`, add the dependency to `[project.optional-dependencies]` and the `all` group
 6. Sync + restart + verify with the `*_status` probe tool
 
+### Lazy mode (`--lazy`)
+
+When the proxy is started with `--lazy`, `tools/list` returns only 4 meta-tools instead of all 180+ tools. This reduces agent context usage by ~95% at session start.
+
+**The 4 meta-tools:**
+| Tool | Purpose |
+|---|---|
+| `list_modules` | Show 6 tool groups (core, analysis, modify, symbolic, formats, recon) with counts |
+| `list_tools(module=..., limit=50, offset=0)` | Paginated tool discovery within a group |
+| `describe_tool(name)` | Full JSON schema for a single tool |
+| `invoke_tool(tool, args)` | Invoke any tool by name |
+
+**Adding a new tool to the lazy-mode grouping:**
+- If the tool has a distinctive prefix (e.g., `triton_`, `miasm_`, `dbg_`), add it to `_TOOL_MODULE_PREFIXES` in `server.py`.
+- If it has no prefix, add it to `_TOOL_MODULE_EXACT` in `server.py`.
+- If it falls through to `core`, `_validate_groups()` will log a startup warning in lazy mode.
+
+**Cache invalidation:**
+- `_lazy_tools_cache` stores the flat tool list from IDA.
+- `_lazy_module_cache` stores per-module slices.
+- Both are cleared automatically when `invoke_tool` hits a "not found" error (e.g., after IDA reload).
+- Agents can force a clear by calling `invoke_tool("__reset_cache__")`.
+
 ### Testing tools
 
 ```bash
@@ -467,7 +497,8 @@ uv run pytest tests/ -q
 ## What NOT to touch
 
 - `ida_mcp/zeromcp/` — vendored modified zeromcp. This is the fork of mrexodia's modifications on top of the original zeromcp. Do not edit unless fixing a protocol-level bug.
-- `idalib_supervisor.py`, `idalib_server.py`, `server.py` — transport and proxy layer. Changes here require protocol-level testing.
+- `idalib_supervisor.py`, `idalib_server.py` — transport and proxy layer. Changes here require protocol-level testing.
+- `server.py` may be modified for lazy-mode and proxy-layer improvements (it is our code, not upstream).
 - Upstream API modules (`api_core.py` through `api_sigmaker.py`) should not be modified to accommodate Triton/Miasm. Keep the new engines in their own files.
 
 ---

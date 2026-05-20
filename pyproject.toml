@@ -1,7 +1,7 @@
 [project]
-name = "ida-pro-triton-miasm-mcp"
+name = "synapse-mcp"
 version = "1.0.0"
-description = "IDA Pro MCP server with built-in Triton symbolic execution, Miasm IR analysis, declarative binary format parsing, and comprehensive binary reconnaissance tools"
+description = "Synapse MCP — An AI-powered reverse engineering assistant for IDA Pro with built-in Triton symbolic execution, Miasm IR analysis, Angr path exploration, and comprehensive binary reconnaissance tools"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -30,12 +30,20 @@ construct = ["construct>=2.10.68"]
 cstruct  = ["dissect.cstruct>=4.0", "filetype>=1.2.0"]
 lief     = ["lief>=0.15.0"]
 yara     = ["yara-python>=4.3.0"]
+# NOTE: angr is intentionally NOT included in 'all'.
+# It is a ~200 MB install with a complex native build chain.
+# Install separately: pip install angr
+angr     = ["angr>=9.2"]
+# NetworkX: small (~1.5 MB), pure-Python, ubiquitously useful for graph analysis.
+# Included in 'all'.
+networkx = ["networkx>=3.0"]
 all      = [
     "triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0",
     "construct>=2.10.68",
     "dissect.cstruct>=4.0", "filetype>=1.2.0",
     "lief>=0.15.0",
     "yara-python>=4.3.0",
+    "networkx>=3.0",
 ]
 
 [dependency-groups]
@@ -46,8 +54,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/CloudyTabzy/ida-pro-triton-miasm-mcp"
-Issues = "https://github.com/CloudyTabzy/ida-pro-triton-miasm-mcp/issues"
+Repository = "https://github.com/CloudyTabzy/synapse-mcp"
+Issues = "https://github.com/CloudyTabzy/synapse-mcp/issues"
 Upstream = "https://github.com/mrexodia/ida-pro-mcp"
 
 [build-system]
@@ -56,8 +64,7 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 ida-pro-mcp = "ida_pro_mcp.server:main"
-ida-triton-miasm-mcp = "ida_pro_mcp.server:main"
-ida-pro-mcp-enhanced = "ida_pro_mcp.server:main"
+synapse-mcp = "ida_pro_mcp.server:main"
 idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
 ida-mcp-test = "ida_pro_mcp.test:main"
 ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"
