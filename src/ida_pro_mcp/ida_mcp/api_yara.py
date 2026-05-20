@@ -35,6 +35,7 @@ import idc
 from .rpc import tool
 from .sync import idasync
 from .utils import parse_address, read_bytes_bss_safe, tool_error, normalize_list_input
+from . import compat
 
 logger = logging.getLogger(__name__)
 
@@ -665,8 +666,8 @@ def _triton_verify_crypto_usage(func_ea: int, size: int, data: bytes, algorithm:
     """
     try:
         import triton as _triton_local
-        info = idaapi.get_inf_structure()
-        arch = _triton_local.ARCH.X86_64 if info.is_64bit() else _triton_local.ARCH.X86
+        is64 = compat.inf_is_64bit()
+        arch = _triton_local.ARCH.X86_64 if is64 else _triton_local.ARCH.X86
         ctx = _triton_local.TritonContext(arch)
         ctx.setMode(_triton_local.MODE.ALIGNED_MEMORY, True)
 
@@ -686,6 +687,8 @@ def _triton_verify_crypto_usage(func_ea: int, size: int, data: bytes, algorithm:
             if idx >= 0:
                 const_va = func_ea + idx
 
+        rip_reg = ctx.registers.rip if is64 else ctx.registers.eip
+
         for _ in range(300):
             instr = _triton_local.Instruction()
             try:
@@ -698,7 +701,7 @@ def _triton_verify_crypto_usage(func_ea: int, size: int, data: bytes, algorithm:
                 break
             for mem_access, _ in instr.getLoadAccess():
                 memory_reads.append(mem_access.getAddress())
-            pc = ctx.getConcreteRegisterValue(ctx.registers.rip if info.is_64bit() else ctx.registers.eip)
+            pc = ctx.getConcreteRegisterValue(rip_reg)
             instrs_processed += 1
             if pc < func_ea or pc >= func_ea + size:
                 break
@@ -739,8 +742,7 @@ def _miasm_lift_and_simplify(func_ea: int, data: bytes) -> tuple[int, int, int, 
         from miasm.core.locationdb import LocationDB
         import miasm.analysis.data_flow as _df
 
-        info = idaapi.get_inf_structure()
-        machine_name = "x86_64" if info.is_64bit() else "x86_32"
+        machine_name = "x86_64" if compat.inf_is_64bit() else "x86_32"
         machine = Machine(machine_name)
         loc_db = LocationDB()
 

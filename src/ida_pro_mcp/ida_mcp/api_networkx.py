@@ -706,27 +706,47 @@ def _resolve_to_graph_node(G, raw_addr) -> int | None:
 
     Tries, in order:
       1. The parsed integer directly.
-      2. The address normalized to its IDA function start (handles the
+      2. Hex fallback for bare hex strings (e.g. "140002590" → 0x140002590).
+      3. The address normalized to its IDA function start (handles the
          "user passed a mid-function address" case).
 
     Returns the matching node ID, or None if neither resolves.
     """
-    try:
-        parsed = _parse_node(raw_addr)
-    except Exception:
-        return None
-    if G.has_node(parsed):
+    parsed = None
+    if isinstance(raw_addr, int):
+        parsed = raw_addr
+    else:
+        try:
+            parsed = _parse_node(raw_addr)
+        except Exception:
+            pass
+
+    if parsed is not None and G.has_node(parsed):
         return parsed
-    try:
-        f = idaapi.get_func(parsed)
-        if f is not None and f.start_ea != parsed and G.has_node(f.start_ea):
-            logger.debug(
-                "Resolved mid-function address %s -> function start %s",
-                hex(parsed), hex(f.start_ea),
-            )
-            return f.start_ea
-    except Exception:
-        pass
+
+    # Hex fallback: "140002590" without 0x prefix might mean 0x140002590
+    if isinstance(raw_addr, str):
+        stripped = raw_addr.strip()
+        if not stripped.startswith("0x") and not stripped.startswith("0X"):
+            try:
+                hex_parsed = int(stripped, 16)
+                if G.has_node(hex_parsed):
+                    return hex_parsed
+            except ValueError:
+                pass
+
+    # Normalize to function start
+    if parsed is not None:
+        try:
+            f = idaapi.get_func(parsed)
+            if f is not None and f.start_ea != parsed and G.has_node(f.start_ea):
+                logger.debug(
+                    "Resolved mid-function address %s -> function start %s",
+                    hex(parsed), hex(f.start_ea),
+                )
+                return f.start_ea
+        except Exception:
+            pass
     return None
 
 
@@ -760,11 +780,22 @@ def _describe_lookup_failure(G, raw_addr: str, parsed_ea: int) -> dict:
 
     info: dict = {
         "input": raw_addr,
-        "parsed_int": parsed_ea,
-        "parsed_hex": hex(parsed_ea),
+        "parsed_as_hex": hex(parsed_ea),
         "graph_node_count": G.number_of_nodes(),
         "sample_node_addrs": sample,
     }
+    # If the raw input looks like a bare hex string, also show the hex
+    # interpretation so the user can spot missing-0x-prefix typos.
+    if isinstance(raw_addr, str):
+        stripped = raw_addr.strip()
+        if not stripped.startswith("0x") and not stripped.startswith("0X"):
+            try:
+                hex_fallback = int(stripped, 16)
+                if hex_fallback != parsed_ea:
+                    info["hex_fallback"] = hex(hex_fallback)
+            except ValueError:
+                pass
+
     if ida_func_start is not None:
         info["ida_function_start"] = ida_func_start
         info["ida_function_name"] = ida_func_name
@@ -772,13 +803,15 @@ def _describe_lookup_failure(G, raw_addr: str, parsed_ea: int) -> dict:
             f"IDA reports a function at {ida_func_start} ({ida_func_name}) "
             f"covering {raw_addr}, but it isn't in this cached graph. "
             "Two likely causes: (1) the address is mid-function — pass the "
-            "function start; (2) the cached graph is stale (function created "
-            "after the graph was built) — call nx_call_graph to rebuild."
+            "function start as a hex string (e.g. '0x140002590'); "
+            "(2) the cached graph is stale (function created after the graph "
+            "was built) — call nx_call_graph to rebuild."
         )
     else:
         info["hint"] = (
             f"No IDA function covers {raw_addr}. Verify the address is correct "
-            "and that the binary actually defines a function there."
+            "(use hex strings like '0x140002590') and that the binary actually "
+            "defines a function there."
         )
     return info
 

@@ -1,5 +1,6 @@
 """Core API Functions - IDB metadata and basic queries"""
 
+import ast
 import logging
 import re
 import time
@@ -497,14 +498,65 @@ def lookup_funcs(
     return results
 
 
+def _eval_int_expression(text: str) -> int:
+    """Safely evaluate a numeric expression containing bitwise operators.
+
+    Falls back to plain int() for simple literals. For expressions like
+    '0x3e ^ 0x5d' or '(0x10 << 2) | 3', parses via ast and evaluates with
+    a restricted namespace (no builtins, no calls, no attribute access).
+    """
+    # 1) Plain literal (hex, dec, oct, bin)
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+
+    # 2) Expression — validate AST, then eval safely
+    try:
+        tree = ast.parse(text.strip(), mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid expression: {text}") from exc
+
+    _ALLOWED = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.Pow,
+        ast.LShift,
+        ast.RShift,
+        ast.BitOr,
+        ast.BitXor,
+        ast.BitAnd,
+        ast.Invert,
+        ast.USub,
+        ast.UAdd,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED):
+            raise ValueError(
+                f"Unsupported element in expression: {type(node).__name__}"
+            )
+
+    result = eval(compile(tree, "<string>", "eval"), {"__builtins__": {}}, {})
+    return int(result)
+
+
 @tool
 def int_convert(
     inputs: Annotated[
         list[NumberConversion] | NumberConversion,
-        "Convert numbers to various formats (hex, decimal, binary, ascii)",
+        "Convert numbers to various formats (hex, decimal, binary, ascii). "
+        "Supports basic arithmetic and bitwise expressions: + - * // % ** "
+        "<< >> & | ^ ~.",
     ],
 ) -> list[IntConvertResult]:
-    """Convert numbers to different formats"""
+    """Convert numbers to different formats. Supports expressions like 0x3e ^ 0x5d."""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
     results = []
@@ -513,10 +565,10 @@ def int_convert(
         size = item.get("size")
 
         try:
-            value = int(text, 0)
-        except ValueError:
+            value = _eval_int_expression(text)
+        except Exception as exc:
             results.append(
-                {"input": text, "result": None, "error": f"Invalid number: {text}"}
+                {"input": text, "result": None, "error": f"Invalid number: {exc}"}
             )
             continue
 

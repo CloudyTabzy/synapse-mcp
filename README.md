@@ -1,21 +1,21 @@
 # Synapse MCP
 
-> **One MCP server. Nine analysis engines. 180+ tools. Zero configuration overhead.**
+> **One MCP server. Nine analysis engines. 290+ tools. Zero configuration overhead.**
 
 Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, graph-theoretic analysis, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
 
 | Engine | Status | Tools |
 |--------|--------|-------|
-| 🧠 Triton Symbolic Execution | `pip install triton-library` | 30+ |
-| 🔬 Miasm IR Analysis | `pip install miasm` | 20+ |
+| 🧠 Triton Symbolic Execution | `pip install triton-library` | 51 |
+| 🔬 Miasm IR Analysis | `pip install miasm` | 21 |
 | 🐍 Angr Symbolic Execution | `pip install angr` | 22 |
 | 📦 Construct Format Parsing | `pip install construct` | 10 |
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
 | 🔍 LIEF Binary Analysis | `pip install lief` | 19 |
-| 🎯 YARA Signature Scanning | `pip install yara-python` | 15+ |
-| 🕸️ NetworkX Graph Metrics | `pip install networkx>=3.0` | 22 |
-| 🛡️ Native IDA (core + recon + hybrid) | Built-in | 60+ |
+| 🎯 YARA Signature Scanning | `pip install yara-python` | 11 |
+| 🕸️ NetworkX Graph Metrics | `pip install networkx>=3.0` | 24 |
+| 🛡️ Native IDA (core + recon + hybrid) | Built-in | 124 |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
 
@@ -23,7 +23,7 @@ Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — s
 
 ## 🦥 Lazy Mode — 95% Less Context, Same Power
 
-AI agents have a dirty secret: every MCP session starts by loading **all 180+ tool schemas** into context. That's 24,000–48,000 tokens burned before a single analysis step. For agents with 64K or 128K context windows, this leaves almost no room for the actual work — decompilation, symbolic execution, cross-references.
+AI agents have a dirty secret: every MCP session starts by loading **all 290+ tool schemas** into context. That's 24,000–48,000 tokens burned before a single analysis step. For agents with 64K or 128K context windows, this leaves almost no room for the actual work — decompilation, symbolic execution, cross-references.
 
 **Lazy mode fixes this.** Start the server with `--lazy` and `tools/list` returns only **4 meta-tools**:
 
@@ -648,7 +648,7 @@ uv run ida-pro-mcp --lazy
 uv run idalib-mcp --stdio --lazy path/to/binary
 ```
 
-In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 180+ tools:
+In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 290+ tools:
 
 | Meta-Tool | Purpose |
 |-----------|---------|
@@ -657,7 +657,7 @@ In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 180+ too
 | `describe_tool(name)` | Full JSON schema for a single tool |
 | `invoke_tool(tool, args)` | Invoke any tool by name |
 
-**Why use it:** Agents with limited context windows fail when 180 tool schemas consume 24–48K tokens before any analysis begins. Lazy mode defers schema loading until the agent actually needs a tool.
+**Why use it:** Agents with limited context windows fail when 290 tool schemas consume 40–60K tokens before any analysis begins. Lazy mode defers schema loading until the agent actually needs a tool.
 
 **Cache behavior:** The proxy caches the IDA tool list after the first `list_modules` / `list_tools` call. If IDA reloads a new binary mid-session, `invoke_tool` automatically clears the cache and retries on "not found" errors. Agents can also force a refresh with `invoke_tool("__reset_cache__")`.
 

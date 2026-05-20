@@ -76,6 +76,53 @@ _MAX_EXEC_TRACE_LEN = 10000
 _exec_traces: "dict[str, collections.deque[int]]" = {}
 _exec_traces_lock = threading.Lock()
 
+# Extra constraints injected via triton_inject_comparison_constraint.
+# These are ANDed with getPathPredicate() at solve time, allowing manual
+# "memcmp equality" or arbitrary SMT constraints to influence the model
+# without needing to appear in a branch path constraint.
+_injected_constraints: "dict[str, list]" = {}  # key -> list of AST nodes
+_injected_lock = threading.Lock()
+
+# Pre-registered stdin buffer config set by triton_symbolize_stdin.
+# Maps alias_prefix → {"size": int, "alias_prefix": str}
+_STDIN_BUFFER: dict = {}
+
+
+def _get_injected() -> "list":
+    with _injected_lock:
+        if _CTX_KEY not in _injected_constraints:
+            _injected_constraints[_CTX_KEY] = []
+        return _injected_constraints[_CTX_KEY]
+
+
+def _clear_injected() -> None:
+    with _injected_lock:
+        _injected_constraints.pop(_CTX_KEY, None)
+
+
+def _fmt_triton_version() -> str:
+    """Return a human-readable Triton version string (e.g. '1.0.1597+z3')."""
+    if not TRITON_AVAILABLE:
+        return "unavailable"
+    try:
+        v = getattr(_triton_lib, "VERSION", None)
+        if v is None:
+            return "unknown"
+        major = getattr(v, "MAJOR", "?")
+        minor = getattr(v, "MINOR", "?")
+        build = getattr(v, "BUILD", "?")
+        backends = []
+        if getattr(v, "Z3_INTERFACE", False):
+            backends.append("z3")
+        if getattr(v, "BITWUZLA_INTERFACE", False):
+            backends.append("bitwuzla")
+        if getattr(v, "LLVM_INTERFACE", False):
+            backends.append("llvm")
+        suffix = "+" + "+".join(backends) if backends else ""
+        return f"{major}.{minor}.{build}{suffix}"
+    except Exception:
+        return "installed"
+
 
 def _get_trace() -> "collections.deque[int]":
     with _exec_traces_lock:
@@ -180,17 +227,21 @@ def _str_to_arch(name: str) -> "ARCH":
 # Context factory
 # ============================================================================
 
-def _build_ctx(arch: "ARCH") -> "TritonContext":
+def _build_ctx(arch: "ARCH", pc_tracking_symbolic: bool = False) -> "TritonContext":
     ctx = TritonContext()
     ctx.setArchitecture(arch)
     ctx.setAstRepresentationMode(AST_REPRESENTATION.PYTHON)
     ctx.setSolver(SOLVER.Z3)
-    # Sensible defaults: reduce AST size, fold constants, track aligned memory
+    # Reduce AST size, fold constants, track aligned memory
     ctx.setMode(MODE.AST_OPTIMIZATIONS, True)
     ctx.setMode(MODE.CONSTANT_FOLDING, True)
     ctx.setMode(MODE.ALIGNED_MEMORY, True)
-    # Only track path constraints when at least one symbolic variable is involved
-    ctx.setMode(MODE.PC_TRACKING_SYMBOLIC, True)
+    # PC_TRACKING_SYMBOLIC=True: only add path constraints when the branch
+    # condition involves at least one symbolic variable. This prevents constraint
+    # bloat for concrete-only branches but means branches on un-symbolized memory
+    # (e.g. PEB via gs:60h) produce zero constraints. Set False to track all
+    # branches regardless, at the cost of larger (but trivially satisfied) predicates.
+    ctx.setMode(MODE.PC_TRACKING_SYMBOLIC, pc_tracking_symbolic)
     return ctx
 
 
@@ -329,7 +380,7 @@ def triton_status(
     """
     version = "unknown"
     if TRITON_AVAILABLE:
-        version = str(getattr(_triton_lib, "VERSION", "installed"))
+        version = _fmt_triton_version()
 
     if not TRITON_AVAILABLE:
         return {
@@ -434,6 +485,16 @@ def triton_init(
         "its current state. Useful at the top of analysis scripts that may be "
         "called multiple times. Default False (always reinitialize).",
     ] = False,
+    pc_tracking_symbolic: Annotated[
+        bool,
+        "When True, path constraints are only collected for branches whose condition "
+        "involves at least one symbolic variable (low noise, but misses concrete branches). "
+        "When False (default), ALL branches are tracked regardless of symbolization — "
+        "this is the practical default because it ensures Windows PEB checks, length "
+        "guards, and other concrete branches all appear in the path predicate. "
+        "Use True only when the function has many irrelevant concrete branches you "
+        "want to exclude from the constraint set.",
+    ] = False,
 ) -> TritonInitResult:
     """Initialise (or re-initialise) a Triton context for the current binary.
 
@@ -444,6 +505,11 @@ def triton_init(
     Pass ``skip_if_initialized=True`` for idempotent calls: if a context is
     already active the tool returns immediately with ``already_initialized=true``
     rather than wiping existing symbolic state.
+
+    **Windows binaries**: After init, call ``triton_setup_windows_x64`` to model
+    the GS segment (TEB/PEB), stack, and shadow space so that anti-debug checks
+    against ``gs:60h`` produce satisfiable concrete constraints rather than
+    unresolved symbolic ones.
     """
     if not TRITON_AVAILABLE:
         return {"ok": False, "architecture": "", "version": "", "error": "triton-library not installed"}
@@ -454,7 +520,7 @@ def triton_init(
             with _contexts_lock:
                 existing = _contexts.get(_CTX_KEY)
             if existing is not None:
-                version = str(getattr(_triton_lib, "VERSION", "installed"))
+                version = _fmt_triton_version()
                 arch_str = _arch_to_str(existing.getArchitecture())
                 return {
                     "ok": True,
@@ -468,14 +534,21 @@ def triton_init(
         else:
             arch = _detect_arch_from_ida()
 
-        ctx = _build_ctx(arch)
+        ctx = _build_ctx(arch, pc_tracking_symbolic=pc_tracking_symbolic)
         _set_ctx(_CTX_KEY, ctx)
         _clear_trace()
+        _clear_injected()
+        _STDIN_BUFFER.clear()
 
-        version = str(getattr(_triton_lib, "VERSION", "installed"))
+        version = _fmt_triton_version()
         arch_str = _arch_to_str(arch)
-        logger.info("Triton context initialised for %s", arch_str)
-        return {"ok": True, "architecture": arch_str, "version": version}
+        logger.info("Triton context initialised for %s (pc_tracking_symbolic=%s)", arch_str, pc_tracking_symbolic)
+        return {
+            "ok": True,
+            "architecture": arch_str,
+            "version": version,
+            "pc_tracking_symbolic": pc_tracking_symbolic,
+        }
 
     except IDAError as e:
         return {"ok": False, "architecture": architecture, "version": "", "error": e.message}
@@ -498,6 +571,7 @@ def triton_reset() -> TritonResetResult:
         ctx = _get_ctx()
         ctx.reset()
         ctx.clearPathConstraints()
+        _clear_injected()
         return {"ok": True, "message": "Triton context reset — symbolic state cleared, architecture preserved."}
     except IDAError as e:
         return {"ok": False, "error": e.message}
@@ -1137,38 +1211,92 @@ def triton_get_symbolic_expressions(
 def triton_get_path_constraints() -> dict:
     """List all path constraints accumulated during symbolic execution.
 
-    Each constraint corresponds to a conditional branch. The branch_constraints
-    field contains the taken/not-taken predicates for that branch, which can
-    be negated and fed to triton_solve_path_constraints for reachability queries.
+    Each constraint corresponds to a conditional branch. Each branch entry now
+    includes a constraint_type field:
+    - "symbolic"       — condition involves at least one symbolic variable → solver can steer it
+    - "concrete_true"  — condition is always True (never gates execution)
+    - "concrete_false" — condition is always False (path is infeasible with current state)
+    - "concrete"       — condition is concrete but not trivially true/false
+
+    Use triton_check_input_reaches_branch to understand whether your symbolized input
+    flows into any branch. Constraints with constraint_type="concrete" cannot be solved
+    for inputs — only "symbolic" ones produce useful Z3 models.
     """
     if not TRITON_AVAILABLE:
         return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
+        all_sym_var_names = {sv.getName() for sv in ctx.getSymbolicVariables().values()}
         pcs = ctx.getPathConstraints()
         items: list[PathConstraintItem] = []
+        symbolic_count = 0
+        concrete_count = 0
+
         for pc in pcs:
             branches = []
+            pc_has_symbolic = False
             for branch in pc.getBranchConstraints():
+                ast_str = str(branch["constraint"])
+                has_sym = bool(all_sym_var_names & set(ast_str.split()))
+
+                # Classify constraint type
+                if has_sym:
+                    ctype = "symbolic"
+                    pc_has_symbolic = True
+                else:
+                    # Check for trivially concrete: try eval via str comparison
+                    ast_lower = ast_str.strip()
+                    if ast_lower in ("true", "#b1", "(= #b1 #b1)"):
+                        ctype = "concrete_true"
+                    elif ast_lower in ("false", "#b0", "(= #b1 #b0)"):
+                        ctype = "concrete_false"
+                    else:
+                        ctype = "concrete"
+
                 branches.append({
                     "is_taken": branch["isTaken"],
                     "src_addr": hex(branch["srcAddr"]),
                     "dst_addr": hex(branch["dstAddr"]),
-                    "constraint": str(branch["constraint"]),
+                    "constraint_type": ctype,
+                    "has_symbolic": has_sym,
+                    "constraint": ast_str,
                 })
+
+            if pc_has_symbolic:
+                symbolic_count += 1
+            else:
+                concrete_count += 1
+
             items.append({
                 "source_addr": hex(pc.getSourceAddress()),
                 "taken_addr": hex(pc.getTakenAddress()),
                 "is_multiple_branches": pc.isMultipleBranches(),
+                "has_symbolic": pc_has_symbolic,
                 "branches": branches,
             })
 
-        return {"ok": True, "count": len(items), "path_constraints": items}
+        advice = ""
+        if items and symbolic_count == 0:
+            advice = (
+                "All constraints are concrete — the solver cannot produce useful input assignments. "
+                "Ensure you symbolized the correct register or memory region BEFORE running "
+                "the instructions that contain the branch. Use triton_check_input_reaches_branch "
+                "or triton_scan_for_input_calls to diagnose."
+            )
+
+        return {
+            "ok": True,
+            "count": len(items),
+            "symbolic_constraints": symbolic_count,
+            "concrete_constraints": concrete_count,
+            "advice": advice,
+            "path_constraints": items,
+        }
 
     except IDAError as e:
         return {"ok": False, "error": e.message}
     except Exception as e:
-        logger.exception("triton_reset failed")
+        logger.exception("triton_get_path_constraints failed")
         return {"ok": False, "error": str(e)}
 
 
@@ -1374,36 +1502,54 @@ def triton_solve_path_constraints(
     Returns a model mapping each symbolic variable name to its concrete value.
     Set negate_last=true to explore the opposite side of the most recent branch.
 
+    When the result is sat=false, a 'diagnostics' field explains the likely cause:
+    - no_path_constraints: PC_TRACKING_SYMBOLIC filtered all branches (see hint)
+    - concrete_constraints_only: branches don't depend on your symbolic variables
+    - unsat: the constraint set is genuinely unsatisfiable
+
     Typical workflow:
       1. triton_init()
-      2. triton_symbolize_register('rdi')     # mark argument as unknown
-      3. triton_process_function('0x401000')  # execute symbolically
-      4. triton_solve_path_constraints()      # find input reaching observed path
-      5. triton_solve_path_constraints(negate_last=true)  # find input for other branch
+      2. triton_setup_windows_x64()           # for Windows binaries (PEB/gs setup)
+      3. triton_symbolize_register('rdi')     # mark argument as unknown
+      4. triton_process_function('0x401000')  # execute symbolically
+      5. triton_solve_path_constraints()      # find input reaching observed path
+      6. triton_solve_path_constraints(negate_last=true)  # find input for other branch
     """
     if not TRITON_AVAILABLE:
         return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
-        ast = ctx.getAstContext()
+        ast_ctx = ctx.getAstContext()
+        pcs = ctx.getPathConstraints()
 
-        predicate = ctx.getPathPredicate()
+        if negate_last and pcs:
+            # Build predicate: conjunction of all-but-last taken predicates
+            # THEN add the NOT-taken alternative of the last branch.
+            # This is the correct Triton pattern (from code_coverage_crackme_xor.py).
+            prev = ast_ctx.equal(ast_ctx.bvtrue(), ast_ctx.bvtrue())
+            for pc in pcs[:-1]:
+                prev = ast_ctx.land([prev, pc.getTakenPredicate()])
 
-        if negate_last:
-            pcs = ctx.getPathConstraints()
-            if pcs:
-                last = pcs[-1]
-                ctx.popPathConstraint()
-                for branch in last.getBranchConstraints():
-                    if not branch["isTaken"]:
-                        ctx.pushPathConstraint(branch["constraint"])
-                        break
+            last = pcs[-1]
+            not_taken_node = None
+            for branch in last.getBranchConstraints():
+                if not branch["isTaken"]:
+                    not_taken_node = branch["constraint"]
+                    break
+
+            if not_taken_node is not None:
+                predicate = ast_ctx.land([prev, not_taken_node])
+            else:
+                # Last branch has no not-taken alternative (e.g. unconditional jump)
                 predicate = ctx.getPathPredicate()
+        else:
+            predicate = ctx.getPathPredicate()
 
         model = ctx.getModel(predicate, timeout=timeout_ms)
 
         if not model:
-            return {"ok": True, "sat": False, "model": {}}
+            diag = _constraint_diagnostics(ctx)
+            return {"ok": True, "sat": False, "model": {}, "diagnostics": diag}
 
         result: dict[str, str] = {}
         for var_id, solver_model in model.items():
@@ -1418,6 +1564,1779 @@ def triton_solve_path_constraints(
     except Exception as e:
         logger.exception("triton_solve_path_constraints failed")
         return {"ok": False, "sat": False, "model": {}, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_setup_windows_x64(
+    teb_address: Annotated[
+        str,
+        "Base address for the fake TEB (Thread Environment Block). "
+        "Default 0x7ffa0000 — a safe region well below the typical stack.",
+    ] = "0x7ffa0000",
+    peb_address: Annotated[
+        str,
+        "Base address for the fake PEB (Process Environment Block). "
+        "Default 0x7ff90000.",
+    ] = "0x7ff90000",
+    stack_top: Annotated[
+        str,
+        "Initial RSP value. Default 0x7fffffffe000 (typical Windows user-mode stack).",
+    ] = "0x7fffffffe000",
+    being_debugged: Annotated[
+        int,
+        "Value for PEB.BeingDebugged (offset 0x2). 0 = not debugged (default). "
+        "Set 1 to simulate a debugger being present.",
+    ] = 0,
+    nt_global_flag: Annotated[
+        int,
+        "Value for PEB.NtGlobalFlag (offset 0x68 on x64). 0 = default user mode. "
+        "Anti-debug checks look for 0x70 here when a debugger is attached.",
+    ] = 0,
+    heap_flags: Annotated[
+        int,
+        "Value for first heap's Flags field (at PEB.ProcessHeap+0x14 on x64). "
+        "Normally 2 (HEAP_GROWABLE). Anti-debug checks look for non-2 values.",
+    ] = 2,
+    heap_force_flags: Annotated[
+        int,
+        "Value for first heap's ForceFlags field (at PEB.ProcessHeap+0x18 on x64). "
+        "Normally 0. Anti-debug checks look for non-zero values.",
+    ] = 0,
+) -> dict:
+    """Set up a realistic Windows x64 execution environment in the Triton context.
+
+    Windows x64 binaries commonly access the TEB/PEB via the GS segment register
+    (``mov rax, gs:[0x60]`` to get the PEB pointer). Without modeling these
+    structures, Triton reads from virtual address 0x60 (unmapped → returns 0)
+    which makes PEB-based anti-debug checks produce concrete-false branch
+    conditions that the solver cannot satisfy.
+
+    This tool:
+      1. Sets gs_base to ``teb_address`` (so ``gs:[0x60]`` resolves to TEB+0x60)
+      2. Writes a minimal fake TEB with the PEB pointer at offset 0x60
+      3. Writes a minimal fake PEB with BeingDebugged, NtGlobalFlag, heap fields
+      4. Sets RSP to ``stack_top`` with 32-byte shadow space allocated below
+      5. Sets RBP to the same value
+
+    After calling this tool, re-symbolize your argument registers (they are
+    cleared by the TEB/PEB memory writes if they overlap — they don't with
+    default addresses, but always symbolize AFTER this call to be safe).
+
+    **Typical workflow for Windows crackmes:**
+
+      1. triton_init(architecture="x86_64")
+      2. triton_setup_windows_x64()
+      3. triton_symbolize_register("rcx")   # first arg in Windows x64 ABI
+      4. triton_process_function("0x401000")
+      5. triton_solve_path_constraints()
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
+    try:
+        ctx = _get_ctx()
+        arch = ctx.getArchitecture()
+        if arch != ARCH.X86_64:
+            return {
+                "ok": False,
+                "error": f"triton_setup_windows_x64 requires x86_64 architecture, got {_arch_to_str(arch)}",
+            }
+
+        def _parse(s: str) -> int:
+            return int(s, 16) if isinstance(s, str) and s.startswith("0x") else int(s, 0)
+
+        teb = _parse(teb_address)
+        peb = _parse(peb_address)
+        stack = _parse(stack_top)
+
+        # ── GS segment base ────────────────────────────────────────────────
+        # On Windows x64, GS.base = TEB base. Setting gs_base register causes
+        # Triton to resolve gs:[offset] as teb + offset.
+        try:
+            gs_reg = ctx.getRegister("gs_base")
+            ctx.setConcreteRegisterValue(gs_reg, teb)
+        except Exception:
+            # Some Triton builds expose it as "gs" directly
+            try:
+                gs_reg = ctx.getRegister("gs")
+                ctx.setConcreteRegisterValue(gs_reg, teb)
+            except Exception as e:
+                logger.warning("Could not set gs_base: %s", e)
+
+        # ── Fake TEB (minimal) ──────────────────────────────────────────────
+        # TEB layout (x64, relevant fields):
+        #   +0x000  NtTib.StackBase (8 bytes)
+        #   +0x008  NtTib.StackLimit (8 bytes)
+        #   +0x030  ProcessEnvironmentBlock pointer (8 bytes) → PEB address
+        #   +0x060  PEB pointer (alternative — some code reads TEB+0x60 directly
+        #            as shorthand on older Windows; keep both)
+        import struct
+        teb_data = bytearray(0x200)
+        struct.pack_into("<Q", teb_data, 0x000, stack)        # StackBase
+        struct.pack_into("<Q", teb_data, 0x008, stack - 0x100000)  # StackLimit
+        struct.pack_into("<Q", teb_data, 0x030, peb)          # PEB ptr (standard)
+        struct.pack_into("<Q", teb_data, 0x060, peb)          # PEB ptr (gs:[0x60])
+        ctx.setConcreteMemoryAreaValue(teb, bytes(teb_data))
+
+        # ── Fake heap (referenced by PEB.ProcessHeap) ───────────────────────
+        heap_addr = peb + 0x1000
+        heap_data = bytearray(0x40)
+        struct.pack_into("<I", heap_data, 0x14, heap_flags)       # Heap.Flags
+        struct.pack_into("<I", heap_data, 0x18, heap_force_flags)  # Heap.ForceFlags
+        ctx.setConcreteMemoryAreaValue(heap_addr, bytes(heap_data))
+
+        # ── Fake PEB (minimal) ──────────────────────────────────────────────
+        # PEB layout (x64, anti-debug relevant fields):
+        #   +0x000  InheritedAddressSpace (1 byte)
+        #   +0x001  ReadImageFileExecOptions (1 byte)
+        #   +0x002  BeingDebugged (1 byte)  ← checked by IsDebuggerPresent
+        #   +0x003  BitField (1 byte, NtGlobalFlag bits...)
+        #   +0x010  ImageBaseAddress (8 bytes)
+        #   +0x018  Ldr (8 bytes)
+        #   +0x020  ProcessParameters (8 bytes)
+        #   +0x058  NtGlobalFlag (was 0x68 on older Windows x64 PEB)
+        #             Actually NtGlobalFlag is at:
+        #             PEB+0x068 on Windows 8.1+ x64
+        #             PEB+0x06C on older x86 PEB
+        #   +0x010  — ProcessHeap ptr at PEB+0x30 on x64
+        #
+        # We zero out 0x200 bytes then set the specific fields.
+        peb_data = bytearray(0x200)
+        peb_data[0x002] = being_debugged & 0xFF
+        # NtGlobalFlag: at PEB+0x68 on Windows x64 (confirmed by WinDbg dt _PEB)
+        struct.pack_into("<I", peb_data, 0x068, nt_global_flag & 0xFFFFFFFF)
+        # ProcessHeap pointer at PEB+0x30 (x64)
+        struct.pack_into("<Q", peb_data, 0x030, heap_addr)
+        ctx.setConcreteMemoryAreaValue(peb, bytes(peb_data))
+
+        # ── Stack ────────────────────────────────────────────────────────────
+        # Allocate 64 KB of zeroed stack memory below RSP
+        stack_buf_size = 0x10000
+        stack_buf_base = stack - stack_buf_size
+        ctx.setConcreteMemoryAreaValue(stack_buf_base, b"\x00" * stack_buf_size)
+
+        rsp_reg = ctx.getRegister("rsp")
+        rbp_reg = ctx.getRegister("rbp")
+        # Windows x64 ABI: caller allocates 32-byte shadow space; RSP must be
+        # 16-byte aligned before the CALL. We set RSP to stack - 8 (simulating
+        # the return address push) with shadow space already accounted for.
+        ctx.setConcreteRegisterValue(rsp_reg, stack - 8)
+        ctx.setConcreteRegisterValue(rbp_reg, stack)
+
+        return {
+            "ok": True,
+            "teb_address": hex(teb),
+            "peb_address": hex(peb),
+            "gs_base_set": hex(teb),
+            "stack_rsp": hex(stack - 8),
+            "being_debugged": being_debugged,
+            "nt_global_flag": nt_global_flag,
+            "heap_addr": hex(heap_addr),
+            "heap_flags": heap_flags,
+            "heap_force_flags": heap_force_flags,
+            "note": (
+                "Windows memory model initialized. gs:[0x60] now resolves to the "
+                f"fake PEB at {hex(peb)}. Symbolize argument registers AFTER this call."
+            ),
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_setup_windows_x64 failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_diagnose_constraints() -> dict:
+    """Diagnose why triton_solve_path_constraints returned UNSAT or an empty model.
+
+    Inspects the current path constraints and symbolic variables to explain
+    the most likely cause of solver failure. Returns:
+
+    - constraint_count: total path constraints accumulated
+    - symbolic_var_count: symbolic variables in the context
+    - constraints_with_symbolic: constraints that reference at least one symbolic var
+    - constraints_all_concrete: constraints entirely on concrete values
+    - per_constraint details: AST string, whether symbolic, whether taken
+    - hint: human-readable explanation and suggested fix
+
+    This is the first tool to call when you see sat=false.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
+    try:
+        ctx = _get_ctx()
+        pcs = ctx.getPathConstraints()
+        sym_vars = ctx.getSymbolicVariables()
+
+        diag = _constraint_diagnostics(ctx)
+
+        # Build per-constraint detail list
+        constraint_details = []
+        for i, pc in enumerate(pcs):
+            branches = []
+            for br in pc.getBranchConstraints():
+                ast_str = str(br["constraint"])
+                has_sym = _has_symbolic_in_ast(ast_str)
+                branches.append({
+                    "is_taken": br["isTaken"],
+                    "src_addr": hex(br["srcAddr"]),
+                    "dst_addr": hex(br["dstAddr"]),
+                    "has_symbolic": has_sym,
+                    "constraint": ast_str[:300] + ("..." if len(ast_str) > 300 else ""),
+                })
+            constraint_details.append({
+                "index": i,
+                "source_addr": hex(pc.getSourceAddress()),
+                "taken_addr": hex(pc.getTakenAddress()),
+                "is_multiple_branches": pc.isMultipleBranches(),
+                "branches": branches,
+            })
+
+        # Symbolic variable summary
+        sym_var_list = []
+        try:
+            from triton import SYMBOLIC
+            for vid, sv in sym_vars.items():
+                stype = sv.getType()
+                kind = "register" if stype == SYMBOLIC.REGISTER_VARIABLE else "memory"
+                sym_var_list.append({
+                    "id": sv.getId(),
+                    "name": sv.getName(),
+                    "alias": sv.getAlias(),
+                    "bitsize": sv.getBitSize(),
+                    "kind": kind,
+                })
+        except Exception:
+            pass
+
+        # Quick check: are any symbolic vars mentioned in ANY branch constraint?
+        all_branch_asts = []
+        for pc in pcs:
+            for br in pc.getBranchConstraints():
+                all_branch_asts.append(str(br["constraint"]))
+        combined = "\n".join(all_branch_asts)
+        vars_in_constraints = [sv for sv in sym_var_list if sv["name"] in combined]
+
+        return {
+            "ok": True,
+            "constraint_count": len(pcs),
+            "symbolic_var_count": len(sym_vars),
+            "constraints_with_symbolic": diag["constraints_with_symbolic"],
+            "constraints_all_concrete": diag["constraints_all_concrete"],
+            "symbolic_vars_referenced_in_any_branch": len(vars_in_constraints),
+            "hint": diag["hint"],
+            "symbolic_variables": sym_var_list,
+            "path_constraints": constraint_details,
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_diagnose_constraints failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+@tool_timeout(60.0)
+def triton_explore_branches(
+    timeout_ms: Annotated[int, "Per-branch Z3 solver timeout in milliseconds."] = 10000,
+    max_alternatives: Annotated[
+        int,
+        "Maximum number of alternative (not-taken) branch inputs to find. "
+        "Default 20. Each branch is tried independently.",
+    ] = 20,
+) -> dict:
+    """Find concrete inputs that would have taken each NOT-taken branch.
+
+    Implements the Triton path-exploration pattern from code_coverage_crackme_xor.py:
+    for every branch constraint in the current path, it asks Z3 for an input
+    that satisfies all prior (taken) constraints PLUS the negated (not-taken)
+    constraint of that branch.
+
+    This is the correct way to enumerate all alternative execution paths from
+    a symbolic trace. Unlike triton_solve_path_constraints(negate_last=true)
+    which only looks at the last branch, this explores EVERY branch in the trace.
+
+    Returns a list of discovered alternative inputs, one per solvable branch.
+    Each entry shows which branch it targets, the required input values, and
+    the SMT constraint that was satisfied.
+
+    **Workflow:**
+      1. triton_init() + triton_setup_windows_x64() [for Windows]
+      2. triton_symbolize_register("rcx")  [or memory range]
+      3. triton_process_function("0x401000")
+      4. triton_explore_branches()         ← this tool
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
+    try:
+        ctx = _get_ctx()
+        ast_ctx = ctx.getAstContext()
+        pcs = ctx.getPathConstraints()
+        sym_vars = ctx.getSymbolicVariables()
+
+        if not pcs:
+            diag = _constraint_diagnostics(ctx)
+            return {
+                "ok": True,
+                "alternatives_found": 0,
+                "alternatives": [],
+                "diagnostics": diag,
+            }
+
+        alternatives = []
+        # Build up path predicate incrementally (conjunction of taken predicates)
+        # This mirrors the exact pattern from the Triton examples.
+        previous_constraints = ast_ctx.equal(ast_ctx.bvtrue(), ast_ctx.bvtrue())
+
+        for i, pc in enumerate(pcs):
+            if len(alternatives) >= max_alternatives:
+                break
+
+            if pc.isMultipleBranches():
+                branches = pc.getBranchConstraints()
+                for branch in branches:
+                    if branch["isTaken"]:
+                        continue  # skip the taken path — we want the NOT-taken one
+                    if len(alternatives) >= max_alternatives:
+                        break
+
+                    # Solve: all previous taken predicates AND this not-taken branch
+                    candidate = ast_ctx.land([previous_constraints, branch["constraint"]])
+                    try:
+                        model = ctx.getModel(candidate, timeout=timeout_ms)
+                    except Exception:
+                        model = {}
+
+                    if model:
+                        inputs: dict[str, str] = {}
+                        for _, sm in model.items():
+                            sv = sm.getVariable()
+                            alias = sv.getAlias() or sv.getName()
+                            inputs[alias] = hex(sm.getValue())
+
+                        alternatives.append({
+                            "branch_index": i,
+                            "src_addr": hex(branch["srcAddr"]),
+                            "not_taken_dst": hex(branch["dstAddr"]),
+                            "taken_dst": hex(pc.getTakenAddress()),
+                            "constraint": str(branch["constraint"])[:200],
+                            "inputs": inputs,
+                        })
+
+            # Accumulate the taken predicate for the next iteration
+            previous_constraints = ast_ctx.land([previous_constraints, pc.getTakenPredicate()])
+
+        diag = _constraint_diagnostics(ctx)
+        return {
+            "ok": True,
+            "path_constraint_count": len(pcs),
+            "symbolic_var_count": len(sym_vars),
+            "alternatives_found": len(alternatives),
+            "alternatives": alternatives,
+            "diagnostics": diag,
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_explore_branches failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_inject_comparison_constraint(
+    buf1_addr: Annotated[str, "Address of the symbolic (user-controlled) buffer — hex or symbol."],
+    buf2_addr: Annotated[str, "Address of the concrete (expected) buffer to read from IDA — hex or symbol."],
+    size: Annotated[int, "Number of bytes to compare."],
+    auto_symbolize: Annotated[
+        bool,
+        "If true (default), automatically symbolize any byte in buf1 that is not yet symbolic. "
+        "Set false when you have already called triton_symbolize_bytes on buf1.",
+    ] = True,
+) -> dict:
+    """Inject equality constraints modelling memcmp(buf1, buf2, size) == 0.
+
+    Triton cannot trace into opaque external functions such as memcmp, strcmp, or
+    strncmp. This tool works around that limitation by manually injecting the
+    byte-level equality constraints that memcmp would have implied:
+
+        buf1[0] == buf2[0]  AND  buf1[1] == buf2[1]  AND  ...  AND  buf1[n-1] == buf2[n-1]
+
+    Injected constraints are ANDed with the path predicate at solve time by
+    triton_solve_path_constraints and triton_analyze_function. They survive until
+    triton_clear_injected_constraints (or triton_reset / triton_init) is called.
+
+    Typical workflow for a memcmp-based crackme:
+      1. triton_init()
+      2. triton_symbolize_bytes(buf1_addr, size)   # symbolize user-input buffer
+      3. triton_analyze_function(main_addr)         # run the function
+      4. triton_inject_comparison_constraint(buf1_addr, expected_buf_addr, size)
+      5. triton_solve_path_constraints()            # solver finds the password
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import idc
+    from .utils import parse_address
+
+    try:
+        ctx = _get_ctx()
+        if ctx is None:
+            return {"ok": False, "error": "Triton context not initialised — call triton_init first."}
+
+        ea1 = parse_address(buf1_addr)
+        ea2 = parse_address(buf2_addr)
+
+        buf2_bytes = idc.get_bytes(ea2, size)
+        if buf2_bytes is None or len(buf2_bytes) < size:
+            return {
+                "ok": False,
+                "error": f"Could not read {size} bytes from buf2 at {hex(ea2)} — check IDA has that memory mapped.",
+            }
+
+        ast_ctx = ctx.getAstContext()
+        injected = _get_injected()
+        symbolized_now: list[str] = []
+        constraints_added = 0
+
+        for i in range(size):
+            addr = ea1 + i
+            ma = TritonMemoryAccess(addr, 1)
+
+            if auto_symbolize and not ctx.isMemorySymbolized(ma):
+                sv = ctx.symbolizeMemory(ma, f"buf1_{hex(addr)}")
+                symbolized_now.append(sv.getName())
+
+            mem_ast = ctx.getMemoryAst(ma)
+            expected_byte = int(buf2_bytes[i])
+            eq_node = ast_ctx.equal(mem_ast, ast_ctx.bv(expected_byte, 8))
+            injected.append(eq_node)
+            constraints_added += 1
+
+        return {
+            "ok": True,
+            "buf1_addr": hex(ea1),
+            "buf2_addr": hex(ea2),
+            "size": size,
+            "constraints_injected": constraints_added,
+            "bytes_auto_symbolized": len(symbolized_now),
+            "new_sym_vars": symbolized_now,
+            "note": (
+                "Injected constraints will be ANDed with the path predicate at next solve. "
+                "Call triton_solve_path_constraints or triton_analyze_function to use them."
+            ),
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_inject_comparison_constraint failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_clear_injected_constraints() -> dict:
+    """Remove all manually-injected comparison constraints.
+
+    Call this before injecting a new set of constraints or after a solve cycle
+    to avoid stale constraints from previous analyses polluting future solves.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    try:
+        before = len(_get_injected())
+        _clear_injected()
+        return {
+            "ok": True,
+            "constraints_removed": before,
+            "message": f"Cleared {before} injected constraint(s).",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_symbolize_stack_region(
+    size: Annotated[int, "Number of bytes to symbolize."],
+    offset: Annotated[
+        int,
+        "Signed byte offset from the base register. "
+        "Use negative values for [rbp-N] (typical local variable), "
+        "positive for [rsp+N] (typical argument shadow space). Default 0.",
+    ] = 0,
+    base: Annotated[
+        str,
+        "Base register or concrete hex address: 'rbp' (default), 'rsp', or '0x...'. "
+        "Use 'rbp' for local variables (base pointer), 'rsp' for stack-pointer relative.",
+    ] = "rbp",
+    alias_prefix: Annotated[
+        str,
+        "Prefix for symbolic variable names, e.g. 'input' → 'input_0', 'input_1', ...",
+    ] = "stack_sym",
+) -> dict:
+    """Symbolize a contiguous region of the stack relative to RBP or RSP.
+
+    This is the right tool when user input lands in a local variable (function stack frame)
+    rather than at a fixed address. After the function sets up its frame (PUSH RBP /
+    MOV RBP, RSP), call this tool to mark the input buffer as symbolic so the solver
+    can reason about it.
+
+    Typical usage for a crackme that reads into a stack buffer:
+      1. triton_init() and optionally triton_setup_windows_x64()
+      2. Run enough instructions to set up the stack frame
+         (e.g. triton_replay_instructions or partial triton_process_function)
+      3. triton_symbolize_stack_region(size=64, offset=-0x50)  # [rbp-0x50]
+      4. Continue execution through the comparison logic
+      5. triton_solve_path_constraints()
+
+    Works with triton_process_with_hooks too: symbolize the stack buffer BEFORE
+    running process_with_hooks so the instructions that read from the buffer
+    build symbolic AST nodes rather than concrete bytes.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    try:
+        from .utils import parse_address
+        ctx = _get_ctx()
+        if ctx is None:
+            return {"ok": False, "error": "Triton context not initialised — call triton_init first."}
+
+        arch = ctx.getArchitecture()
+        is_64 = arch == ARCH.X86_64
+
+        base_val: int
+        base_lower = base.strip().lower()
+        if base_lower == "rbp":
+            base_val = ctx.getConcreteRegisterValue(ctx.registers.rbp if is_64 else ctx.registers.ebp)
+        elif base_lower == "rsp":
+            base_val = ctx.getConcreteRegisterValue(ctx.registers.rsp if is_64 else ctx.registers.esp)
+        else:
+            base_val = parse_address(base)
+
+        effective_addr = (base_val + offset) & 0xFFFFFFFFFFFFFFFF
+
+        sym_vars: list[dict] = []
+        for i in range(size):
+            ma = TritonMemoryAccess(effective_addr + i, 1)
+            sv = ctx.symbolizeMemory(ma, f"{alias_prefix}_{i}")
+            sym_vars.append({
+                "name": sv.getName(),
+                "id": sv.getId(),
+                "addr": hex(effective_addr + i),
+                "bitsize": sv.getBitSize(),
+            })
+
+        return {
+            "ok": True,
+            "base": base,
+            "base_value": hex(base_val),
+            "offset": offset,
+            "effective_addr": hex(effective_addr),
+            "size": size,
+            "sym_var_count": len(sym_vars),
+            "sym_vars": sym_vars,
+            "note": (
+                f"Symbolized {size} bytes at {hex(effective_addr)} "
+                f"({base}{'%+d' % offset if offset else ''}). "
+                "Instructions that read from this region will now build symbolic AST nodes."
+            ),
+        }
+
+    except Exception as e:
+        logger.exception("triton_symbolize_stack_region failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_symbolize_stdin(
+    size: Annotated[
+        int,
+        "Number of symbolic stdin bytes. Default 128.",
+    ] = 128,
+    alias_prefix: Annotated[
+        str,
+        "Prefix for symbolic variable names: '<prefix>_0', '<prefix>_1', ... Default 'stdin'.",
+    ] = "stdin",
+) -> dict:
+    """Pre-register a symbolic stdin buffer and return a hook configuration template.
+
+    Call this BEFORE triton_process_with_hooks to set up stdin symbolization.
+    The size and alias_prefix are stored in module state; when a 'fill_stdin_buffer'
+    hook fires at the input function, it creates symbolic variables at the concrete
+    runtime buffer address using these pre-registered names.
+
+    This solves the fundamental stdin→symbolic bridge problem: user input's concrete
+    address is only known at runtime (inside the hooked function), but alias naming
+    can be configured statically here.
+
+    Workflow:
+        1. triton_init(pc_tracking_symbolic=False)
+        2. triton_setup_windows_x64()
+        3. stdin_info = triton_symbolize_stdin(size=64, alias_prefix="password")
+        4. # Find the input function address (from triton_scan_call_sites or manual analysis)
+        5. hooks = [{"address": "0x140002750", "action": "fill_stdin_buffer",
+                     "alias_prefix": "password", "arg_reg": "rcx"}]
+        6. triton_process_with_hooks("main", hooks=hooks)
+        7. model = triton_solve_path_constraints()
+        8. # Look up solved bytes using stdin_info["aliases"]
+
+    Returns:
+    - aliases: list ["password_0", ..., "password_63"] — query after solving
+    - suggested_hook_template: partial hook dict — fill in 'address' and 'arg_reg'
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    try:
+        aliases = [f"{alias_prefix}_{i}" for i in range(size)]
+        _STDIN_BUFFER[alias_prefix] = {"size": size, "alias_prefix": alias_prefix}
+        return {
+            "ok": True,
+            "size": size,
+            "alias_prefix": alias_prefix,
+            "aliases": aliases,
+            "suggested_hook_template": {
+                "address": "<fill_in_input_function_address>",
+                "action": "fill_stdin_buffer",
+                "alias_prefix": alias_prefix,
+                "arg_reg": "rcx",
+                "return_value": 1,
+                "_note": "Set 'address' to the function that reads user input (e.g. from triton_scan_call_sites)",
+            },
+            "note": (
+                f"Registered stdin buffer: {size} bytes, prefix '{alias_prefix}'. "
+                "Use action='fill_stdin_buffer' in triton_process_with_hooks on the input function. "
+                "After solving, map solution bytes back to character values using the aliases list."
+            ),
+        }
+    except Exception as e:
+        logger.exception("triton_symbolize_stdin failed")
+        return {"ok": False, "error": str(e)}
+
+
+# Known stdin/input function name patterns for triton_scan_for_input_calls.
+# Each entry is a (name_fragment, abi_arg_reg_x64, abi_arg_reg_x86, default_size) tuple.
+_INPUT_FUNC_SIGNATURES: tuple[tuple[str, str, str, int], ...] = (
+    # C runtime stdin
+    ("scanf",         "rdx", "esp+4",  64),   # scanf(fmt, buf) — buf in rdx
+    ("sscanf",        "rdx", "esp+8",  64),
+    ("fscanf",        "rdx", "esp+8",  64),
+    ("vscanf",        "rdx", "esp+4",  64),
+    ("gets",          "rcx", "esp+0",  256),  # gets(buf)
+    ("gets_s",        "rcx", "esp+0",  256),
+    ("fgets",         "rcx", "esp+0",  256),  # fgets(buf, n, fp)
+    ("_getch",        None,  None,     1),    # returns single char in rax
+    # POSIX
+    ("read",          "rsi", "esp+4",  64),   # read(fd, buf, n)
+    ("fread",         "rdi", "esp+0",  64),   # fread(buf, sz, n, fp)
+    ("getline",       "rdi", "esp+0",  64),
+    ("getdelim",      "rdi", "esp+0",  64),
+    # Winsock / network
+    ("recv",          "rdx", "esp+4",  4096),
+    ("recvfrom",      "rdx", "esp+4",  4096),
+    ("WSARecv",       "rdx", "esp+4",  4096),
+    # Win32 file I/O
+    ("ReadFile",      "rdx", "esp+4",  4096),
+    ("ReadConsoleA",  "rdx", "esp+4",  256),
+    ("ReadConsoleW",  "rdx", "esp+4",  256),
+    ("ReadConsole",   "rdx", "esp+4",  256),
+)
+
+# Output/formatting function name fragments — callees matching these patterns are
+# excluded from heuristic input-candidate detection in _scan_call_sites_internal.
+_KNOWN_OUTPUT_PATTERNS: tuple[str, ...] = (
+    "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+    "wprintf", "fwprintf", "swprintf",
+    "puts", "fputs", "fputc", "putchar", "putc",
+    "cout", "cerr", "clog", "basic_ostream",
+    "send", "sendto", "sendmsg", "WSASend",
+    "WriteFile", "WriteConsole", "fwrite", "_write",
+    "OutputDebugString", "MessageBox", "MessageBoxA", "MessageBoxW",
+    "exit", "abort", "__cxa_terminate",
+    "free", "HeapFree", "VirtualFree",
+    "memcpy", "memmove", "memset", "strcpy", "strncpy", "wcscpy",
+)
+
+
+def _scan_call_sites_internal(
+    func,
+    lookback_insns: int = 10,
+    watch_regs: "list[str] | None" = None,
+) -> "list[dict]":
+    """Return CALL site dicts for every CALL in func, annotated with heuristic input-candidate flags.
+
+    This is the shared core for both triton_scan_call_sites and the fallback path
+    in triton_scan_for_input_calls. Runs on IDA main thread (caller must be @idasync).
+    """
+    import idaapi
+    import ida_funcs
+    import ida_gdl
+    import idc
+    import ida_name
+
+    if watch_regs is None:
+        watch_regs = ["rcx", "rdx", "r8", "r9"]
+
+    def _is_output(name: str) -> bool:
+        nl = name.lower()
+        return any(p.lower() in nl for p in _KNOWN_OUTPUT_PATTERNS)
+
+    def _is_known_input(name: str) -> bool:
+        nl = name.lower()
+        return any(frag.lower() in nl for frag, *_ in _INPUT_FUNC_SIGNATURES)
+
+    def _stack_relative(op_text: str) -> bool:
+        lo = op_text.lower()
+        return "[rbp" in lo or "[rsp" in lo or "[ebp" in lo or "[esp" in lo
+
+    fc = ida_gdl.FlowChart(func)
+    call_sites: list[dict] = []
+
+    for bb in fc:
+        # (ea, mnem, [op0, op1]) sliding window
+        window: list[tuple] = []
+        curr = bb.start_ea
+        while curr < bb.end_ea:
+            insn = idaapi.insn_t()
+            length = idaapi.decode_insn(insn, curr)
+            if length == 0:
+                break
+
+            mnem = idc.print_insn_mnem(curr).lower()
+            op0 = idc.print_operand(curr, 0) or ""
+            op1 = idc.print_operand(curr, 1) or ""
+
+            if mnem in ("call", "callf"):
+                target = idc.get_operand_value(curr, 0)
+                callee_name = (
+                    ida_name.get_short_name(target)
+                    or ida_funcs.get_func_name(target)
+                    or ""
+                ) if target else ""
+
+                # Look back for arg-register ← stack-ptr loads
+                stack_ptr_args: list[dict] = []
+                for w_ea, w_mnem, w_op0, w_op1 in window[-lookback_insns:]:
+                    if w_mnem not in ("lea", "mov"):
+                        continue
+                    dst_reg = w_op0.lower().strip()
+                    # Strip any size override: "byte ptr rcx" → "rcx"
+                    for pfx in ("byte ptr ", "word ptr ", "dword ptr ", "qword ptr "):
+                        dst_reg = dst_reg.replace(pfx, "")
+                    dst_reg = dst_reg.split("[")[0].strip()
+                    if dst_reg in watch_regs and _stack_relative(w_op1):
+                        stack_ptr_args.append({
+                            "insn_ea": hex(w_ea),
+                            "mnem": w_mnem,
+                            "dst": w_op0,
+                            "src": w_op1,
+                            "arg_reg": dst_reg,
+                        })
+
+                is_output = _is_output(callee_name)
+                is_known_input = _is_known_input(callee_name)
+                is_candidate = bool(stack_ptr_args) and not is_output and not is_known_input
+
+                call_sites.append({
+                    "call_site_ea": hex(curr),
+                    "callee_ea": hex(target) if target else "unknown",
+                    "callee_name": callee_name,
+                    "is_known_output": is_output,
+                    "is_known_input": is_known_input,
+                    "stack_ptr_args": stack_ptr_args,
+                    "input_candidate": is_candidate,
+                })
+            else:
+                window.append((curr, mnem, op0, op1))
+
+            curr += length
+
+    return call_sites
+
+
+@tool
+@idasync
+def triton_scan_for_input_calls(
+    address: Annotated[str, "Function start address — hex or symbol name."],
+    additional_names: Annotated[
+        list[str],
+        "Extra function name substrings to treat as input sources, e.g. ['my_read_input']. "
+        "Match is case-insensitive substring. Default empty.",
+    ] = [],
+    default_size: Annotated[
+        int,
+        "Symbolic buffer size to use when the exact size cannot be determined. Default 128.",
+    ] = 128,
+    recursive_depth: Annotated[
+        int,
+        "How many call-graph levels deep to search for known input functions. "
+        "Depth 0 = only direct calls from address; depth 1 (default) = also scan "
+        "the bodies of direct callees (catches internal wrappers like sub_140002750 "
+        "that call scanf internally). Increase for deeper wrapper chains.",
+    ] = 1,
+) -> dict:
+    """Scan a function's call sites for known stdin/input functions using IDA.
+
+    Returns a list of pre-configured hook dicts ready to pass directly to
+    triton_process_with_hooks. Use this instead of manually looking up import
+    addresses.
+
+    **Handles internal wrappers**: with recursive_depth=1 (default), the scan also
+    checks the bodies of every callee of the target function. If `main` calls
+    `sub_140002750` and that calls `scanf`, the scanf call site is detected and
+    the hook is configured on `sub_140002750` (the callee of main) with the
+    buffer argument forwarded.
+
+    Detected functions and their default actions:
+    - scanf / fscanf / sscanf → symbolize_buffer_arg (buf pointer in rdx)
+    - gets / fgets → symbolize_buffer_arg (buf pointer in rcx)
+    - read / fread / recv / ReadFile → symbolize_buffer_arg
+    - _getch / getchar → symbolize_return (single char in rax)
+
+    Workflow:
+      result = triton_scan_for_input_calls("main")
+      hooks = result["hooks"]
+      # Add memcmp/strcmp hooks manually, then:
+      triton_process_with_hooks("main", hooks=hooks + [memcmp_hook])
+      triton_solve_path_constraints()
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import idaapi
+    import ida_funcs
+    import ida_gdl
+    import idc
+    import ida_name
+
+    try:
+        from .utils import parse_address
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "address": address, "error": f"No function at {hex(ea)}"}
+
+        # Build lookup: lower-case name fragment → (arg_reg_x64, arg_reg_x86, size)
+        sig_map: dict[str, tuple] = {}
+        for frag, reg64, reg86, sz in _INPUT_FUNC_SIGNATURES:
+            sig_map[frag.lower()] = (reg64, reg86, sz)
+        for extra in additional_names:
+            sig_map[extra.lower()] = ("rdx", "esp+4", default_size)
+
+        arch = _detect_arch_from_ida()
+        is_64 = arch == ARCH.X86_64
+
+        hooks: list[dict] = []
+        found: list[dict] = []
+        visited_funcs: set[int] = set()
+
+        def _name_matches(name: str) -> tuple | None:
+            name_lower = name.lower()
+            for frag, sig in sig_map.items():
+                if frag in name_lower:
+                    return sig
+            return None
+
+        def _get_call_targets(scan_func_ea: int) -> list[tuple[int, int, str]]:
+            """Return list of (call_site_ea, target_ea, target_name) for all CALL insns."""
+            results = []
+            f = ida_funcs.get_func(scan_func_ea)
+            if f is None:
+                return results
+            fc = ida_gdl.FlowChart(f)
+            for bb in fc:
+                curr = bb.start_ea
+                while curr < bb.end_ea:
+                    insn = idaapi.insn_t()
+                    length = idaapi.decode_insn(insn, curr)
+                    if length == 0:
+                        break
+                    mnem = idc.print_insn_mnem(curr).lower()
+                    if mnem in ("call", "callf"):
+                        target = idc.get_operand_value(curr, 0)
+                        tname = ida_name.get_short_name(target) or ida_funcs.get_func_name(target) or ""
+                        results.append((curr, target, tname))
+                    curr += length
+            return results
+
+        def _scan_function(scan_ea: int, hook_addr: int, depth: int, wrapper_chain: list[str]) -> None:
+            """Recursively scan scan_ea for input functions.
+
+            hook_addr is the address to put in the hook dict — it's the address
+            in the PARENT function that calls this scanner's function. For a direct
+            call this equals the callee; for recursive cases it's the outermost wrapper.
+            """
+            if scan_ea in visited_funcs:
+                return
+            visited_funcs.add(scan_ea)
+
+            for call_site, target, target_name in _get_call_targets(scan_ea):
+                sig = _name_matches(target_name)
+                if sig is not None:
+                    reg64, reg86, buf_sz = sig
+                    chain_str = " → ".join(wrapper_chain + [target_name]) if wrapper_chain else target_name
+                    call_info = {
+                        "call_site": hex(call_site),
+                        "target": hex(target),
+                        "target_name": target_name,
+                        "hook_address": hex(hook_addr),
+                        "wrapper_chain": chain_str,
+                        "depth": len(wrapper_chain),
+                    }
+                    found.append(call_info)
+
+                    if reg64 is None:
+                        hooks.append({
+                            "address": hex(hook_addr),
+                            "action": "symbolize_return",
+                            "alias": f"input_char_{hex(call_site)}",
+                            "_note": call_info,
+                        })
+                    else:
+                        arg_reg = reg64 if is_64 else "ecx"
+                        hooks.append({
+                            "address": hex(hook_addr),
+                            "action": "symbolize_buffer_arg",
+                            "arg_reg": arg_reg,
+                            "size": buf_sz,
+                            "alias_prefix": "stdin",
+                            "return_value": 1,
+                            "_note": call_info,
+                        })
+                elif depth > 0 and target != 0:
+                    # Recurse into unknown callees looking for wrapped input functions.
+                    # The hook address stays as 'target' (the immediate callee from parent).
+                    _scan_function(target, target, depth - 1, wrapper_chain + [target_name])
+
+        _scan_function(func.start_ea, func.start_ea, recursive_depth, [])
+
+        # De-duplicate hooks by hook address (multiple wrappers can resolve to same addr)
+        seen_addrs: set[str] = set()
+        deduped_hooks = []
+        for h in hooks:
+            key = h["address"]
+            if key not in seen_addrs:
+                seen_addrs.add(key)
+                deduped_hooks.append(h)
+
+        # When name-based detection found nothing, run the stack-ptr-arg heuristic
+        # as a fallback so the caller gets actionable candidates instead of silence.
+        heuristic_candidates: list[dict] = []
+        heuristic_hooks: list[dict] = []
+        if not deduped_hooks:
+            try:
+                all_call_sites = _scan_call_sites_internal(func, lookback_insns=10)
+                candidates = [c for c in all_call_sites if c["input_candidate"]]
+                heuristic_candidates = candidates
+                seen_h: set[str] = set()
+                for c in candidates:
+                    if c["callee_ea"] in seen_h:
+                        continue
+                    seen_h.add(c["callee_ea"])
+                    first_arg = c["stack_ptr_args"][0]["arg_reg"] if c["stack_ptr_args"] else "rcx"
+                    heuristic_hooks.append({
+                        "address": c["callee_ea"],
+                        "action": "symbolize_buffer_arg",
+                        "arg_reg": first_arg,
+                        "size": 128,
+                        "alias_prefix": "stdin",
+                        "return_value": 1,
+                        "_note": (
+                            f"Heuristic candidate: '{c['callee_name']}' receives stack buffer "
+                            f"in {first_arg}. Confirm this reads user input before using."
+                        ),
+                    })
+            except Exception:
+                pass  # heuristic is best-effort
+
+        note: str
+        if deduped_hooks:
+            note = (
+                "Pass 'hooks' directly to triton_process_with_hooks. "
+                "Add memcmp / strcmp / strncmp hooks manually if needed. "
+                "Wrapper functions are hooked at the callee boundary — the hook "
+                "fires when main calls the wrapper, then the wrapper's body is skipped."
+            )
+        elif heuristic_hooks:
+            note = (
+                "No known input functions detected by name. "
+                f"Heuristic found {len(heuristic_hooks)} candidate(s) that receive stack buffer "
+                "pointers (see 'heuristic_candidates'). Review them and confirm which reads "
+                "user input, then use 'heuristic_hooks' in triton_process_with_hooks, or call "
+                "triton_scan_call_sites for the full heuristic analysis."
+            )
+        else:
+            note = (
+                "No input functions found by name or by stack-pointer-arg heuristic. "
+                "The function may read input via a global buffer, command-line args, "
+                "or a deeply nested call chain. Try triton_symbolize_stack_region to "
+                "symbolize the buffer directly, or increase recursive_depth."
+            )
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "function_name": ida_funcs.get_func_name(func.start_ea) or "",
+            "scan_depth": recursive_depth,
+            "input_calls_found": len(found),
+            "found": found,
+            "hooks": deduped_hooks,
+            "heuristic_candidates": heuristic_candidates,
+            "heuristic_hooks": heuristic_hooks,
+            "note": note,
+        }
+
+    except Exception as e:
+        logger.exception("triton_scan_for_input_calls failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_scan_call_sites(
+    address: Annotated[str, "Function start address — hex or symbol name."],
+    lookback_insns: Annotated[
+        int,
+        "How many instructions before each CALL to scan for stack-relative argument loads. "
+        "Default 10.",
+    ] = 10,
+    arg_registers: Annotated[
+        list[str],
+        "Argument registers to watch. Empty list = Windows x64 ABI default: "
+        "[rcx, rdx, r8, r9]. For x86, pass ['eax', 'ecx', 'edx'].",
+    ] = [],
+) -> dict:
+    """Static heuristic: find CALL sites that pass stack-buffer pointers as arguments.
+
+    Walks every CALL in the function and looks back lookback_insns instructions for
+    LEA/MOV instructions that load a stack-relative address ([rbp-N] / [rsp+N]) into
+    an argument register. A call site is flagged as an input_candidate when:
+
+    - At least one argument register receives a stack-buffer pointer, AND
+    - The callee is NOT a known output/formatting/free function.
+
+    This is the key fallback when triton_scan_for_input_calls returns zero matches
+    because the input function is an internal C++ wrapper or renamed import.
+    The heuristic works without knowing function names — it detects the calling
+    convention pattern.
+
+    Returns:
+    - call_sites: ALL calls with full argument analysis
+    - input_candidates: subset flagged as likely input readers
+    - suggested_hooks: pre-built hook dicts for triton_process_with_hooks
+
+    Typical workflow (when name-based scan fails):
+        cs = triton_scan_call_sites("main")
+        for c in cs["input_candidates"]:
+            print(c["call_site_ea"], c["callee_name"], c["stack_ptr_args"])
+        # Confirm which candidate reads user input, then:
+        hooks = cs["suggested_hooks"]  # already configured with detected arg_reg
+        triton_process_with_hooks("main", hooks=hooks + [memcmp_hook])
+        triton_solve_path_constraints()
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import ida_funcs
+
+    try:
+        from .utils import parse_address
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "address": address, "error": f"No function at {hex(ea)}"}
+
+        arch = _detect_arch_from_ida()
+        is_64 = arch == ARCH.X86_64
+        watch_regs = [r.lower() for r in (arg_registers or (["rcx", "rdx", "r8", "r9"] if is_64 else ["eax", "ecx", "edx"]))]
+
+        call_sites = _scan_call_sites_internal(func, lookback_insns=lookback_insns, watch_regs=watch_regs)
+        input_candidates = [c for c in call_sites if c["input_candidate"]]
+
+        # Build suggested hooks (one per unique callee)
+        suggested_hooks: list[dict] = []
+        seen_callees: set[str] = set()
+        for c in input_candidates:
+            if c["callee_ea"] in seen_callees:
+                continue
+            seen_callees.add(c["callee_ea"])
+            first_arg = c["stack_ptr_args"][0]["arg_reg"] if c["stack_ptr_args"] else ("rcx" if is_64 else "ecx")
+            suggested_hooks.append({
+                "address": c["callee_ea"],
+                "action": "symbolize_buffer_arg",
+                "arg_reg": first_arg,
+                "size": 128,
+                "alias_prefix": "stdin",
+                "return_value": 1,
+                "_note": (
+                    f"Heuristic: '{c['callee_name']}' @ {c['callee_ea']} receives "
+                    f"stack buffer in {first_arg}. Verify it reads user input."
+                ),
+            })
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "function_name": ida_funcs.get_func_name(func.start_ea) or "",
+            "lookback_insns": lookback_insns,
+            "total_call_sites": len(call_sites),
+            "input_candidates_count": len(input_candidates),
+            "call_sites": call_sites,
+            "input_candidates": input_candidates,
+            "suggested_hooks": suggested_hooks,
+            "note": (
+                f"Found {len(input_candidates)} input candidate(s) by stack-pointer-arg heuristic. "
+                "Review 'input_candidates' — check which callee reads user input — then pass "
+                "'suggested_hooks' to triton_process_with_hooks."
+                if input_candidates else
+                "No stack-buffer-receiving callees found. Input may arrive via global buffer, "
+                "registers, or a deeply nested chain. Try triton_symbolize_stack_region."
+            ),
+        }
+
+    except Exception as e:
+        logger.exception("triton_scan_call_sites failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_check_input_reaches_branch(
+    branch_addr: Annotated[
+        str,
+        "Address of the branch instruction (jz, jnz, jg, etc.) to check — hex or symbol. "
+        "Pass 'any' to check all collected path constraints and return a summary.",
+    ],
+    sym_var_ids: Annotated[
+        list[int],
+        "Optional list of symbolic variable IDs to check specifically. "
+        "Empty list (default) = check all current symbolic variables.",
+    ] = [],
+) -> dict:
+    """Check whether symbolized input variables flow into a branch's condition.
+
+    This is the primary diagnostic tool for 'why does my input not affect the solver?'
+    After running triton_analyze_function or triton_process_with_hooks, use this to see:
+    - Which branches in the path predicate involve your symbolic inputs
+    - Which branches are on concrete (non-symbolic) data and cannot be steered
+    - The full AST of each constraint so you can see the formula
+
+    If ALL branches report has_symbolic=false, your input does not flow into any
+    branch condition — consider symbolizing a different register or memory region,
+    or check if input is read AFTER the branches (wrong symbolization point).
+
+    Returns a per-branch summary and an overall verdict.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    try:
+        from .utils import parse_address
+        ctx = _get_ctx()
+        if ctx is None:
+            return {"ok": False, "error": "Triton context not initialised — call triton_init first."}
+
+        pcs = ctx.getPathConstraints()
+        all_sym_vars = ctx.getSymbolicVariables()
+
+        # Resolve which sym var names we're looking for
+        if sym_var_ids:
+            target_names: set[str] = set()
+            for vid in sym_var_ids:
+                sv = all_sym_vars.get(vid)
+                if sv:
+                    target_names.add(sv.getName())
+        else:
+            target_names = {sv.getName() for sv in all_sym_vars.values()}
+
+        check_all = branch_addr.strip().lower() == "any"
+        target_ea: int = 0
+        if not check_all:
+            target_ea = parse_address(branch_addr)
+
+        results: list[dict] = []
+        symbolic_branch_count = 0
+        concrete_branch_count = 0
+
+        for pc_idx, pc in enumerate(pcs):
+            for br in pc.getBranchConstraints():
+                src = br.get("srcAddr", 0)
+                dst = br.get("dstAddr", 0)
+
+                if not check_all and src != target_ea:
+                    continue
+
+                ast_str = str(br["constraint"])
+                # Find which of our target sym vars appear in this constraint
+                vars_present = [name for name in target_names if name in ast_str]
+                has_sym = bool(vars_present)
+
+                if has_sym:
+                    symbolic_branch_count += 1
+                else:
+                    concrete_branch_count += 1
+
+                # Attempt to classify the constraint
+                if not has_sym and "SymVar_" not in ast_str:
+                    constraint_type = "concrete"
+                elif has_sym:
+                    constraint_type = "symbolic"
+                else:
+                    constraint_type = "symbolic_other"  # Has SymVar but not from our set
+
+                results.append({
+                    "pc_index": pc_idx,
+                    "branch_src": hex(src),
+                    "branch_dst": hex(dst),
+                    "is_taken": br["isTaken"],
+                    "constraint_type": constraint_type,
+                    "has_symbolic": has_sym,
+                    "sym_vars_present": vars_present,
+                    "constraint_ast": ast_str,
+                    "is_multiple_branches": pc.isMultipleBranches(),
+                })
+
+        if not check_all and not results:
+            return {
+                "ok": True,
+                "branch_addr": branch_addr,
+                "found": False,
+                "message": (
+                    f"No path constraint at {branch_addr}. The branch at that address "
+                    "may not have been executed during the last symbolic run, "
+                    "or pc_tracking_symbolic=True filtered it out (retry with pc_tracking_symbolic=False)."
+                ),
+            }
+
+        total = len(results)
+        verdict = (
+            "INPUT_REACHES_BRANCH"
+            if symbolic_branch_count > 0
+            else ("NO_PATH_CONSTRAINTS" if total == 0 else "INPUT_DOES_NOT_REACH_BRANCH")
+        )
+
+        advice = ""
+        if verdict == "INPUT_DOES_NOT_REACH_BRANCH":
+            advice = (
+                "Your symbolized input does not flow into any branch condition on this path. "
+                "Possible causes: (1) input is read AFTER the branch — symbolize later; "
+                "(2) wrong register/buffer symbolized — check the call that reads user data; "
+                "(3) use triton_scan_for_input_calls to auto-detect the input function."
+            )
+        elif verdict == "INPUT_REACHES_BRANCH":
+            advice = (
+                f"Input affects {symbolic_branch_count}/{total} branch(es). "
+                "Call triton_solve_path_constraints to find concrete input values."
+            )
+
+        return {
+            "ok": True,
+            "branch_addr": branch_addr if not check_all else "any",
+            "found": total > 0,
+            "total_constraints_checked": total,
+            "symbolic_branches": symbolic_branch_count,
+            "concrete_branches": concrete_branch_count,
+            "verdict": verdict,
+            "advice": advice,
+            "results": results,
+        }
+
+    except Exception as e:
+        logger.exception("triton_check_input_reaches_branch failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_get_register_ast(
+    register: Annotated[str, "Register name, e.g. 'rax', 'rbx', 'eax', 'rcx'."],
+    simplify: Annotated[bool, "If true, apply Triton AST simplification before returning. Default false."] = False,
+) -> dict:
+    """Return the symbolic AST expression for a register's current value.
+
+    After running triton_process_function or triton_analyze_function, this shows
+    how the register's value depends on the symbolic input variables. Useful for:
+    - Verifying that a register IS symbolic (not a concrete bitvector)
+    - Understanding the data-flow formula before solving
+    - Debugging why the solver returns UNSAT (concrete formula = trivially False)
+
+    Example: after symbolizing RCX and running 3 XOR instructions, rax might
+    show as  (bvxor SymVar_0 #x6d)  — confirming the XOR relationship.
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    try:
+        ctx = _get_ctx()
+        if ctx is None:
+            return {"ok": False, "error": "Triton context not initialised — call triton_init first."}
+
+        reg_name = register.strip().lower()
+        try:
+            reg = ctx.getRegister(reg_name)
+        except Exception as e:
+            return {"ok": False, "register": register, "error": f"Unknown register: {e}"}
+
+        reg_ast = ctx.getRegisterAst(reg)
+        if simplify:
+            reg_ast = ctx.simplify(reg_ast, True)
+
+        ast_str = str(reg_ast)
+        has_sym = _has_symbolic_in_ast(ast_str)
+        concrete_val: int | None = None
+        if not has_sym:
+            try:
+                concrete_val = ctx.getConcreteRegisterValue(reg)
+            except Exception:
+                pass
+
+        is_symbolized = ctx.isRegisterSymbolized(reg)
+
+        return {
+            "ok": True,
+            "register": register,
+            "ast": ast_str,
+            "has_symbolic": has_sym,
+            "is_symbolized": is_symbolized,
+            "concrete_value": hex(concrete_val) if concrete_val is not None else None,
+            "bitsize": reg.getBitSize(),
+        }
+
+    except Exception as e:
+        logger.exception("triton_get_register_ast failed")
+        return {"ok": False, "register": register, "error": str(e)}
+
+
+@tool
+@idasync
+@tool_timeout(120.0)
+def triton_process_with_hooks(
+    address: Annotated[str, "Function start address — hex or symbol name."],
+    hooks: Annotated[
+        list[dict],
+        "List of hook definitions. Each hook: "
+        "{\"address\": \"0x...\", \"action\": \"<action>\", ...action-specific fields...}. "
+        "Actions: "
+        "  return_concrete — skip the call, set RAX to a fixed value (field: 'value': '0x0'); "
+        "  symbolize_return — skip the call, make RAX a fresh symbolic variable (field: 'alias'); "
+        "  symbolize_buffer_arg — model scanf/gets/fgets/recv/ReadFile: read buffer ptr from "
+        "    arg_reg (default rdx), symbolize 'size' bytes, set RAX=return_value. "
+        "    Fields: 'arg_reg','size','alias_prefix','return_value'; "
+        "  fill_stdin_buffer — like symbolize_buffer_arg but sources size/alias_prefix from "
+        "    triton_symbolize_stdin registry. Fields: 'arg_reg','alias_prefix','return_value'; "
+        "  memcmp_semantic — model memcmp(buf1,buf2,n): read expected bytes from buf2 "
+        "    (tries IDA static then Triton concrete memory for runtime-computed values), "
+        "    inject buf1[i]==buf2[i] equality constraints, set RAX=0. "
+        "    Fields: 'buf1_reg','buf2_reg','size_reg' (register sources, Windows x64 defaults: rcx,rdx,r8) "
+        "    OR individual overrides 'buf1','buf2','size'. "
+        "    Literal override: 'expected': '<hex_or_ascii_string>' to bypass memory read entirely. "
+        "    When size_reg is 0, auto-detects size from symbolized region at buf1; "
+        "  strcmp_semantic — like memcmp_semantic but auto-detects size from null terminator in buf2. "
+        "    Supports 'expected': 'literal_string' for direct constraint injection.",
+    ],
+    max_insns: Annotated[int, "Maximum instructions to process per function. Default 2000."] = 2000,
+    setup_windows_abi: Annotated[
+        bool,
+        "Set up fake Windows x64 TEB/PEB/GS segment before processing. "
+        "Required for binaries that read gs:[0x60] (BeingDebugged etc.).",
+    ] = False,
+    pc_tracking_symbolic: Annotated[
+        "bool | None",
+        "PC_TRACKING_SYMBOLIC mode: only collect path constraints for branches whose "
+        "condition involves a symbolic variable. Default None → False (collect all branches). "
+        "Set True only if you want to filter out concrete anti-debug branches.",
+    ] = None,
+) -> dict:
+    """Process a function with CALL hooks that intercept external/opaque function calls.
+
+    Triton cannot symbolically trace into CALL targets like memcmp, strcmp, or any
+    function not inside the current function range. This tool intercepts those calls
+    and applies a hook action instead:
+
+    - return_concrete: Skip the call. Set RAX to a constant value you specify.
+      Use when the external function always returns a fixed value in your scenario.
+
+    - symbolize_return: Skip the call. Make RAX a fresh symbolic variable.
+      Use when the return value's effect on branches is what you want to explore.
+
+    - symbolize_buffer_arg: Model an input function (scanf, gets, fgets, recv, ReadFile).
+      Reads the buffer pointer from arg_reg, symbolizes 'size' bytes there, sets RAX
+      to return_value (default 1 = success). Use this to make user-controlled input
+      symbolic so the solver can find what bytes satisfy downstream comparisons.
+
+    - fill_stdin_buffer: Like symbolize_buffer_arg, but sources size and alias_prefix
+      from the registry set by triton_symbolize_stdin. Minimal hook dict — just
+      set address and arg_reg. Ensures alias names match across tools.
+
+    - memcmp_semantic: Skip the call. Read expected bytes from buf2 — first tries
+      IDA's static binary view, then falls back to Triton's runtime concrete memory
+      (handles XOR-decoded or otherwise runtime-computed comparison buffers). If size
+      register is 0, auto-detects from the symbolized region at buf1. Accepts an
+      'expected' field with literal hex or ASCII to bypass memory reads entirely.
+      Injects buf1[i]==expected[i] equality constraints. Sets RAX=0.
+
+    - strcmp_semantic: Like memcmp_semantic but for null-terminated strings. Auto-
+      detects size from the null terminator in buf2. Accepts 'expected': 'string'
+      for direct ASCII string injection without needing to read buf2 from memory.
+
+    All hooks advance PC past the CALL instruction (restore RSP, set RIP to return
+    address) so execution continues correctly.
+
+    ┌─── End-to-end crackme solve workflow (stdin → memcmp) ───────────────────┐
+    │  # Step 1: find the addresses of scanf and memcmp in the import table    │
+    │  hooks = triton_scan_for_input_calls("main")["hooks"]   # auto-detect    │
+    │                                                                           │
+    │  # Step 2: run with hooks — scanf symbolizes input, memcmp injects =     │
+    │  triton_process_with_hooks("main", hooks=hooks,                          │
+    │      setup_windows_abi=True)                                              │
+    │                                                                           │
+    │  # Step 3: solve — Z3 finds the bytes satisfying buf1==expected          │
+    │  triton_solve_path_constraints()   # → {"stdin_0": "0x63", ...}          │
+    └───────────────────────────────────────────────────────────────────────────┘
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    import idaapi
+    import idc
+    import ida_funcs
+    from .utils import parse_address
+
+    try:
+        ctx = _get_ctx()
+        if ctx is None:
+            return {"ok": False, "error": "Triton context not initialised — call triton_init first."}
+
+        ea = parse_address(address)
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ok": False, "address": address, "error": f"No function at {hex(ea)}"}
+
+        # --- Parse and resolve hook addresses ---
+        resolved_hooks: dict[int, dict] = {}
+        for h in hooks:
+            try:
+                haddr = parse_address(str(h.get("address", "0")))
+                resolved_hooks[haddr] = h
+            except Exception as e:
+                return {"ok": False, "error": f"Invalid hook address '{h.get('address')}': {e}"}
+
+        # --- Resolve pc_tracking_symbolic: None → False (track all branches by default) ---
+        pc_tracking = pc_tracking_symbolic if pc_tracking_symbolic is not None else False
+        ctx.setMode(MODE.PC_TRACKING_SYMBOLIC, pc_tracking)
+
+        # --- Windows ABI setup ---
+        windows_abi_applied = False
+        if setup_windows_abi and ctx.getArchitecture() == ARCH.X86_64:
+            try:
+                _setup_windows_x64_internal(ctx)
+                windows_abi_applied = True
+            except Exception as e:
+                logger.warning("triton_process_with_hooks: Windows ABI setup failed: %s", e)
+
+        # --- Determine PC/SP/return-val registers for the architecture ---
+        arch = ctx.getArchitecture()
+        is_64 = arch == ARCH.X86_64
+        try:
+            pc_reg = ctx.registers.rip if is_64 else ctx.registers.eip
+            sp_reg = ctx.registers.rsp if is_64 else ctx.registers.esp
+            ret_reg = ctx.registers.rax if is_64 else ctx.registers.eax
+        except Exception as e:
+            return {"ok": False, "error": f"Could not resolve architecture registers: {e}"}
+
+        def _apply_hook(hook: dict, rip_after_call: int) -> dict:
+            """Apply a hook action. rip_after_call is the return address (CALL+size)."""
+            action = hook.get("action", "return_concrete")
+            log_entry: dict = {"action": action}
+
+            # Shared helper — available to ALL action branches
+            def _reg_val(name: str) -> int:
+                return ctx.getConcreteRegisterValue(ctx.getRegister(name.lower()))
+
+            try:
+                # Restore stack pointer (undo the CALL's push of return address)
+                sp_val = ctx.getConcreteRegisterValue(sp_reg)
+                ctx.setConcreteRegisterValue(sp_reg, sp_val + (8 if is_64 else 4))
+
+                # Redirect PC to return address
+                ctx.setConcreteRegisterValue(pc_reg, rip_after_call)
+
+                if action == "return_concrete":
+                    raw = hook.get("value", "0x0")
+                    val = int(str(raw), 16) if isinstance(raw, str) and raw.startswith("0x") else int(str(raw), 0)
+                    ctx.setConcreteRegisterValue(ret_reg, val)
+                    log_entry["rax"] = hex(val)
+
+                elif action == "symbolize_return":
+                    alias = hook.get("alias", f"hook_ret_{hex(rip_after_call)}")
+                    sv = ctx.symbolizeRegister(ret_reg, alias)
+                    log_entry["sym_var"] = sv.getName()
+                    log_entry["alias"] = alias
+
+                elif action in ("memcmp_semantic", "strcmp_semantic"):
+                    # --- Resolve buf1, buf2, size (individual overrides take priority) ---
+                    b1_reg = hook.get("buf1_reg", "rcx" if is_64 else "ecx")
+                    b2_reg = hook.get("buf2_reg", "rdx" if is_64 else "edx")
+                    sz_reg = hook.get("size_reg", "r8" if is_64 else "ebx")
+
+                    b1 = parse_address(str(hook["buf1"])) if "buf1" in hook else _reg_val(b1_reg)
+                    b2 = parse_address(str(hook["buf2"])) if "buf2" in hook else _reg_val(b2_reg)
+                    sz = int(hook["size"])               if "size" in hook else (
+                         0 if action == "strcmp_semantic" else _reg_val(sz_reg)
+                    )
+
+                    # --- Validate buf1 address ---
+                    if b1 < 0x1000:
+                        raise ValueError(
+                            f"buf1 address {hex(b1)} (from {b1_reg!r}) is implausibly small "
+                            "— set 'buf1_reg' or 'buf1' in the hook dict."
+                        )
+
+                    # --- sz=0 or strcmp: auto-detect from consecutive symbolized bytes at buf1 ---
+                    if sz == 0:
+                        for _a in range(1, 513):
+                            if not ctx.isMemorySymbolized(TritonMemoryAccess(b1 + _a - 1, 1)):
+                                sz = _a - 1
+                                break
+                        else:
+                            sz = 512
+                        if sz > 0:
+                            log_entry["size_auto_detected"] = sz
+                        if sz == 0:
+                            raise ValueError(
+                                f"Cannot determine size: {sz_reg!r}=0 and no symbolized bytes "
+                                f"found at buf1 {hex(b1)}. Set 'size' explicitly in the hook dict."
+                            )
+
+                    # --- Validate buf2 address ---
+                    if b2 < 0x1000:
+                        raise ValueError(
+                            f"buf2 address {hex(b2)} (from {b2_reg!r}) is implausibly small — "
+                            "the comparison target is likely in a different register. "
+                            "Set 'buf2_reg' or 'buf2' explicitly, or use 'expected' with "
+                            "the known comparison bytes as a hex string."
+                        )
+
+                    # --- Resolve expected bytes (priority: literal → IDA static → Triton concrete) ---
+                    buf2_bytes: "bytes | None" = None
+                    buf2_source = "unknown"
+
+                    if "expected" in hook or "buf2_bytes" in hook:
+                        raw = hook.get("expected") or hook.get("buf2_bytes")
+                        if isinstance(raw, str) and not all(c in "0123456789abcdefABCDEF " for c in raw.strip()):
+                            # Treat as ASCII string literal (e.g. "expected": "crackme")
+                            buf2_bytes = raw.encode("utf-8")
+                            buf2_source = "hook_string"
+                        else:
+                            # Treat as hex string (e.g. "expected": "41424344")
+                            buf2_bytes = bytes.fromhex(str(raw).replace(" ", ""))[:sz]
+                            buf2_source = "hook_hex"
+                    else:
+                        # Try IDA's static binary view first
+                        ida_bytes_data = idc.get_bytes(b2, sz)
+                        if ida_bytes_data and len(ida_bytes_data) >= sz:
+                            buf2_bytes = bytes(ida_bytes_data)
+                            buf2_source = "ida_static"
+                        else:
+                            # buf2 is runtime-computed (XOR-decoded, stack-allocated) — not
+                            # in IDA's static view. Read from Triton's concrete memory model,
+                            # which tracks all writes made during emulation.
+                            try:
+                                raw_triton = ctx.getConcreteMemoryAreaValue(b2, sz)
+                                if raw_triton:
+                                    buf2_bytes = bytes(raw_triton)
+                                    buf2_source = "triton_concrete"
+                            except Exception:
+                                pass
+
+                    if buf2_bytes is None or len(buf2_bytes) < sz:
+                        raise ValueError(
+                            f"Cannot read {sz} bytes from buf2 at {hex(b2)}: not found in "
+                            "IDA static memory or Triton's concrete memory model. "
+                            "If buf2 is XOR-decoded at runtime, ensure the decode loop ran "
+                            "before this hook fires (linear processing must have reached it). "
+                            "Or set 'expected': '<hexbytes>' in the hook dict to specify the "
+                            "known expected bytes directly."
+                        )
+
+                    if action == "strcmp_semantic":
+                        # strcmp compares up to (but not including) the null terminator
+                        if b"\x00" in buf2_bytes:
+                            buf2_bytes = buf2_bytes[:buf2_bytes.index(b"\x00")]
+                        sz = len(buf2_bytes)
+
+                    # --- Inject equality constraints: buf1[i] == buf2_bytes[i] ---
+                    ast_ctx = ctx.getAstContext()
+                    injected = _get_injected()
+                    sym_created = []
+                    for i in range(sz):
+                        ma = TritonMemoryAccess(b1 + i, 1)
+                        if not ctx.isMemorySymbolized(ma):
+                            sv = ctx.symbolizeMemory(ma, f"inp_{hex(b1 + i)}")
+                            sym_created.append(sv.getName())
+                        mem_ast = ctx.getMemoryAst(ma)
+                        injected.append(ast_ctx.equal(mem_ast, ast_ctx.bv(int(buf2_bytes[i]), 8)))
+
+                    ctx.setConcreteRegisterValue(ret_reg, 0)  # 0 = equal
+                    log_entry["buf1"] = hex(b1)
+                    log_entry["buf2"] = hex(b2)
+                    log_entry["size"] = sz
+                    log_entry["buf2_source"] = buf2_source
+                    log_entry["buf2_expected_hex"] = buf2_bytes[:sz].hex()
+                    log_entry["constraints_injected"] = sz
+                    log_entry["sym_vars_created"] = sym_created
+                    log_entry["rax"] = "0x0"
+
+                elif action == "symbolize_buffer_arg":
+                    # Model a function that writes user-controlled bytes into a buffer
+                    # argument: scanf(fmt, buf), gets(buf), fgets(buf, n, fp), recv(...),
+                    # ReadFile(h, buf, n, ...), etc.
+                    # Read the buffer pointer from the specified argument register.
+                    arg_reg = hook.get("arg_reg", "rdx" if is_64 else "edx")
+                    size = int(hook.get("size", 64))
+                    alias_prefix = hook.get("alias_prefix", "stdin")
+                    ret_value = int(str(hook.get("return_value", 1)), 0)
+
+                    buf_addr = _reg_val(arg_reg)
+                    if buf_addr == 0:
+                        raise ValueError(
+                            f"Buffer register {arg_reg!r} is 0 — function may not have been "
+                            "called yet, or the register holds the wrong argument."
+                        )
+
+                    sym_created = []
+                    for i in range(size):
+                        ma = TritonMemoryAccess(buf_addr + i, 1)
+                        sv = ctx.symbolizeMemory(ma, f"{alias_prefix}_{i}")
+                        sym_created.append(sv.getName())
+
+                    ctx.setConcreteRegisterValue(ret_reg, ret_value)
+                    log_entry["buf_addr"] = hex(buf_addr)
+                    log_entry["size"] = size
+                    log_entry["sym_vars_created"] = sym_created
+                    log_entry["rax"] = hex(ret_value)
+
+                elif action == "fill_stdin_buffer":
+                    # Like symbolize_buffer_arg but sources size/alias_prefix from the
+                    # _STDIN_BUFFER registry set by triton_symbolize_stdin, so the hook
+                    # dict is minimal and alias names match what the caller registered.
+                    arg_reg = hook.get("arg_reg", "rcx" if is_64 else "ecx")
+                    alias_prefix = hook.get("alias_prefix", "stdin")
+                    ret_value = int(str(hook.get("return_value", 1)), 0)
+
+                    stdin_cfg = _STDIN_BUFFER.get(alias_prefix, {})
+                    size = int(hook.get("size", stdin_cfg.get("size", 128)))
+
+                    buf_addr = _reg_val(arg_reg)
+                    if buf_addr == 0:
+                        raise ValueError(
+                            f"Buffer register {arg_reg!r} is 0 — hook may have fired before "
+                            "the function was called, or the register holds a different argument."
+                        )
+
+                    sym_created = []
+                    for i in range(size):
+                        ma = TritonMemoryAccess(buf_addr + i, 1)
+                        sv = ctx.symbolizeMemory(ma, f"{alias_prefix}_{i}")
+                        sym_created.append(sv.getName())
+
+                    ctx.setConcreteRegisterValue(ret_reg, ret_value)
+                    log_entry["buf_addr"] = hex(buf_addr)
+                    log_entry["size"] = size
+                    log_entry["alias_prefix"] = alias_prefix
+                    log_entry["sym_vars_created"] = sym_created
+                    log_entry["rax"] = hex(ret_value)
+
+                else:
+                    raise ValueError(f"Unknown hook action: '{action}'")
+
+                log_entry["ok"] = True
+
+            except Exception as e:
+                log_entry["ok"] = False
+                log_entry["error"] = str(e)
+
+            return log_entry
+
+        # --- Linear processing with hook interception ---
+        func_start = func.start_ea
+        func_end = func.end_ea
+
+        raw_func = idc.get_bytes(func_start, func_end - func_start)
+        if raw_func:
+            ctx.setConcreteMemoryAreaValue(func_start, raw_func)
+
+        pc_start = len(ctx.getPathConstraints())
+        processed_count = 0
+        hook_log: list[dict] = []
+        curr = func_start
+        truncated = False
+
+        while curr < func_end and processed_count < max_insns:
+            insn_ida = idaapi.insn_t()
+            length = idaapi.decode_insn(insn_ida, curr)
+            if length == 0:
+                break
+
+            raw = idc.get_bytes(curr, length)
+            if not raw:
+                curr += 1
+                continue
+
+            insn = TritonInstruction()
+            insn.setAddress(curr)
+            insn.setOpcode(raw)
+            ctx.processing(insn)
+            _get_trace().append(curr)
+            processed_count += 1
+
+            is_call = _is_call_insn(insn)
+            if is_call:
+                # After processing a CALL, Triton has pushed the return address and
+                # set RIP to the call target.
+                try:
+                    call_target = ctx.getConcreteRegisterValue(pc_reg)
+                    return_addr = curr + length
+                    if call_target in resolved_hooks:
+                        entry = _apply_hook(resolved_hooks[call_target], return_addr)
+                        entry["call_site"] = hex(curr)
+                        entry["target"] = hex(call_target)
+                        hook_log.append(entry)
+                        # Continue from return address
+                        curr = return_addr
+                        continue
+                except Exception as e:
+                    logger.debug("triton_process_with_hooks: hook check failed at %s: %s", hex(curr), e)
+
+            curr += length
+
+        truncated = processed_count >= max_insns and curr < func_end
+        new_pcs = len(ctx.getPathConstraints()) - pc_start
+
+        solve_result = _try_solve_predicate(ctx, 30000)
+
+        return {
+            "ok": True,
+            "function_ea": hex(func_start),
+            "function_name": ida_funcs.get_func_name(func_start) or "",
+            "instructions_processed": processed_count,
+            "instructions_truncated": truncated,
+            "hooks_fired": len(hook_log),
+            "hook_log": hook_log,
+            "new_path_constraints": new_pcs,
+            "windows_abi_applied": windows_abi_applied,
+            "pc_tracking_symbolic": pc_tracking,
+            "injected_constraints": len(_get_injected()),
+            "solver": solve_result,
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_process_with_hooks failed")
+        return {"ok": False, "error": str(e)}
 
 
 @tool
@@ -1833,6 +3752,51 @@ def triton_snapshot_delete(
 # ============================================================================
 
 
+def _setup_windows_x64_internal(ctx: "TritonContext") -> None:
+    """Apply minimal Windows x64 ABI setup to an existing context (no return value).
+
+    Sets GS base → fake TEB, writes TEB+PEB structs with safe anti-debug values,
+    allocates stack memory. Called internally by compound tools when
+    setup_windows_abi=True. For full parameter control use triton_setup_windows_x64.
+    """
+    import struct
+    teb = 0x7ffa0000
+    peb = 0x7ff90000
+    heap_addr = peb + 0x1000
+    stack = 0x7fffffffe000
+
+    try:
+        gs_reg = ctx.getRegister("gs_base")
+        ctx.setConcreteRegisterValue(gs_reg, teb)
+    except Exception:
+        try:
+            ctx.setConcreteRegisterValue(ctx.getRegister("gs"), teb)
+        except Exception:
+            pass
+
+    teb_data = bytearray(0x200)
+    struct.pack_into("<Q", teb_data, 0x000, stack)
+    struct.pack_into("<Q", teb_data, 0x008, stack - 0x100000)
+    struct.pack_into("<Q", teb_data, 0x030, peb)
+    struct.pack_into("<Q", teb_data, 0x060, peb)
+    ctx.setConcreteMemoryAreaValue(teb, bytes(teb_data))
+
+    heap_data = bytearray(0x40)
+    struct.pack_into("<I", heap_data, 0x14, 2)   # Heap.Flags = HEAP_GROWABLE
+    struct.pack_into("<I", heap_data, 0x18, 0)   # Heap.ForceFlags = 0
+    ctx.setConcreteMemoryAreaValue(heap_addr, bytes(heap_data))
+
+    peb_data = bytearray(0x200)
+    peb_data[0x002] = 0  # BeingDebugged = 0
+    struct.pack_into("<I", peb_data, 0x068, 0)   # NtGlobalFlag = 0
+    struct.pack_into("<Q", peb_data, 0x030, heap_addr)
+    ctx.setConcreteMemoryAreaValue(peb, bytes(peb_data))
+
+    ctx.setConcreteMemoryAreaValue(stack - 0x10000, b"\x00" * 0x10000)
+    ctx.setConcreteRegisterValue(ctx.getRegister("rsp"), stack - 8)
+    ctx.setConcreteRegisterValue(ctx.getRegister("rbp"), stack)
+
+
 def _symbolize_registers_internal(ctx: "TritonContext", names: list[str]) -> list[dict]:
     """Helper: symbolize a list of register names. Returns per-register results."""
     out: list[dict] = []
@@ -1855,15 +3819,34 @@ def _symbolize_registers_internal(ctx: "TritonContext", names: list[str]) -> lis
             out.append({"ok": False, "register": name, "error": str(e)})
     return out
 
+def _is_call_insn(insn: "TritonInstruction") -> bool:
+    """Return True if the Triton instruction is a CALL (opcode group)."""
+    try:
+        from triton import OPCODE
+        t = insn.getType()
+        # x86/x64 CALL opcodes
+        call_types = {OPCODE.X86.CALL, OPCODE.X86.LCALL}
+        return t in call_types
+    except Exception:
+        # Fallback: check disassembly prefix
+        try:
+            return insn.getDisassembly().startswith("call ")
+        except Exception:
+            return False
+
+
 def _process_function_instructions_linear(
     ctx: "TritonContext",
     func_start: int,
     func_end: int,
     max_insns: int,
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool, list[dict]]:
     """Linearly process every instruction in [func_start, func_end).
 
-    Returns (processed_records, truncated_flag). Bytes are preloaded once.
+    Returns (processed_records, truncated_flag, call_sites).
+    call_sites is a list of dicts for each CALL instruction detected, with
+    the source address, disassembly, and resolved target if available.
+    Bytes are preloaded once.
     """
     import idaapi
     import idc
@@ -1874,6 +3857,7 @@ def _process_function_instructions_linear(
         ctx.setConcreteMemoryAreaValue(func_start, raw_func)
 
     processed: list[dict] = []
+    call_sites: list[dict] = []
     curr = func_start
     count = 0
 
@@ -1896,12 +3880,34 @@ def _process_function_instructions_linear(
 
         disasm_raw = ida_lines.generate_disasm_line(curr, 0)
         disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
+        is_call = _is_call_insn(insn)
+
+        if is_call:
+            # Try to resolve the call target from the post-processing RIP
+            try:
+                rip_val = ctx.getConcreteRegisterValue(ctx.registers.rip)
+                target_outside = not (func_start <= rip_val < func_end)
+                import ida_funcs
+                target_name = ida_funcs.get_func_name(rip_val) or ""
+            except Exception:
+                rip_val = 0
+                target_outside = True
+                target_name = ""
+
+            call_sites.append({
+                "src": hex(curr),
+                "disasm": disasm,
+                "target": hex(rip_val) if rip_val else "?",
+                "target_name": target_name,
+                "is_external": target_outside,
+            })
 
         processed.append({
             "address": hex(curr),
             "disasm": disasm,
             "size": length,
             "is_branch": insn.isBranch(),
+            "is_call": is_call,
             "is_symbolised": insn.isSymbolized(),
             "is_tainted": insn.isTainted(),
         })
@@ -1910,7 +3916,7 @@ def _process_function_instructions_linear(
         count += 1
 
     truncated = count >= max_insns and curr < func_end
-    return processed, truncated
+    return processed, truncated, call_sites
 
 
 def _process_function_instructions_fast(
@@ -1957,26 +3963,157 @@ def _process_function_instructions_fast(
     truncated = count >= max_insns and curr < func_end
     return count, truncated
 
+def _has_symbolic_in_ast(ast_str: str) -> bool:
+    """Heuristic check: does an AST string reference any symbolic variable."""
+    return "SymVar_" in ast_str or "ref!" in ast_str
+
+
+def _constraint_diagnostics(ctx: "TritonContext") -> dict:
+    """Inspect path constraints and explain why the solver may have failed.
+
+    Returns a dict with constraint counts, concrete vs symbolic breakdown,
+    and a human-readable hint for the most likely cause.
+    """
+    pcs = ctx.getPathConstraints()
+    sym_vars = ctx.getSymbolicVariables()
+
+    if not pcs:
+        if sym_vars:
+            hint = (
+                "PC_TRACKING_SYMBOLIC mode is active and no branch conditions "
+                "involved your symbolic variables. Branches on concrete memory "
+                "(e.g. Windows PEB via gs:60h, stack canary, global flags) produce "
+                "no path constraints even when registers like rdi/rbx are symbolic. "
+                "Solutions: (1) call triton_setup_windows_x64 to model GS/PEB "
+                "concretely before execution, (2) symbolize the memory that "
+                "the branch actually reads, or (3) re-init with pc_tracking_symbolic=false "
+                "to track all branches regardless."
+            )
+        else:
+            hint = (
+                "No symbolic variables and no path constraints. "
+                "Symbolize at least one register or memory range before processing instructions."
+            )
+        return {
+            "path_constraint_count": 0,
+            "symbolic_var_count": len(sym_vars),
+            "constraints_with_symbolic": 0,
+            "constraints_all_concrete": 0,
+            "hint": hint,
+        }
+
+    constraints_sym = 0
+    constraints_concrete = 0
+    concrete_always_false = 0
+
+    for pc in pcs:
+        for br in pc.getBranchConstraints():
+            if not br["isTaken"]:
+                continue
+            ast_str = str(br["constraint"])
+            if _has_symbolic_in_ast(ast_str):
+                constraints_sym += 1
+            else:
+                constraints_concrete += 1
+                # A concrete constraint can be literally False if the taken
+                # branch condition evaluates to False in the concrete state.
+                if "False" in ast_str or ast_str.strip() == "(= (bv 0 1) (bv 1 1))":
+                    concrete_always_false += 1
+
+    if constraints_sym == 0 and constraints_concrete > 0:
+        hint = (
+            f"All {constraints_concrete} path constraint(s) are fully concrete — "
+            "they involve no symbolic variables. Z3 correctly returns UNSAT when a "
+            "concrete constraint is False (e.g. a branch condition that was not taken "
+            "due to a PEB flag being 0). The symbolic variables you created (rdi, rbx, etc.) "
+            "do not flow into these branches. "
+            "Fix: model the memory that the branch reads from concretely "
+            "(call triton_setup_windows_x64 for PEB/TEB), or symbolize that memory instead."
+        )
+    elif constraints_sym > 0:
+        hint = (
+            f"{constraints_sym} symbolic + {constraints_concrete} concrete constraint(s). "
+            "The constraint set may be over-constrained. Check triton_get_path_constraints "
+            "for conflicting conditions, or increase the solver timeout."
+        )
+    else:
+        hint = "Unexpected constraint state — no taken-branch constraints found."
+
+    return {
+        "path_constraint_count": len(pcs),
+        "symbolic_var_count": len(sym_vars),
+        "constraints_with_symbolic": constraints_sym,
+        "constraints_all_concrete": constraints_concrete,
+        "concrete_always_false_count": concrete_always_false,
+        "hint": hint,
+    }
+
+
 def _try_solve_predicate(ctx: "TritonContext", timeout_ms: int) -> dict:
     """Attempt Z3 solve of the current path predicate.
 
-    Returns a structured dict — never raises. Used by the compound tools so
-    that a missing or failed solver doesn't lose the rest of the analysis.
+    Returns a structured dict — never raises. When UNSAT or empty, includes
+    diagnostic information explaining the likely cause.
+    Injected constraints (from triton_inject_comparison_constraint) are ANDed
+    into the predicate automatically.
     """
     try:
+        pcs = ctx.getPathConstraints()
+        sym_vars = ctx.getSymbolicVariables()
         predicate = ctx.getPathPredicate()
-        model = ctx.getModel(predicate, timeout=timeout_ms)
-        if not model:
-            return {"sat": False, "model": {}, "solver_used": "z3"}
 
-        result: dict[str, str] = {}
-        for _, sm in model.items():
-            sv = sm.getVariable()
-            alias = sv.getAlias() or sv.getName()
-            result[alias] = hex(sm.getValue())
-        return {"sat": True, "model": result, "solver_used": "z3"}
+        # AND in any manually injected constraints (e.g. memcmp equality)
+        injected = _get_injected()
+        if injected:
+            ast_ctx = ctx.getAstContext()
+            predicate = ast_ctx.land([predicate] + injected)
+
+        model = ctx.getModel(predicate, timeout=timeout_ms)
+
+        if model:
+            result: dict[str, str] = {}
+            for _, sm in model.items():
+                sv = sm.getVariable()
+                alias = sv.getAlias() or sv.getName()
+                result[alias] = hex(sm.getValue())
+            return {"sat": True, "model": result, "solver_used": "z3"}
+
+        # model == {} — could be UNSAT or trivially SAT (no vars to constrain).
+        # Distinguish these cases for better diagnostics.
+        diag = _constraint_diagnostics(ctx)
+
+        if not pcs:
+            # No path constraints at all — trivially satisfied, but no useful model
+            return {
+                "sat": False,
+                "model": {},
+                "solver_used": "z3",
+                "reason": "no_path_constraints",
+                "diagnostics": diag,
+            }
+
+        if diag.get("constraints_with_symbolic", 0) == 0:
+            # All constraints are concrete — UNSAT because a concrete branch
+            # condition is False, or SAT but with nothing to solve for
+            return {
+                "sat": False,
+                "model": {},
+                "solver_used": "z3",
+                "reason": "concrete_constraints_only",
+                "diagnostics": diag,
+            }
+
+        # Has symbolic constraints but still UNSAT → genuinely over-constrained
+        return {
+            "sat": False,
+            "model": {},
+            "solver_used": "z3",
+            "reason": "unsat",
+            "diagnostics": diag,
+        }
+
     except Exception as e:
-        logger.exception("triton_solve_path_constraints_inner failed")
+        logger.exception("_try_solve_predicate failed")
         return {"sat": False, "model": {}, "error": str(e)}
 
 @tool
@@ -1998,15 +4135,39 @@ def triton_analyze_function(
         "When true, re-initialize the Triton context before analysis (fresh slate).",
     ] = True,
     timeout_ms: Annotated[int, "Z3 solver timeout in ms (0 = no limit)."] = 10000,
+    setup_windows_abi: Annotated[
+        bool,
+        "When true, automatically call triton_setup_windows_x64 before symbolization. "
+        "This models the GS segment base, fake TEB/PEB (BeingDebugged=0, NtGlobalFlag=0), "
+        "stack pointer, and heap fields. Essential for Windows x64 binaries that access "
+        "gs:[0x60] (PEB) — without this, anti-debug checks produce concrete-false "
+        "constraints and the solver returns UNSAT. Default False.",
+    ] = False,
+    pc_tracking_symbolic: Annotated[
+        bool | None,
+        "When true, path constraints are only collected for branches whose condition "
+        "involves at least one symbolic variable. When false or None (default), ALL "
+        "branches are tracked — this ensures concrete branches (anti-debug PEB checks, "
+        "length guards, sanity checks) appear in the path predicate and the solver can "
+        "reason about them. Set true only when excluding concrete-only branches is "
+        "intentional (high-noise functions with many unrelated concrete checks).",
+    ] = None,
 ) -> dict:
     """One-shot symbolic execution analysis of a whole function.
 
     Runs the full pipeline in a single call:
       1. (re-)initialize the Triton context, auto-detecting architecture from IDA
-      2. mark the listed argument registers as symbolic
-      3. linearly process every instruction inside the function (capped by max_insns)
-      4. ask Z3 to find a concrete input satisfying the accumulated path predicate
-      5. return symbolic variables, path constraints, taint state, and the model
+      2. (optionally) set up Windows x64 ABI environment (GS/PEB/TEB/stack)
+      3. mark the listed argument registers as symbolic
+      4. linearly process every instruction inside the function (capped by max_insns)
+      5. ask Z3 to find a concrete input satisfying the accumulated path predicate
+      6. return symbolic variables, path constraints, taint state, solver model, and diagnostics
+
+    When solver returns sat=false, check the ``solver.diagnostics`` field for an
+    explanation. Common causes for Windows binaries:
+    - Zero path constraints: branches on gs:[0x60] (PEB) aren't symbolized →
+      use setup_windows_abi=true and symbolize_args='rcx,rdx,r8,r9'
+    - Concrete constraints only: your symbolic registers don't flow into branches
 
     This is a convenience tool — for fine-grained control use triton_init,
     triton_symbolize_register, triton_process_function, and triton_solve_path_constraints
@@ -2026,14 +4187,27 @@ def triton_analyze_function(
             return {"ok": False, "address": address, "error": f"No function at {hex(ea)}"}
 
         # Step 1: (re-)init context, auto-detecting architecture
+        # Resolve pc_tracking_symbolic: None → False (track all branches by default).
+        # When setup_windows_abi=True this is especially important so that concrete
+        # PEB checks appear in the path predicate.
+        pc_tracking = pc_tracking_symbolic if pc_tracking_symbolic is not None else False
         if reinit or _contexts.get(_CTX_KEY) is None:
             arch = _detect_arch_from_ida()
-            ctx = _build_ctx(arch)
+            ctx = _build_ctx(arch, pc_tracking_symbolic=pc_tracking)
             _set_ctx(_CTX_KEY, ctx)
         else:
             ctx = _get_ctx()
 
-        # Step 2: parse and symbolize argument registers
+        # Step 2: Windows ABI setup (before symbolization — must happen first)
+        windows_abi_applied = False
+        if setup_windows_abi and ctx.getArchitecture() == ARCH.X86_64:
+            try:
+                _setup_windows_x64_internal(ctx)
+                windows_abi_applied = True
+            except Exception as e:
+                logger.warning("triton_analyze_function: Windows ABI setup failed: %s", e)
+
+        # Step 3: parse and symbolize argument registers
         if isinstance(symbolize_args, str):
             reg_list = [r.strip() for r in symbolize_args.split(",") if r.strip()]
         else:
@@ -2041,20 +4215,21 @@ def triton_analyze_function(
 
         symbolized = _symbolize_registers_internal(ctx, reg_list) if reg_list else []
 
-        # Step 3: linearly process the function
+        # Step 4: linearly process the function
         sym_start = len(ctx.getSymbolicExpressions())
         pc_start = len(ctx.getPathConstraints())
         tainted_reg_start = len(ctx.getTaintedRegisters())
         tainted_mem_start = len(ctx.getTaintedMemory())
 
-        processed, truncated = _process_function_instructions_linear(
+        processed, truncated, call_sites = _process_function_instructions_linear(
             ctx, func.start_ea, func.end_ea, max_insns
         )
 
         sym_end = len(ctx.getSymbolicExpressions())
         pc_end = len(ctx.getPathConstraints())
+        new_pcs = pc_end - pc_start
 
-        # Step 4: capture state summaries
+        # Step 5: capture state summaries
         sym_vars_info = []
         try:
             from triton import SYMBOLIC
@@ -2070,14 +4245,20 @@ def triton_analyze_function(
             pass
 
         pc_records = []
+        branches_with_symbolic = 0
         try:
             for pc in ctx.getPathConstraints():
                 branches_info = []
                 for br in pc.getBranchConstraints():
+                    ast_str = str(br["constraint"])
+                    has_sym = _has_symbolic_in_ast(ast_str)
+                    if has_sym:
+                        branches_with_symbolic += 1
                     branches_info.append({
                         "is_taken": br["isTaken"],
                         "src": hex(br["srcAddr"]),
                         "dst": hex(br["dstAddr"]),
+                        "has_symbolic": has_sym,
                     })
                 pc_records.append({
                     "multiple_branches": pc.isMultipleBranches(),
@@ -2091,8 +4272,24 @@ def triton_analyze_function(
             "memory_addrs": [hex(a) for a in ctx.getTaintedMemory()],
         }
 
-        # Step 5: solve
+        # Step 6: solve
         solve_result = _try_solve_predicate(ctx, timeout_ms)
+
+        # Warn when symbolic vars exist but 0 constraints collected (common trap)
+        warnings = []
+        if new_pcs == 0 and sym_vars_info:
+            warnings.append(
+                f"Zero path constraints despite {len(sym_vars_info)} symbolic variable(s). "
+                "PC_TRACKING_SYMBOLIC mode is filtering out branches on concrete memory. "
+                "If this function reads from gs:[0x60] (PEB), retry with setup_windows_abi=true. "
+                "If symbolic vars don't flow into branch conditions, symbolize different registers or memory."
+            )
+        elif new_pcs > 0 and branches_with_symbolic == 0:
+            warnings.append(
+                f"{new_pcs} path constraint(s) collected but none reference symbolic variables. "
+                "Branches are on concrete data — symbolic inputs don't affect the path taken. "
+                "The solver will return UNSAT or an empty model (no useful assignments)."
+            )
 
         return {
             "ok": True,
@@ -2101,17 +4298,22 @@ def triton_analyze_function(
             "function_name": ida_funcs.get_func_name(func.start_ea) or "",
             "architecture": _arch_to_str(ctx.getArchitecture()),
             "reinitialised": reinit,
+            "windows_abi_applied": windows_abi_applied,
+            "pc_tracking_symbolic": pc_tracking,
             "symbolized_args": symbolized,
             "instructions_processed": len(processed),
             "instructions_truncated": truncated,
             "new_symbolic_expressions": sym_end - sym_start,
-            "new_path_constraints": pc_end - pc_start,
+            "new_path_constraints": new_pcs,
+            "path_constraints_with_symbolic": branches_with_symbolic,
             "symbolic_variables": sym_vars_info,
             "path_constraints": pc_records,
             "tainted_outputs": tainted_outputs,
             "tainted_register_delta": len(ctx.getTaintedRegisters()) - tainted_reg_start,
             "tainted_memory_delta": len(ctx.getTaintedMemory()) - tainted_mem_start,
             "solver": solve_result,
+            "warnings": warnings,
+            "call_sites": call_sites,
             "instructions": processed,
         }
 
@@ -2199,11 +4401,24 @@ def triton_find_input_for_branch(
         "Re-initialize the Triton context before exploration (default true).",
     ] = True,
     timeout_ms: Annotated[int, "Z3 solver timeout in ms (default 10000)."] = 10000,
+    setup_windows_abi: Annotated[
+        bool,
+        "When true, model the Windows x64 GS segment (TEB/PEB), stack, and heap "
+        "before symbolization. Prevents anti-debug checks via gs:[0x60] from "
+        "producing concrete-false constraints that make the solver return UNSAT.",
+    ] = False,
+    pc_tracking_symbolic: Annotated[
+        bool | None,
+        "When true, track path constraints only for branches involving symbolic variables. "
+        "When false or None (default), ALL branches are tracked — ensures concrete branches "
+        "(PEB anti-debug, length checks) appear in the path predicate. Set true only to "
+        "exclude concrete-only branches intentionally.",
+    ] = None,
 ) -> dict:
     """CFG-guided branch reachability: find concrete inputs that reach a target address.
 
     Algorithm:
-      1. Init Triton + symbolize the listed argument registers.
+      1. Init Triton + optionally set up Windows ABI + symbolize listed argument registers.
       2. Use IDA's basic-block CFG to BFS the shortest sequence of blocks
          from the function entry to the block containing target_address.
       3. Execute Triton symbolically over **only those blocks**, in order
@@ -2212,7 +4427,12 @@ def triton_find_input_for_branch(
          that is, an input that makes the program take exactly that path.
 
     Returns the chosen block path, the per-instruction trace, accumulated
-    path constraints, and a Z3 model (or 'unsatisfiable' / solver error).
+    path constraints, a Z3 model, and diagnostics explaining any UNSAT result.
+
+    **For Windows x64 crackmes**: always pass setup_windows_abi=true and set
+    symbolize_args to the Windows ABI registers ('rcx,rdx,r8,r9'). Without
+    setup_windows_abi, gs:[0x60] accesses resolve to address 0x60 (unmapped)
+    and any anti-debug check produces a concrete-false constraint → UNSAT.
     """
     if not TRITON_AVAILABLE:
         return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
@@ -2248,13 +4468,25 @@ def triton_find_input_for_branch(
                 ),
             }
 
+        # Resolve pc_tracking_symbolic: None → False (track all branches by default)
+        pc_tracking = pc_tracking_symbolic if pc_tracking_symbolic is not None else False
+
         # Init / reset context
         if reinit or _contexts.get(_CTX_KEY) is None:
             arch = _detect_arch_from_ida()
-            ctx = _build_ctx(arch)
+            ctx = _build_ctx(arch, pc_tracking_symbolic=pc_tracking)
             _set_ctx(_CTX_KEY, ctx)
         else:
             ctx = _get_ctx()
+
+        # Windows ABI setup (before symbolization)
+        windows_abi_applied = False
+        if setup_windows_abi and ctx.getArchitecture() == ARCH.X86_64:
+            try:
+                _setup_windows_x64_internal(ctx)
+                windows_abi_applied = True
+            except Exception as e:
+                logger.warning("triton_find_input_for_branch: Windows ABI setup failed: %s", e)
 
         # Symbolize the listed registers
         if isinstance(symbolize_args, str):
@@ -2282,7 +4514,6 @@ def triton_find_input_for_branch(
             bb_end = bb.end_ea
             if bb.id == target_block_id:
                 bb_end = min(bb.end_ea, target_ea + 1)
-                # We still need to process up to and including target_ea
                 stop_after_target = True
 
             curr = bb.start_ea
@@ -2292,8 +4523,6 @@ def triton_find_input_for_branch(
                 if length == 0:
                     break
 
-                # If processing one more instruction would jump us past the target inside
-                # the target block, stop after this instruction.
                 raw = idc.get_bytes(curr, length)
                 if not raw:
                     curr += 1
@@ -2333,14 +4562,20 @@ def triton_find_input_for_branch(
 
         # Collect the path constraints we accumulated
         pc_records = []
+        branches_with_symbolic = 0
         try:
             for pc in ctx.getPathConstraints():
                 branches_info = []
                 for br in pc.getBranchConstraints():
+                    ast_str = str(br["constraint"])
+                    has_sym = _has_symbolic_in_ast(ast_str)
+                    if has_sym:
+                        branches_with_symbolic += 1
                     branches_info.append({
                         "is_taken": br["isTaken"],
                         "src": hex(br["srcAddr"]),
                         "dst": hex(br["dstAddr"]),
+                        "has_symbolic": has_sym,
                     })
                 pc_records.append({
                     "multiple_branches": pc.isMultipleBranches(),
@@ -2353,6 +4588,20 @@ def triton_find_input_for_branch(
         solve_result = _try_solve_predicate(ctx, timeout_ms)
         reached = any(int(t["address"], 16) == target_ea for t in trace)
 
+        warnings = []
+        if new_pcs == 0 and symbolized:
+            warnings.append(
+                f"Zero path constraints despite {len(symbolized)} symbolized register(s). "
+                "Branches along this CFG path don't involve your symbolic registers. "
+                "If Windows anti-debug checks (gs:[0x60]) are on this path, retry with "
+                "setup_windows_abi=true to model PEB concretely."
+            )
+        elif new_pcs > 0 and branches_with_symbolic == 0:
+            warnings.append(
+                f"{new_pcs} constraint(s) collected but none involve symbolic variables. "
+                "The path predicate is concrete — solver cannot produce useful input assignments."
+            )
+
         return {
             "ok": True,
             "function_ea": hex(func.start_ea),
@@ -2362,12 +4611,16 @@ def triton_find_input_for_branch(
                 {"id": bb.id, "start_ea": hex(bb.start_ea), "end_ea": hex(bb.end_ea)}
                 for bb in block_path
             ],
+            "windows_abi_applied": windows_abi_applied,
+            "pc_tracking_symbolic": pc_tracking,
             "symbolized_args": symbolized,
             "instructions_executed": len(trace),
             "instructions_truncated": insn_count >= max_insns,
             "path_constraints_collected": new_pcs,
+            "path_constraints_with_symbolic": branches_with_symbolic,
             "path_constraints": pc_records,
             "solver": solve_result,
+            "warnings": warnings,
             "trace": trace,
         }
 

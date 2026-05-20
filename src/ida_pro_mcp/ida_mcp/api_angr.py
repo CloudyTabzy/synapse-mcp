@@ -105,6 +105,18 @@ if ANGR_AVAILABLE:
         except Exception:
             pass
 
+    # Work around claripy's fragile SIGINT handler which asserts on uninstall
+    # even when install was skipped (e.g., when SIGINT is SIG_DFL or when
+    # running inside IDA's signal-handling context). angr runs inside a daemon
+    # thread via _run_with_deadline; Ctrl+C interruption is handled at the
+    # MCP server layer, not inside z3.
+    try:
+        import claripy.backends.backend_z3 as _backend_z3
+        _backend_z3.install_sigint_handler = lambda: None
+        _backend_z3.uninstall_sigint_handler = lambda: None
+    except Exception:
+        pass
+
 
 # ============================================================================
 # TypedDict result types
@@ -988,7 +1000,11 @@ if ANGR_AVAILABLE:
                 funcs.append({
                     "addr": hex(addr),
                     "name": func.name or f"sub_{addr:X}",
-                    "block_count": len(func.block_addrs),
+                    "block_count": (
+                        len(func.block_addrs_set)
+                        if hasattr(func, "block_addrs_set")
+                        else len(list(func.block_addrs))
+                    ),
                     "call_targets": call_targets[:20],
                     "is_returning": bool(func.returning) if func.returning is not None else False,
                     "has_unresolved_calls": bool(getattr(func, "has_unresolved_calls", False)),
@@ -998,8 +1014,17 @@ if ANGR_AVAILABLE:
             funcs_sorted = sorted(funcs, key=lambda f: f["block_count"], reverse=True)
 
             graph = cfg.model.graph
-            block_count = len(graph.nodes())
-            edge_count = len(graph.edges())
+            # SpillingCFG (angr >= 9.2) exposes .nodes and .edges as properties
+            # that return views; calling them with () invokes __call__ which
+            # yields a generator, breaking len(). Use number_of_* for safety.
+            try:
+                block_count = graph.number_of_nodes()
+            except Exception:
+                block_count = len(list(graph.nodes()))
+            try:
+                edge_count = graph.number_of_edges()
+            except Exception:
+                edge_count = len(list(graph.edges()))
             resolved_ij = 0
             unresolved_ij = 0
             try:
@@ -1730,11 +1755,9 @@ if ANGR_AVAILABLE:
 
             graph = cfg.model.graph
 
-            import networkx as _nx
-            try:
-                bfs_iter = _nx.bfs_tree(graph, src_node, depth_limit=max_depth)
-            except Exception:
-                bfs_iter = _nx.bfs_tree(graph, src_node)
+            # SpillingCFG (angr >= 9.2) lacks .neighbors() which NetworkX
+            # bfs_tree requires. Use manual BFS over .successors() instead.
+            from collections import deque as _deque
 
             kw = None
             if flag_strings:
@@ -1742,12 +1765,17 @@ if ANGR_AVAILABLE:
 
             nodes_out: list[dict] = []
             interesting: list[str] = []
-            for n in bfs_iter:
-                if len(nodes_out) >= max_nodes:
-                    break
+            seen_addrs: set[int] = set()
+            bfs_queue: _deque = _deque()
+            bfs_queue.append((src_node, 0))
+
+            while bfs_queue and len(nodes_out) < max_nodes:
+                n, depth = bfs_queue.popleft()
                 addr = getattr(n, "addr", None)
-                if addr is None:
+                if addr is None or addr in seen_addrs:
                     continue
+                seen_addrs.add(addr)
+
                 func_name = None
                 try:
                     f = cfg.kb.functions.get(getattr(n, "function_address", 0))
@@ -1761,12 +1789,21 @@ if ANGR_AVAILABLE:
                     is_interesting = any(k in name_lower for k in kw)
                 nodes_out.append({
                     "addr": hex(addr),
-                    "depth": 0,
+                    "depth": depth,
                     "function_name": func_name or "",
                     "is_interesting": is_interesting,
                 })
                 if is_interesting:
                     interesting.append(hex(addr))
+
+                if depth < max_depth:
+                    try:
+                        for succ in graph.successors(n):
+                            saddr = getattr(succ, "addr", None)
+                            if saddr is not None and saddr not in seen_addrs:
+                                bfs_queue.append((succ, depth + 1))
+                    except Exception:
+                        pass
 
             return {
                 "ok": True,
@@ -2039,8 +2076,10 @@ if ANGR_AVAILABLE:
                     }
 
                 def _build_slice():
+                    # angr >= 9.2 requires cdg and ddg as positional args even
+                    # when control_flow_slice=True; pass None for both.
                     return proj.analyses.BackwardSlice(
-                        cfg,
+                        cfg, None, None,
                         control_flow_slice=True,
                         targets=[(target_node, -1)],
                     )
