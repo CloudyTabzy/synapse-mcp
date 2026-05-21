@@ -448,6 +448,29 @@ Requires: `pip install networkx>=3.0`
 | `workflow_find_critical_paths` | Find bottleneck edges whose removal disconnects subgraphs |
 | `workflow_reveng_overview` | One-call RE overview: centrality + communities + top functions |
 
+### 🔧 Enhanced Native Tools — Core & Analysis (`api_core.py`, `api_analysis.py`)
+No extra dependencies.
+
+**Function inventory (`api_core.py`):**
+
+| Tool | What it does |
+|------|-------------|
+| `list_functions_enhanced` | List functions with `is_thunk`, `is_library`, `is_noret`, `is_external`, `has_prototype` flags — filter out stubs and thunks before spending tokens on analysis |
+| `list_classes` | Extract C++ class/namespace inventory from mangled IDB names — groups methods under each class prefix with method counts |
+
+**Function analysis (`api_analysis.py`):**
+
+| Tool | What it does |
+|------|-------------|
+| `get_function_callers` | All callers of one or more functions (CodeRefsTo + call-instruction filter, deduplicated by caller function start) |
+| `get_function_signature` | Type string per function — IDB prototype first, Hex-Rays `cfunc.type` fallback; `source` field tells you which was used |
+| `get_function_jump_targets` | Control-flow triage without a full CFG — lists jump targets with kind: `unconditional` / `conditional` / `indirect` |
+| `get_function_hash` | SHA-256 of normalised instruction bytes (address-type operands zeroed, immediates kept) — stable across rebase, useful for cross-binary matching |
+| `get_bulk_function_hashes` ⚡ | Paginated binary-wide hash map — submit as background task on large binaries (`Heavy:`) |
+| `analyze_function_completeness` | 0–100 documentation score per function (custom name 35pts, type 25pts, comment 20pts, named stack vars 15pts, inline comments 5pts) with letter grade A–F and missing-item list |
+| `batch_analyze_completeness` ⚡ | Binary-wide completeness sweep — worst-first by default, filter by score range, grade distribution histogram (`Heavy:`) |
+| `diff_functions` | Unified diff of two decompiled functions + `SequenceMatcher` similarity ratio — track changes across patches or compare variants |
+
 ### 🎯 Native IDA — Reconnaissance (`api_recon.py`)
 No extra dependencies.
 
