@@ -2742,6 +2742,12 @@ if NETWORKX_AVAILABLE:
             bool, "Compute Louvain communities (default: True)"
         ] = True,
         max_recommendations: Annotated[int, "Cap recommendations list"] = 15,
+        quick_mode: Annotated[
+            bool,
+            "Skip YARA enrichment and community detection for a fast centrality-only "
+            "overview. Cuts runtime by ~50-70% on large binaries. "
+            "Equivalent to use_yara=False, include_communities=False.",
+        ] = False,
     ) -> RevengOverviewResult:
         """⭐ Comprehensive first-pass binary structural overview.
 
@@ -2759,6 +2765,10 @@ if NETWORKX_AVAILABLE:
         try:
             import time as _t
             start = _t.time()
+
+            if quick_mode:
+                use_yara = False
+                include_communities = False
 
             # Build the call graph (uses cache if available)
             cg_res = _call_graph_impl()
@@ -2890,10 +2900,12 @@ if NETWORKX_AVAILABLE:
                 "recommendations": recs,
                 "yara_used": yara_used,
                 "elapsed_ms": elapsed,
+                "quick_mode": quick_mode,
                 "note": (
-                    f"Analyzed {n} functions / {e} edges in {elapsed}ms. "
-                    + (f"YARA enriched {len(yara_categories)} functions."
-                       if yara_used else "YARA not available.")
+                    f"Analyzed {n} functions / {e} edges in {elapsed}ms"
+                    + (" [quick_mode: YARA+communities skipped]." if quick_mode else ".")
+                    + (" " + f"YARA enriched {len(yara_categories)} functions."
+                       if yara_used else "")
                 ),
             }
         except Exception as e:

@@ -113,7 +113,16 @@ class PythonExecResult(TypedDict):
 def py_eval(
     code: Annotated[str, "Python code"],
 ) -> PythonExecResult:
-    """Execute Python in IDA context and return result/stdout/stderr."""
+    """Execute Python in IDA context and return result/stdout/stderr.
+
+    Scoping note: generator expressions inside any() / all() / sum() can raise
+    NameError because the generator's inner scope cannot see the outer exec()
+    locals. Use explicit for-loops instead:
+        bad:  any(f(x) for x in items)
+        good: result = False
+              for x in items:
+                  if f(x): result = True; break
+    """
     # Capture stdout/stderr
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()

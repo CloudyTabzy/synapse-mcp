@@ -33,6 +33,7 @@ import idc
 from .rpc import tool, unsafe
 from .sync import idasync, IDAError
 from .utils import parse_address, tool_error
+from . import compat
 
 
 # ============================================================================
@@ -501,7 +502,7 @@ def find_vtable_candidates(
     min_pointers: Annotated[
         int, "Minimum consecutive code pointers to qualify (default 3)"
     ] = 3,
-    pointer_size: Annotated[int, "Pointer width: 4 or 8 (default 8 for x64)"] = 8,
+    pointer_size: Annotated[int, "Pointer width: 4 or 8 (default 0 = auto-detect from IDB bitness)"] = 0,
     max_targets_per_vtable: Annotated[
         int, "Max function targets to include per candidate (default 10)"
     ] = 10,
@@ -512,11 +513,16 @@ def find_vtable_candidates(
     Any run of `min_pointers`+ consecutive values that all point into an
     executable segment is reported as a VTable candidate.
 
+    `pointer_size` defaults to 0 (auto-detect): 4 for 32-bit IDBs, 8 for
+    64-bit IDBs. Override explicitly for mixed-bitness binaries.
+
     Returns the run's start address, length, sample target functions, and
     whether IDA already named the address. AI agents can then probe each
     candidate's call sites with `find_global_writers` (to see who installs
     it) or `find_indirect_calls` (to see who calls through it).
     """
+    if pointer_size == 0:
+        pointer_size = 8 if compat.inf_is_64bit() else 4
     if pointer_size not in (4, 8):
         return _annotate({"ok": False, "section": section, "error": "pointer_size must be 4 or 8"})
 
@@ -563,6 +569,7 @@ def find_vtable_candidates(
         return _annotate({
             "ok": True,
             "section": section,
+            "pointer_size": pointer_size,
             "candidates": candidates,
             "count": len(candidates),
         })
@@ -747,6 +754,7 @@ def find_indirect_calls(
     try:
         sites: list[IndirectCallSite] = []
         by_offset: dict[str, int] = {}
+        instructions_scanned = 0
         ea = start_ea
         while ea < end_ea and len(sites) < max_results:
             insn = _decoded_or_none(ea)
@@ -756,6 +764,7 @@ def find_indirect_calls(
                     break
                 continue
 
+            instructions_scanned += 1
             if _is_indirect_call(insn):
                 # ops[0] for an indirect call is the target memory operand.
                 op = insn.ops[0]
@@ -790,6 +799,9 @@ def find_indirect_calls(
 
             ea += insn.size if insn.size else 1
 
+        note = None
+        if len(sites) == 0:
+            note = f"Scanned {instructions_scanned} instructions, found 0 indirect calls. Verify the address range contains decoded code and that the binary is x86/x64."
         return _annotate({
             "ok": True,
             "start": hex(start_ea),
@@ -797,6 +809,8 @@ def find_indirect_calls(
             "sites": sites,
             "by_offset": by_offset,
             "count": len(sites),
+            "instructions_scanned": instructions_scanned,
+            **({"note": note} if note else {}),
         })
     except Exception as e:
         return _annotate({

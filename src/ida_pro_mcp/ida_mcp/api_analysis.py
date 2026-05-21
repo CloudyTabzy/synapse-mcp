@@ -920,6 +920,12 @@ def disasm(
         total_count = 0
         more = False
 
+        # Always provide a fast total count when we have a function, so agents
+        # can plan pagination without passing include_total=True manually.
+        if func and not include_total:
+            total_count = sum(1 for _ in idautils.FuncItems(func.start_ea))
+            include_total = True  # mark so the value is emitted below
+
         def _maybe_add(ea: int) -> bool:
             nonlocal seen, total_count, more
             if include_total:
