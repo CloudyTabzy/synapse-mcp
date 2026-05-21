@@ -1134,7 +1134,9 @@ def analyze_batch(
         "Comprehensive per-function analysis with selectable sections",
     ],
 ) -> list[AnalyzeBatchResult]:
-    """Run comprehensive analysis over one or more target functions."""
+    """Run comprehensive analysis over one or more target functions.
+
+    Heavy: for large batches use invoke_tool(..., async_mode=True) or task_submit + task_poll."""
     queries = normalize_dict_list(queries)
 
     results: list[dict] = []
@@ -2428,7 +2430,9 @@ def callgraph(
         int, "Max edges per function (default: 200, max: 5000)"
     ] = 200,
 ) -> list[CallGraphResult]:
-    """Build bounded callgraph from roots with depth/node/edge limits."""
+    """Build bounded callgraph from roots with depth/node/edge limits.
+
+    Heavy: for deep or wide graphs use invoke_tool(..., async_mode=True) or task_submit + task_poll."""
     roots = normalize_list_input(roots)
     if max_depth < 0:
         max_depth = 0
@@ -3041,6 +3045,8 @@ def find_similar_functions(
     ] = 0.75,
 ) -> FindSimilarFunctionsResult:
     """Find functions structurally similar to a reference function.
+
+    Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
 
     Uses a feature-vector approach combining:
     - CFG metrics: block count, edge count, cyclomatic complexity

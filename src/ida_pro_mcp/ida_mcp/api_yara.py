@@ -1255,7 +1255,10 @@ if YARA_AVAILABLE:
         Use dry_run=True (default) to preview all changes safely before committing.
 
         Scope 'functions' is most precise and avoids cross-function noise;
-        'segments' is faster for large IDBs; 'file' bypasses IDA entirely."""
+        'segments' is faster for large IDBs; 'file' bypasses IDA entirely.
+
+        Heavy: for large IDBs use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+        """
         try:
             if not rules or not rules.strip():
                 return {"ok": False, "error": "rules must not be empty"}

@@ -996,6 +996,8 @@ def scan_and_define_funcs(
 ) -> dict:
     """Scan an address range, force IDA analysis, and define all functions found.
 
+    Heavy: for large ranges use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+
     Workflow:
     1. Optionally clear existing definitions (``del_items=true``).
     2. Run ``plan_and_wait`` to disassemble the range (``force=true``).

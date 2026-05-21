@@ -939,6 +939,8 @@ if NETWORKX_AVAILABLE:
     ) -> GraphSummary:
         """Build the full call graph for the current IDB.
 
+        Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+
         Cached in module-global LRU (max 5). Subsequent analysis tools
         (centrality, paths, communities) reuse the cached graph by graph_id.
         """
@@ -1361,6 +1363,8 @@ if NETWORKX_AVAILABLE:
         ] = 500,
     ) -> CentralFunctionsResult:
         """⭐ Rank functions by graph-theoretic importance.
+
+        Heavy: use invoke_tool(..., async_mode=True) or task_submit + task_poll on large binaries.
 
         method='combined' weights PageRank (50%) + betweenness (30%) +
         in-degree centrality (20%). For graphs with V > 2000, betweenness
@@ -2749,6 +2753,8 @@ if NETWORKX_AVAILABLE:
         This is "the first tool to call on a new binary." A stripped binary
         with 800 functions normally requires hours of manual browsing —
         this surfaces the top targets in seconds.
+
+        Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
         """
         try:
             import time as _t
@@ -3019,6 +3025,8 @@ if NETWORKX_AVAILABLE:
 
         Useful for vulnerability triage: surfaces all call chains that can
         reach known-dangerous functions.
+
+        Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
         """
         try:
             entry = _get_cached(graph_id)
@@ -3096,6 +3104,8 @@ if NETWORKX_AVAILABLE:
 
         Returns: similarity score, top added/removed functions by importance,
         and a narrative summary suitable for binary diffing reports.
+
+        Heavy: for large graphs use invoke_tool(..., async_mode=True) or task_submit + task_poll.
         """
         try:
             # We can't call the @idasync-wrapped nx_graph_diff tool — inline the logic.

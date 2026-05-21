@@ -651,10 +651,82 @@ def describe_tool(
     }
 
 
+def _unpack_call_result(call_result: dict) -> object:
+    """Extract the actual tool output from a zeromcp tools/call result envelope."""
+    structured = call_result.get("structuredContent")
+    if structured is not None:
+        return structured
+    content = call_result.get("content", [])
+    if content:
+        try:
+            return json.loads(content[0].get("text", "null"))
+        except (json.JSONDecodeError, KeyError):
+            return content[0].get("text")
+    return None
+
+
+def _invoke_tool_async(tool: str, args: dict | None, host: str, port: int) -> object:
+    """Submit tool as a background task and poll until done, then return the result.
+
+    Keeps no open HTTP connection during execution — safe for operations that
+    take 30 s–5 min on the IDA main thread.
+    """
+    submit_resp = _proxy_to_instance(host, port, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "task_submit", "arguments": {"tool_name": tool, "arguments": args or {}}},
+    })
+    if submit_resp is None or "error" in submit_resp:
+        err = (submit_resp or {}).get("error", {}).get("message", "no response")
+        return {"ok": False, "error": f"task_submit failed: {err}", "hint": "Retry without async_mode=True for a direct synchronous call."}
+
+    submit_result = _unpack_call_result(submit_resp.get("result", {}))
+    if not isinstance(submit_result, dict) or not submit_result.get("ok"):
+        err = submit_result.get("error", "unknown") if isinstance(submit_result, dict) else "submit failed"
+        return {"ok": False, "error": f"task_submit error: {err}"}
+
+    task_id = submit_result.get("task_id")
+    if not task_id:
+        return {"ok": False, "error": "task_submit returned no task_id"}
+
+    poll_interval = 2.0
+    max_wait = 300.0
+    waited = 0.0
+    while waited < max_wait:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        poll_resp = _proxy_to_instance(host, port, {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "task_poll", "arguments": {"task_id": task_id}},
+        })
+        if poll_resp is None or "error" in poll_resp:
+            continue
+        poll_data = _unpack_call_result(poll_resp.get("result", {}))
+        if not isinstance(poll_data, dict):
+            continue
+        status = poll_data.get("status")
+        if status == "done":
+            inner = poll_data.get("result")
+            if isinstance(inner, dict):
+                return _unpack_call_result(inner) or inner
+            return inner
+        if status == "error":
+            return {"ok": False, "error": poll_data.get("error", "task failed"), "task_id": task_id}
+        if status == "cancelled":
+            return {"ok": False, "error": "Task was cancelled", "task_id": task_id}
+
+    return {
+        "ok": False,
+        "error": f"Async task '{task_id}' did not complete within {int(max_wait)}s.",
+        "task_id": task_id,
+        "hint": "Call task_poll(task_id=...) manually to check if it finished, or task_cancel to abort.",
+    }
+
+
 @mcp.tool
 def invoke_tool(
     tool: Annotated[str, "Tool name to invoke (from list_tools or list_modules directory)"],
     args: Annotated[dict | None, "Tool arguments as a flat dict. ALL tool inputs go here — never at the top level alongside 'tool'. CORRECT: invoke_tool(tool='decompile', args={'address': 'main'}). WRONG: invoke_tool(tool='decompile', address='main')."] = None,
+    async_mode: Annotated[bool, "Submit as a background task and poll until done. Use for heavy operations marked with 'Heavy:' in their description (callgraph, analyze_batch, triton_process_function, workflow_*, nx_central_functions, angr_find_paths, yara_idb_annotate, scan_and_define_funcs). Avoids MCP client timeouts. Returns same result shape as a direct call."] = False,
 ) -> object:
     """[lazy-mode] Invoke any IDA tool by name.
 
@@ -662,8 +734,11 @@ def invoke_tool(
       CORRECT:   invoke_tool(tool='decompile', args={'address': 'main'})
       INCORRECT: invoke_tool(tool='decompile', address='main')  ← args silently empty, call fails
 
-    If you know the tool name from a prior session or the list_modules directory, call directly
-    without discovery. Use describe_tool(name=...) to see required fields first if unsure."""
+    For heavy tools (those with 'Heavy:' in their description), pass async_mode=True to avoid
+    MCP client timeouts. The call submits a background task, polls every 2 s, and returns the
+    same result shape when done. Max wait: 300 s.
+
+    If you know the tool name, call directly without discovery."""
     global _lazy_tools_cache, _lazy_module_cache
     if tool == "__reset_cache__":
         with _lazy_tools_cache_lock:
@@ -674,7 +749,12 @@ def invoke_tool(
         except Exception:
             pass
         return {"ok": True, "message": "Tool cache cleared and directory refreshed."}
+
     host, port = _get_active_ida_target()
+
+    if async_mode:
+        return _invoke_tool_async(tool, args, host, port)
+
     for attempt in range(2):
         resp = _proxy_to_instance(host, port, {
             "jsonrpc": "2.0",
@@ -714,17 +794,7 @@ def invoke_tool(
                 "error": msg,
                 "hint": "Call list_modules() to see available groups, then list_tools(module=...) to find the right tool name.",
             }
-        # Prefer structuredContent (already a dict); fall back to parsing the text content
-        structured = call_result.get("structuredContent")
-        if structured is not None:
-            return structured
-        content = call_result.get("content", [])
-        if content:
-            try:
-                return json.loads(content[0].get("text", "null"))
-            except (json.JSONDecodeError, KeyError):
-                return content[0].get("text")
-        return None
+        return _unpack_call_result(call_result)
 
 
 # ============================================================================

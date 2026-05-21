@@ -1027,6 +1027,8 @@ def triton_process_function(
 ) -> dict:
     """Process every instruction in a function symbolically.
 
+    Heavy: for large functions use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+
     Iterates the function linearly (not following branches), feeds each
     instruction to Triton in order. Returns a summary of symbolic expressions
     and path constraints collected.

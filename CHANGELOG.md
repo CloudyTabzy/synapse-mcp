@@ -299,7 +299,7 @@ These bugs prevented entire modules from loading. Because `__init__.py` wraps al
   - Task category auto-detection for richer `task_list` output
   - Consistent error shapes across all 4 task tools
 
-#### Enhanced Fork Cherry-Picks (xjoker/ida-pro-mcp-xjoker)
+#### Enhanced Fork Cherry-Picks 
 All practical features from the enhanced fork were already present in our codebase from prior integration work. Verified:
 - `compat.py` — enhanced IDA 8.3–9.0 compatibility layer (identical)
 - `trace.py` + `trace_dump.py` — tool-call trace persistence to IDB netnode

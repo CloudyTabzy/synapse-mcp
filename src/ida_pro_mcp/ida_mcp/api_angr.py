@@ -1073,6 +1073,8 @@ if ANGR_AVAILABLE:
 
         Read-only — does not modify IDA. CFG is cached in the project entry
         so downstream tools (backward_slice, value_set) can reuse it.
+
+        Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
         """
         return _cfg_fast_impl(
             project_id=project_id,
@@ -1353,6 +1355,8 @@ if ANGR_AVAILABLE:
             input_mode      = "stdin"
             input_size      = known serial length (e.g. 59 bytes)
             char_constraint = "printable" or "FRZ{,A-Z,0-9}" if the format is known
+
+        Heavy: for non-trivial targets use invoke_tool(..., async_mode=True) or task_submit + task_poll.
         """
         return _find_paths_impl(
             target_address=target_address,
@@ -1466,6 +1470,8 @@ if ANGR_AVAILABLE:
         Composes auto-detection (via IDB string xrefs), char-class inference,
         and angr_find_paths into a single workflow. The flagship tool for the
         Phase 5 stress-test failure mode (stdin-fed serial check).
+
+        Heavy: always use invoke_tool(..., async_mode=True) or task_submit + task_poll for this workflow.
         """
         try:
             try:
