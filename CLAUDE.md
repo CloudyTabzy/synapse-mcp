@@ -179,12 +179,18 @@ When running with `--lazy`, the server exposes exactly 4 tools instead of 160+:
 
 | Tool | Purpose |
 |---|---|
-| `list_modules` | List tool groups: `core`, `symbolic`, `graph`, `formats` |
-| `list_tools(module=...)` | List tools in a group with one-line descriptions |
-| `describe_tool(name)` | Get the full input schema for a specific tool |
-| `invoke_tool(tool, args)` | Call any tool by name; returns structured result |
+| `list_modules` | List tool groups with live counts. Description embeds the full group directory (top tool names per group) so agents can skip calling this and go straight to `invoke_tool` if they know the name. |
+| `list_tools(module=..., search=..., limit=50, offset=0)` | List tools with one-line descriptions. Use `search=` for keyword lookup across all groups — much cheaper than browsing. Use `module=` to see a full group. Both can be combined. |
+| `describe_tool(name)` | Get the full input schema for a specific tool. Response includes `module` field. |
+| `invoke_tool(tool, args)` | Call any tool by name. Put ALL tool arguments inside `args={...}`. Never place tool inputs beside `tool` at the top level — they are silently ignored. |
 
-The cache of IDA tool schemas is populated on first `list_tools` or `describe_tool` call. If IDA loads a new IDB at runtime, restart the server (or call `invoke_tool` on a non-existent tool to trigger a cache miss reset).
+**Optimized discovery paths (cheapest first):**
+1. Know the name → `invoke_tool` directly (0 discovery calls)
+2. Know a keyword → `list_tools(search='keyword')` → `invoke_tool` (1 call)
+3. Know the group → `list_tools(module='analysis')` → `invoke_tool` (1 call)
+4. Exploring → `list_modules` → `list_tools(module=...)` → `invoke_tool` (2 calls)
+
+**Cache behaviour:** Populated on first `list_tools`, `describe_tool`, or `invoke_tool` call. The `list_modules` description is built with live counts at startup. Call `invoke_tool(tool='__reset_cache__')` to force a refresh (e.g. after IDA loads a new IDB).
 
 ### MCP inspector
 ```bash

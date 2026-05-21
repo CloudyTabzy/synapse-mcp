@@ -327,6 +327,17 @@ def _get_lazy_module_cache() -> dict[str, list[dict]]:
     return modules
 
 
+# Representative tools shown per group in the embedded list_modules directory.
+# These are hardcoded so the description is useful even before IDA connects.
+_GROUP_REPRESENTATIVE_TOOLS: dict[str, list[str]] = {
+    "analysis": ["decompile", "disasm", "xrefs_to", "basic_blocks", "func_profile", "callgraph", "find_bytes"],
+    "core":     ["server_health", "list_funcs", "find_regex", "imports", "entity_query", "search_text"],
+    "formats":  ["lief_info", "yara_scan", "lief_checksec", "yara_generate_rule", "construct_parse"],
+    "modify":   ["rename", "set_comments", "patch_asm", "declare_type", "define_func", "analyze_range"],
+    "recon":    ["nx_central_functions", "workflow_reveng_overview", "apply_flirt_sig", "list_sections"],
+    "symbolic": ["triton_init", "miasm_lift", "angr_find_paths", "workflow_solve_crackme", "triton_taint"],
+}
+
 # Prefix-based module mapping for _tool_module().
 # Known core tools; used by _validate_groups() to avoid false-positive warnings.
 _CORE_TOOL_NAMES: frozenset[str] = frozenset({
@@ -495,6 +506,37 @@ def _validate_groups() -> None:
             )
 
 
+def _build_lazy_directory_description() -> str:
+    """Build the embedded group directory for list_modules' description.
+
+    Called at startup and on cache reset so agents see live counts in tools/list.
+    Falls back to static representative tools + '?' counts if IDA is unreachable.
+    """
+    modules = _get_lazy_module_cache()
+    all_groups = sorted(set(list(modules.keys()) + list(_GROUP_REPRESENTATIVE_TOOLS.keys())))
+    group_lines = []
+    for grp in all_groups:
+        count = len(modules.get(grp, []))
+        count_str = str(count) if count else "?"
+        top = _GROUP_REPRESENTATIVE_TOOLS.get(grp, [])
+        top_str = ", ".join(top) if top else "(see list_tools)"
+        group_lines.append(f"  {grp:<10} ({count_str:>3}) — {top_str}")
+
+    groups_block = "\n".join(group_lines)
+    return (
+        "[lazy-mode] List available tool groups with live counts.\n"
+        "\n"
+        "Groups — invoke_tool directly if you know the name:\n"
+        f"{groups_block}\n"
+        "\n"
+        "Shortcuts:\n"
+        "  invoke_tool(tool='NAME', args={...})   direct call, no prior discovery needed\n"
+        "  list_tools(search='keyword')           search names+descriptions by keyword\n"
+        "  list_tools(module='GROUP')             full tool list for one group\n"
+        "  list_tools(module='GROUP', limit=20)   paginate large groups (symbolic has 60+)"
+    )
+
+
 # ============================================================================
 # Local tools (handled by the proxy, not forwarded to IDA)
 # ============================================================================
@@ -548,18 +590,25 @@ def select_instance(
 
 @mcp.tool
 def list_modules() -> list[dict]:
-    """[lazy-mode] List available tool groups. Call list_tools(module=...) to see tools per group."""
+    """[lazy-mode] List available tool groups. Call list_tools(module=...) to see tools per group.
+    Use list_tools(search='keyword') to find a tool by keyword without browsing groups."""
     modules = _get_lazy_module_cache()
     return [{"module": m, "tool_count": len(v)} for m, v in sorted(modules.items())]
 
 
 @mcp.tool
 def list_tools(
-    module: Annotated[str | None, "Module group to filter by: 'core', 'analysis', 'modify', 'symbolic', 'formats', 'recon'. Omit for all tools."] = None,
-    limit: Annotated[int, "Maximum number of tools to return (default 50)."] = 50,
-    offset: Annotated[int, "Number of tools to skip for pagination (default 0)."] = 0,
+    module: Annotated[str | None, "Module group: 'core', 'analysis', 'modify', 'symbolic', 'formats', 'recon'. Omit for all."] = None,
+    search: Annotated[str | None, "Keyword to search tool names and descriptions (case-insensitive). Faster than browsing a full group — e.g. search='xref' or search='decompile'."] = None,
+    limit: Annotated[int, "Max results to return (default 50, use 0 for unlimited)."] = 50,
+    offset: Annotated[int, "Results to skip for pagination (default 0)."] = 0,
 ) -> dict:
-    """[lazy-mode] List available tools with one-line descriptions. Filter by module group or omit for all tools."""
+    """[lazy-mode] List tools with one-line descriptions.
+
+    Use search= to find tools by keyword across all groups — e.g. list_tools(search='decompile').
+    Use module= to browse all tools in one group — e.g. list_tools(module='analysis').
+    Combine both to narrow a group by keyword.
+    Results include module name so you can route follow-up calls correctly."""
     if module:
         tools = _get_lazy_module_cache().get(module, [])
     else:
@@ -571,6 +620,9 @@ def list_tools(
         result.append({"name": t["name"], "module": _tool_module(t["name"]), "description": short_desc})
     if not module:
         result.sort(key=lambda x: (x["module"], x["name"]))
+    if search:
+        kw = search.lower()
+        result = [t for t in result if kw in t["name"].lower() or kw in t["description"].lower()]
     total = len(result)
     paginated = result[offset:offset + limit] if limit > 0 else result[offset:]
     return {
@@ -601,16 +653,27 @@ def describe_tool(
 
 @mcp.tool
 def invoke_tool(
-    tool: Annotated[str, "Tool name to invoke (from list_tools)"],
-    args: Annotated[dict | None, "Tool arguments as a dict. Use describe_tool first to see required fields."] = None,
+    tool: Annotated[str, "Tool name to invoke (from list_tools or list_modules directory)"],
+    args: Annotated[dict | None, "Tool arguments as a flat dict. ALL tool inputs go here — never at the top level alongside 'tool'. CORRECT: invoke_tool(tool='decompile', args={'address': 'main'}). WRONG: invoke_tool(tool='decompile', address='main')."] = None,
 ) -> object:
-    """[lazy-mode] Invoke any IDA tool by name. Use list_tools() to discover tools, describe_tool() to get schemas."""
+    """[lazy-mode] Invoke any IDA tool by name.
+
+    Put all tool arguments inside args={...}. Do NOT place tool inputs beside 'tool' at the top level.
+      CORRECT:   invoke_tool(tool='decompile', args={'address': 'main'})
+      INCORRECT: invoke_tool(tool='decompile', address='main')  ← args silently empty, call fails
+
+    If you know the tool name from a prior session or the list_modules directory, call directly
+    without discovery. Use describe_tool(name=...) to see required fields first if unsure."""
     global _lazy_tools_cache, _lazy_module_cache
     if tool == "__reset_cache__":
         with _lazy_tools_cache_lock:
             _lazy_tools_cache = None
             _lazy_module_cache = None
-        return {"ok": True, "message": "Tool cache cleared."}
+        try:
+            list_modules.__doc__ = _build_lazy_directory_description()
+        except Exception:
+            pass
+        return {"ok": True, "message": "Tool cache cleared and directory refreshed."}
     host, port = _get_active_ida_target()
     for attempt in range(2):
         resp = _proxy_to_instance(host, port, {
@@ -842,6 +905,8 @@ def main():
     if LAZY_MODE:
         try:
             _validate_groups()
+            list_modules.__doc__ = _build_lazy_directory_description()
+            print("[MCP] Lazy directory embedded in list_modules description.", file=sys.stderr)
         except Exception:
             pass
 
