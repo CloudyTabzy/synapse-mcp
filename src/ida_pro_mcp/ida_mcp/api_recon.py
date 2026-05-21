@@ -577,6 +577,190 @@ def find_vtable_candidates(
         return _annotate({**tool_error(e, f"vtable scan in {section!r}"), "section": section})
 
 
+@tool
+@idasync
+def dump_vtable(
+    address: Annotated[
+        str | None,
+        "Direct vtable address (hex or named symbol like '??_7FooClass@@6B@'). "
+        "If given, reads the vtable directly from this address.",
+    ] = None,
+    class_name: Annotated[
+        str | None,
+        "Class name or partial symbol to search (e.g. 'FNullRenderInterface', '??_7Foo', '_ZTVFoo'). "
+        "Searches IDB names for matching vtable symbols. Ignored when address= is set.",
+    ] = None,
+    max_entries: Annotated[int, "Max vtable entries to read (default: 128)"] = 128,
+    include_decompile: Annotated[
+        bool,
+        "Include first 5 pseudocode lines per method. Token-expensive — "
+        "use only on small vtables or specific entries of interest.",
+    ] = False,
+) -> dict:
+    """Read a virtual function table and list all method pointers with names.
+
+    Two input modes (one is required):
+    - address=: read the vtable at a specific address directly
+    - class_name=: search IDB names for vtable symbols matching the pattern
+
+    For MSVC binaries: looks for ??_7<class>@@6B@ mangled names.
+    For GCC/Clang binaries: looks for _ZTV<class> patterns.
+    Unmangled or user-assigned vtable names are also matched.
+
+    Each entry:
+      {"index": N, "slot_ea": "0x...", "func_ea": "0x...", "func_name": "...", "decompile": "..."}
+
+    On error (bad address, no match, can't read pointer): {"ok": False, "error": "..."}
+    """
+    try:
+        # Resolve the vtable start address
+        vtable_ea: int | None = None
+        vtable_name: str = ""
+        search_hits: list[dict] = []
+
+        if address is not None:
+            vtable_ea = parse_address(address)
+            vtable_name = idc.get_name(vtable_ea, idc.GN_VISIBLE) or hex(vtable_ea)
+        elif class_name:
+            # Walk all names in the IDB looking for vtable symbols matching the pattern
+            pattern_lc = class_name.lower()
+            for name_ea, name in idautils.Names():
+                nl = name.lower()
+                # Match MSVC mangled, GCC mangled, or plain name
+                is_vtable_sym = any(m in nl for m in ("vtable", "vftable", "??_7", "_ztv"))
+                if is_vtable_sym and pattern_lc in nl:
+                    # Also try demangled
+                    try:
+                        demangled = idc.demangle_name(name, idc.INF_SHORT_DN) or ""
+                    except Exception:
+                        demangled = ""
+                    search_hits.append({
+                        "ea": hex(name_ea),
+                        "name": name,
+                        "demangled": demangled,
+                    })
+
+            if not search_hits:
+                return _annotate({
+                    "ok": False,
+                    "class_name": class_name,
+                    "error": (
+                        f"No vtable symbols found matching '{class_name}'. "
+                        "Try a shorter pattern, check the mangled name via find_regex, "
+                        "or pass address= directly if you know the vtable EA."
+                    ),
+                })
+
+            if len(search_hits) > 1:
+                # Return the list and let the agent pick — don't silently pick one
+                return _annotate({
+                    "ok": False,
+                    "class_name": class_name,
+                    "error": (
+                        f"Found {len(search_hits)} matching vtable symbols. "
+                        "Use address= to specify which one, or narrow class_name."
+                    ),
+                    "candidates": search_hits[:20],
+                })
+
+            vtable_ea = int(search_hits[0]["ea"], 16)
+            vtable_name = search_hits[0]["name"]
+        else:
+            return _annotate({
+                "ok": False,
+                "error": "Provide either address= (direct EA) or class_name= (symbol search).",
+            })
+
+        # Determine pointer width from IDB bitness
+        ptr_size = 8 if compat.inf_is_64bit() else 4
+        get_ptr = ida_bytes.get_qword if ptr_size == 8 else ida_bytes.get_dword
+
+        # Read entries
+        entries: list[dict] = []
+        ea = vtable_ea
+        decompile_cache: dict[int, str] = {}
+
+        for idx in range(max_entries):
+            slot_ea = ea + idx * ptr_size
+            if not idaapi.is_loaded(slot_ea):
+                break
+
+            func_ea_raw = get_ptr(slot_ea)
+            if func_ea_raw == 0 or func_ea_raw == idaapi.BADADDR:
+                break
+
+            # Verify it's a plausible code pointer
+            if not _is_code_address(func_ea_raw):
+                # Could be a RTTI pointer before the vtable; skip only for slot 0
+                if idx == 0:
+                    # Some MSVC vtables are preceded by RTTI — try the next slot
+                    continue
+                break
+
+            func_name = (idc.get_name(func_ea_raw, idc.GN_VISIBLE)
+                         or ida_funcs.get_func_name(func_ea_raw)
+                         or hex(func_ea_raw))
+
+            entry: dict = {
+                "index": idx,
+                "slot_ea": hex(slot_ea),
+                "func_ea": hex(func_ea_raw),
+                "func_name": func_name,
+            }
+
+            if include_decompile:
+                if func_ea_raw not in decompile_cache:
+                    try:
+                        import ida_hexrays as _hr
+                        if _hr.init_hexrays_plugin():
+                            cfunc = _hr.decompile(func_ea_raw)
+                            if cfunc:
+                                sv = cfunc.get_pseudocode()
+                                lines = []
+                                import ida_kernwin as _kw
+                                for i, sl in enumerate(sv):
+                                    if i >= 5:
+                                        break
+                                    import ida_lines as _il
+                                    lines.append(_il.tag_remove(sl.line))
+                                decompile_cache[func_ea_raw] = "\n".join(lines)
+                            else:
+                                decompile_cache[func_ea_raw] = ""
+                        else:
+                            decompile_cache[func_ea_raw] = ""
+                    except Exception as exc:
+                        decompile_cache[func_ea_raw] = f"// decompile failed: {exc}"
+                snippet = decompile_cache[func_ea_raw]
+                if snippet:
+                    entry["decompile"] = snippet
+
+            entries.append(entry)
+
+        if not entries:
+            return _annotate({
+                "ok": False,
+                "vtable_ea": hex(vtable_ea),
+                "vtable_name": vtable_name,
+                "error": (
+                    "No valid function pointers found at this address. "
+                    "Verify the address points to the start of a vtable "
+                    f"(ptr_size={ptr_size}, first word={hex(get_ptr(vtable_ea))})."
+                ),
+            })
+
+        return _annotate({
+            "ok": True,
+            "vtable_ea": hex(vtable_ea),
+            "vtable_name": vtable_name,
+            "ptr_size": ptr_size,
+            "count": len(entries),
+            "entries": entries,
+        })
+
+    except Exception as e:
+        return _annotate(tool_error(e, "dump_vtable"))
+
+
 def _scan_undefined_code(start_ea: int, end_ea: int, max_hits: int = 5) -> list[UndefinedCodeCandidate]:
     """Scan [start_ea, end_ea) for contiguous code-flagged bytes not in any function.
 

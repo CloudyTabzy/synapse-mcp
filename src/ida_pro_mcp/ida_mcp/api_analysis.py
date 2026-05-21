@@ -868,6 +868,120 @@ def decompile(
 
 @tool
 @idasync
+@tool_timeout(120.0)
+def decompile_batch(
+    addresses: Annotated[
+        list[str] | str,
+        "Function addresses or names — list or comma-separated string. "
+        "e.g. ['main', '0x401000', 'sub_401234'] or 'main,0x401000'",
+    ],
+    max_lines_each: Annotated[
+        int,
+        "Pseudocode lines per function (default: 0 = unlimited). "
+        "Set to 10-20 for a compact scanning pass; 0 for full output.",
+    ] = 0,
+    include_addresses: Annotated[
+        bool,
+        "Include /*0xNNNN*/ per-line address markers (default: False to save tokens).",
+    ] = False,
+    skip_errors: Annotated[
+        bool,
+        "Continue past failures — failed entries get error= instead of code= "
+        "(default: True). Set False to abort on the first decompilation failure.",
+    ] = True,
+) -> dict:
+    """Decompile multiple functions in one call — one round-trip, compact results.
+
+    More token-efficient than calling decompile() N times. Returns results in
+    input order, each with {"addr", "name", "code", "truncated", "error"}.
+
+    Useful for scanning patterns across many functions: pass max_lines_each=10
+    to get signatures + opening logic for 20+ functions without flooding context.
+
+    Heavy: for large batches use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+    """
+    try:
+        import ida_hexrays as _hr
+        addrs = normalize_list_input(addresses)
+        if not addrs:
+            return {"ok": False, "error": "No addresses provided"}
+
+        if not _hr.init_hexrays_plugin():
+            return {"ok": False, "error": "Hex-Rays decompiler is not available"}
+
+        results: list[dict] = []
+        succeeded = 0
+        failed = 0
+
+        for raw_addr in addrs:
+            raw_addr = raw_addr.strip()
+            if not raw_addr:
+                continue
+            try:
+                ea = parse_address(raw_addr)
+                func_name = ida_funcs.get_func_name(ea) or hex(ea)
+                code = decompile_function_safe(
+                    ea,
+                    include_addresses=include_addresses,
+                    max_lines=max_lines_each,
+                )
+                if code is None:
+                    # Try to get a structured error from Hex-Rays
+                    decompile_error = "Decompilation failed"
+                    try:
+                        hf = _hr.hexrays_failure_t()
+                        _hr.decompile(ea, hf)
+                    except _hr.DecompilationFailure:
+                        desc = hf.desc()
+                        if desc:
+                            decompile_error = desc
+                    except Exception:
+                        pass
+                    entry: dict = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "code": None,
+                        "error": decompile_error,
+                    }
+                    failed += 1
+                    if not skip_errors:
+                        results.append(entry)
+                        break
+                else:
+                    entry = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "code": code,
+                    }
+                    if max_lines_each > 0 and "// ... (" in code and " more line" in code:
+                        entry["truncated"] = True
+                    succeeded += 1
+                results.append(entry)
+            except Exception as exc:
+                entry = {
+                    "addr": raw_addr,
+                    "name": raw_addr,
+                    "code": None,
+                    **item_error(exc, f"decompile_batch entry {raw_addr!r}"),
+                }
+                failed += 1
+                results.append(entry)
+                if not skip_errors:
+                    break
+
+        return {
+            "ok": True,
+            "results": results,
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+        }
+    except Exception as e:
+        return {"ok": False, **tool_error(e, "decompile_batch")}
+
+
+@tool
+@idasync
 @tool_timeout(90.0)
 def disasm(
     addr: Annotated[str, "Function address or name to disassemble"],

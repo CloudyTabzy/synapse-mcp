@@ -15,16 +15,16 @@ Main pieces:
 
 Core API modules (upstream + enhanced):
 - `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries
-- `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling
+- `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling; `decompile_batch` for scanning many functions in one call
 - `api_memory.py`: bytes/ints/strings read and patch, typed integer I/O
-- `api_types.py`: structs, type inference, type application, enum management, constructor analysis (`analyze_constructor` — extracts field layout from `*(this+N)=value` patterns in constructors)
+- `api_types.py`: structs, type inference, type application, enum management, constructor analysis (`analyze_constructor` — extracts field layout from `*(this+N)=value` patterns, detects vtable pointer writes, memset/memcpy zero-regions, and delegating constructor calls)
 - `api_modify.py`: comments, renaming, asm patching, function definition, forced range analysis (`analyze_range`), bulk function creation (`scan_and_define_funcs`), user xref creation (`add_xref`)
 - `api_stack.py`: stack frame operations
 - `api_sigmaker.py`: signature creation, scanning, xref-based signature generation
 - `api_debug.py`: debugger control, breakpoints, `sync_debugger_to_idb` (live memory → IDB patch + analysis), unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://`, `triton://`, `miasm://` MCP resources
-- `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection
+- `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates (`find_vtable_candidates` auto-detects bitness), `dump_vtable` (read a full vtable by address or class name pattern), indirect calls with diagnostic output, cleanup/method resolution, function prologue detection
 - `api_flirt.py`: FLIRT signature management tools — apply signatures, load type libraries, and suggest names for unidentified functions via structural similarity scoring (prologue match, callee Jaccard, string xref overlap)
 - `api_survey.py`: one-call binary triage (metadata, segments, imports, strings, statistics)
 - `api_composite.py`: multi-step composite operations and cross-engine workflows

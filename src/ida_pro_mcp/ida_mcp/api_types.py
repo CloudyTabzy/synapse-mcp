@@ -2180,12 +2180,41 @@ def _infer_ctor_field_type(access_size: int, rhs_val: int | None) -> tuple[str, 
     return (_guess_field_type(access_size), False, "?")
 
 
+_VTABLE_NAME_MARKERS = ("vtable", "vftable", "??_7", "_ztv")
+_MEMSET_NAMES = ("memset", "_memset", "ntdll_memset", "__memset")
+_MEMCPY_NAMES = ("memcpy", "_memcpy", "memmove", "_memmove")
+
+
+def _vtable_name_at(ea: int | None) -> str | None:
+    """Return the vtable symbol name at ``ea``, or None if it's not a vtable."""
+    if ea is None or ea < 0x1000:
+        return None
+    name = ida_name.get_ea_name(ea) or ""
+    nl = name.lower()
+    if any(m in nl for m in _VTABLE_NAME_MARKERS):
+        return name
+    # Also try the demangled form
+    try:
+        demangled = ida_name.demangle_name(name, ida_name.MNG_LONG_FORM) or ""
+        if "vftable" in demangled.lower() or "vtable" in demangled.lower():
+            return demangled or name
+    except Exception:
+        pass
+    return None
+
+
 class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
     """Walk a constructor's ctree and collect (this + N) field writes.
 
     Identifies the this-pointer as:
     1. A lvar named "this", "v0", or "a1" (first arg convention)
     2. Falling back to the first pointer-typed lvar if none of the above match
+
+    Also detects:
+    - Vtable pointer writes (RHS is a vtable symbol address)
+    - Delegating constructor calls (callee receives this as first arg)
+    - memset(this+N, 0, size) zero-init regions
+    - memcpy(this+N, src, size) copy regions
     """
 
     def __init__(self, cfunc: ida_hexrays.cfunc_t):
@@ -2196,6 +2225,8 @@ class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
         # alias set: lvar indices that hold a copy of this
         self._this_vars: set[int] = set()
         self.writes: list[dict] = []
+        self.delegating_calls: list[dict] = []
+        self.zero_regions: list[dict] = []
         self._seen: set[tuple[str, int]] = set()
         self._identify_this()
 
@@ -2272,9 +2303,101 @@ class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
                         if self._is_this(base):
                             self._record_ptr_write(lhs, offset, size, rhs)
 
+            elif expr.op == ida_hexrays.cot_call:
+                self._check_call(expr)
+
         except Exception as e:
             logger.debug("_ConstructorVisitor.visit_expr failed: %s", e)
         return 0
+
+    def _this_offset_of(self, expr) -> int | None:
+        """Return the byte offset if expr is `this` (→ 0) or `this+N` (→ N), else None."""
+        uw = _unwrap_casts(expr)
+        if uw is None:
+            return None
+        if self._is_this(uw):
+            return 0
+        if uw.op == ida_hexrays.cot_add:
+            base = _unwrap_casts(uw.x)
+            addend = _const_value(uw.y)
+            if addend is not None and base is not None and self._is_this(base):
+                return int(addend)
+            base = _unwrap_casts(uw.y)
+            addend = _const_value(uw.x)
+            if addend is not None and base is not None and self._is_this(base):
+                return int(addend)
+        return None
+
+    def _check_call(self, call_expr):
+        """Detect memset/memcpy and delegating constructor calls involving this."""
+        args = list(call_expr.a)
+        if not args:
+            return
+
+        # Resolve callee name and address
+        callee = call_expr.x
+        callee_ea: int | None = None
+        callee_name = "?"
+        try:
+            if callee.op == ida_hexrays.cot_obj:
+                callee_ea = int(callee.obj_ea)
+                callee_name = (ida_funcs.get_func_name(callee_ea)
+                               or ida_name.get_ea_name(callee_ea)
+                               or hex(callee_ea))
+        except Exception:
+            pass
+
+        name_lc = callee_name.lower()
+
+        # memset(this+N, fill, size) → zero-init region
+        if any(m in name_lc for m in _MEMSET_NAMES) and len(args) >= 3:
+            off = self._this_offset_of(args[0])
+            if off is not None and off >= 0:
+                fill_val = _const_value(_unwrap_casts(args[1]))
+                size_val = _const_value(_unwrap_casts(args[2]))
+                if fill_val == 0 and size_val is not None and size_val > 0:
+                    self.zero_regions.append({
+                        "offset": off,
+                        "size": int(size_val),
+                        "source": callee_name,
+                    })
+                return
+
+        # memcpy/memmove(this+N, src, size) → copy region
+        if any(m in name_lc for m in _MEMCPY_NAMES) and len(args) >= 3:
+            off = self._this_offset_of(args[0])
+            if off is not None and off >= 0:
+                size_val = _const_value(_unwrap_casts(args[2]))
+                rhs_text = self._rhs_repr(args[1])
+                self.zero_regions.append({
+                    "offset": off,
+                    "size": int(size_val) if size_val else -1,
+                    "source": f"{callee_name}(src={rhs_text})",
+                })
+                return
+
+        # Delegating constructor: callee receives `this` as first arg
+        off = self._this_offset_of(args[0])
+        if off == 0:
+            # this is passed directly (not this+N) — genuine ctor delegation
+            self.delegating_calls.append({
+                "callee_ea": hex(callee_ea) if callee_ea is not None else "?",
+                "callee_name": callee_name,
+                "arg_count": len(args),
+                "hint": "Analyze this callee with analyze_constructor to recover its field writes.",
+            })
+
+    def _resolve_rhs_addr(self, rhs) -> int | None:
+        """Extract an absolute address from a RHS expression (cot_obj, cot_ref, or cot_num)."""
+        uw = _unwrap_casts(rhs)
+        if uw is None:
+            return None
+        if uw.op == ida_hexrays.cot_obj:
+            try:
+                return int(uw.obj_ea)
+            except Exception:
+                return None
+        return self._rhs_constant(rhs)
 
     def _record_memptr_write(self, lhs, rhs):
         try:
@@ -2285,17 +2408,31 @@ class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
             if key in self._seen:
                 return
             self._seen.add(key)
-            rhs_val = self._rhs_constant(rhs)
-            inferred, zero_init, val_repr = _infer_ctor_field_type(size, rhs_val)
-            self.writes.append({
-                "offset": offset,
-                "access_size": size,
-                "inferred_type": inferred,
-                "zero_init": zero_init,
-                "assigned_value": self._rhs_repr(rhs) if rhs_val is None else val_repr,
-                "ea": ea_hex,
-                "disasm": _get_expr_text(lhs, self.cfunc),
-            })
+            rhs_addr = self._resolve_rhs_addr(rhs)
+            vtbl_name = _vtable_name_at(rhs_addr)
+            if vtbl_name:
+                self.writes.append({
+                    "offset": offset,
+                    "access_size": size,
+                    "inferred_type": "vtable_ptr",
+                    "zero_init": False,
+                    "assigned_value": vtbl_name,
+                    "vtable_ea": hex(rhs_addr),
+                    "ea": ea_hex,
+                    "disasm": _get_expr_text(lhs, self.cfunc),
+                })
+            else:
+                rhs_val = self._rhs_constant(rhs)
+                inferred, zero_init, val_repr = _infer_ctor_field_type(size, rhs_val)
+                self.writes.append({
+                    "offset": offset,
+                    "access_size": size,
+                    "inferred_type": inferred,
+                    "zero_init": zero_init,
+                    "assigned_value": self._rhs_repr(rhs) if rhs_val is None else val_repr,
+                    "ea": ea_hex,
+                    "disasm": _get_expr_text(lhs, self.cfunc),
+                })
         except Exception as e:
             logger.debug("_record_memptr_write failed: %s", e)
 
@@ -2308,17 +2445,31 @@ class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
             if key in self._seen:
                 return
             self._seen.add(key)
-            rhs_val = self._rhs_constant(rhs)
-            inferred, zero_init, val_repr = _infer_ctor_field_type(size, rhs_val)
-            self.writes.append({
-                "offset": offset,
-                "access_size": size,
-                "inferred_type": inferred,
-                "zero_init": zero_init,
-                "assigned_value": self._rhs_repr(rhs) if rhs_val is None else val_repr,
-                "ea": ea_hex,
-                "disasm": f"*(this+0x{offset:X})",
-            })
+            rhs_addr = self._resolve_rhs_addr(rhs)
+            vtbl_name = _vtable_name_at(rhs_addr)
+            if vtbl_name:
+                self.writes.append({
+                    "offset": offset,
+                    "access_size": size,
+                    "inferred_type": "vtable_ptr",
+                    "zero_init": False,
+                    "assigned_value": vtbl_name,
+                    "vtable_ea": hex(rhs_addr),
+                    "ea": ea_hex,
+                    "disasm": f"*(this+0x{offset:X}) = &{vtbl_name}",
+                })
+            else:
+                rhs_val = self._rhs_constant(rhs)
+                inferred, zero_init, val_repr = _infer_ctor_field_type(size, rhs_val)
+                self.writes.append({
+                    "offset": offset,
+                    "access_size": size,
+                    "inferred_type": inferred,
+                    "zero_init": zero_init,
+                    "assigned_value": self._rhs_repr(rhs) if rhs_val is None else val_repr,
+                    "ea": ea_hex,
+                    "disasm": f"*(this+0x{offset:X})",
+                })
         except Exception as e:
             logger.debug("_record_ptr_write failed: %s", e)
 
@@ -2421,6 +2572,7 @@ def analyze_constructor(
                         logger.warning("apply_type failed in analyze_constructor: %s", ex)
 
         unique_offsets = len({w["offset"] for w in writes})
+        vtable_writes = [w for w in writes if w.get("inferred_type") == "vtable_ptr"]
 
         result: dict = {
             "ok": True,
@@ -2431,15 +2583,24 @@ def analyze_constructor(
             "field_assignments": writes,
             "estimated_size": estimated_size,
             "unique_offsets": unique_offsets,
+            "vtable_writes": vtable_writes,
+            "delegating_calls": visitor.delegating_calls,
+            "zero_regions": visitor.zero_regions,
             "suggested_struct_name": suggested_struct_name,
             "suggested_struct_definition": suggested_struct_definition,
             "applied": applied,
         }
-        if not writes:
+        if not writes and not visitor.delegating_calls and not visitor.zero_regions:
             result["hint"] = (
                 "No this-pointer field writes detected. This may be a delegating "
                 "constructor that calls another ctor, or the function may not be "
                 "a constructor. Try analyze_constructor on any chained callees."
+            )
+        elif not writes and visitor.delegating_calls:
+            result["hint"] = (
+                f"No direct field writes found, but {len(visitor.delegating_calls)} "
+                "delegating call(s) detected. Run analyze_constructor on each callee "
+                "to recover the full struct layout."
             )
         return result
 
