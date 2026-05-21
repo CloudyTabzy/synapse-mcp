@@ -1,8 +1,8 @@
 # Synapse MCP
 
-> **One MCP server. Nine analysis engines. 290+ tools. Zero configuration overhead.**
+> **One MCP server. Nine analysis engines. 250+ tools. Zero configuration overhead.**
 
-A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: nine distinct engines and nearly three hundred tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
+A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: nine distinct engines and over two hundred and fifty tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
 
 Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all nine engines at once.
 
@@ -27,7 +27,7 @@ This is not a monolithic "powerhouse" that blasts every capability into memory r
 
 ## 🦥 Lazy Mode — 95% Less Context, Same Power
 
-AI agents have a dirty secret: every MCP session starts by loading **all 290+ tool schemas** into context. That's 24,000–48,000 tokens burned before a single analysis step. For agents with 64K or 128K context windows, this leaves almost no room for the actual work — decompilation, symbolic execution, cross-references.
+AI agents have a dirty secret: every MCP session starts by loading **all 250+ tool schemas** into context. That's 24,000–48,000 tokens burned before a single analysis step. For agents with 64K or 128K context windows, this leaves almost no room for the actual work — decompilation, symbolic execution, cross-references.
 
 **Lazy mode fixes this.** Start the server with `--lazy` and `tools/list` returns only **4 meta-tools**:
 
@@ -727,7 +727,7 @@ uv run ida-pro-mcp --lazy
 uv run idalib-mcp --stdio --lazy path/to/binary
 ```
 
-In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 290+ tools:
+In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 250+ tools:
 
 | Meta-Tool | Purpose |
 |-----------|---------|
