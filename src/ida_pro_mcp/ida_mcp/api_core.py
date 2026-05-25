@@ -126,6 +126,23 @@ class IdbSaveResult(TypedDict):
     hint: NotRequired[str]
 
 
+class DemangleEntry(TypedDict, total=False):
+    raw: str
+    demangled: str | None
+    demangled_short: str | None
+    mangling_type: str   # "msvc" | "itanium" | "plain"
+    success: bool
+
+
+class DemangleResult(TypedDict, total=False):
+    ok: bool
+    results: list[DemangleEntry]
+    success_count: int
+    fail_count: int
+    error: str
+    error_type: str
+
+
 class FindRegexResult(TypedDict, total=False):
     n: int
     total: int            # total candidates before pagination
@@ -618,6 +635,111 @@ def int_convert(
         )
 
     return results
+
+
+@tool
+@idasync
+def demangle_names(
+    names: Annotated[
+        list[str] | str,
+        "One or more mangled C++ symbol names to demangle. "
+        "Accepts MSVC ?-mangled names (e.g. '??0FString@@QAE@XZ') and "
+        "Itanium/GCC _Z-mangled names (e.g. '_ZN3FooC1Ev'). "
+        "Plain names are passed through as-is with success=false.",
+    ],
+) -> DemangleResult:
+    """Batch-demangle C++ symbol names using IDA Pro's built-in demangler.
+
+    Returns both a long form (full type signature with return type and calling
+    convention) and a short form (ClassName::method only) for each name.
+    IDA's demangler handles MSVC ?-mangled names (Engine.dll, Core.dll, etc.)
+    and Itanium _Z-mangled names (Linux shared libraries).
+
+    Use this tool when you have a list of mangled names from any source
+    (vtable dumps, export tables, YARA matches, memory scans) and need
+    human-readable class::method names for analysis or documentation.
+
+    Profile: analysis
+    """
+    try:
+        name_list = normalize_list_input(names)
+        entries: list[DemangleEntry] = []
+        success_count = 0
+        fail_count = 0
+
+        for raw in name_list:
+            if not raw or not isinstance(raw, str):
+                entries.append({"raw": str(raw), "demangled": None, "demangled_short": None,
+                                 "mangling_type": "plain", "success": False})
+                fail_count += 1
+                continue
+
+            # Detect mangling convention from name prefix
+            if raw.startswith("?"):
+                mangling_type = "msvc"
+            elif raw.startswith("_Z") or raw.startswith("__Z"):
+                mangling_type = "itanium"
+            else:
+                mangling_type = "plain"
+
+            # Long form: full signature with return type and calling convention
+            long_form: str | None = None
+            try:
+                r = ida_name.demangle_name(raw, ida_name.MNG_LONG_FORM)
+                if r and r != raw:
+                    long_form = r
+            except Exception:
+                pass
+
+            # Short form: class::method without return type or calling convention.
+            # MNG_NODEFINIT (0x8) + MNG_NORETTYPE (0x80) suppress those parts.
+            # MNG_NORETTYPE may not be present on all IDA versions; fall back to 0x80.
+            _MNG_NORETTYPE = getattr(ida_name, "MNG_NORETTYPE", 0x80)
+            short_form: str | None = None
+            try:
+                r = ida_name.demangle_name(raw, ida_name.MNG_NODEFINIT | _MNG_NORETTYPE)
+                if r and r != raw:
+                    short_form = r
+            except Exception:
+                pass
+
+            # If IDA couldn't produce a distinct short form, derive it from the
+            # long form by stripping access specifier + return type prefix
+            # (everything before the last token that contains "::").
+            if long_form and not short_form:
+                # e.g. "public: void __thiscall Foo::Bar(int)" → "Foo::Bar(int)"
+                paren = long_form.find("(")
+                prefix = long_form[:paren] if paren != -1 else long_form
+                tokens = prefix.split()
+                for i, tok in enumerate(tokens):
+                    if "::" in tok:
+                        short_form = " ".join(tokens[i:])
+                        if paren != -1:
+                            short_form += long_form[paren:]
+                        break
+
+            success = long_form is not None or short_form is not None
+            if success:
+                success_count += 1
+            else:
+                fail_count += 1
+
+            entries.append({
+                "raw": raw,
+                "demangled": long_form,
+                "demangled_short": short_form,
+                "mangling_type": mangling_type,
+                "success": success,
+            })
+
+        return {
+            "ok": True,
+            "results": entries,
+            "success_count": success_count,
+            "fail_count": fail_count,
+        }
+    except Exception as e:
+        return {**tool_error(e), "ok": False}
 
 
 @tool
