@@ -10,6 +10,7 @@ Extended features (DWARF/PDB): LIEF Extended commercial license.
 from __future__ import annotations
 
 import collections
+import fnmatch
 import hashlib
 import math
 import os
@@ -230,6 +231,27 @@ def _try_demangle(name: str) -> str | None:
     return None
 
 
+def _match_pattern(raw: str | None, pattern: str) -> bool:
+    """Return True if raw name (or its demangled form) matches pattern.
+
+    Pattern rules (case-insensitive):
+    - Contains no wildcards → treated as substring (*pattern*)
+    - Contains * or ?       → standard glob (fnmatch)
+    """
+    if not raw:
+        return False
+    p = pattern.lower()
+    if "*" not in p and "?" not in p:
+        p = f"*{p}*"
+    raw_l = raw.lower()
+    if fnmatch.fnmatch(raw_l, p):
+        return True
+    dem = _try_demangle(raw)
+    if dem:
+        return fnmatch.fnmatch(dem.lower(), p)
+    return False
+
+
 # Rich Header product ID table (subset of public database)
 # Format: {product_id: (component_name, vs_version_hint)}
 _RICH_PRODUCT_NAMES: dict[int, tuple[str, str]] = {
@@ -382,7 +404,10 @@ class LiefImportsResult(TypedDict, total=False):
     format: str
     libraries: list[LiefImportLib]
     total_imports: int
+    matched_imports: int
     delay_import_count: int
+    filter_pattern: str
+    library_filter: str
     error: str
     error_type: str
     hint: str
@@ -404,6 +429,24 @@ class LiefExportsResult(TypedDict, total=False):
     base_ordinal: int
     exports: list[LiefExportEntry]
     total_exports: int
+    matched_exports: int
+    filter_pattern: str
+    error: str
+    error_type: str
+    hint: str
+
+
+class LiefIatResolveResult(TypedDict, total=False):
+    ok: bool
+    dll_name: str
+    func_name: str
+    demangled_name: str | None
+    ordinal: int | None
+    is_ordinal: bool
+    is_delay_import: bool
+    iat_va: str        # VA using PE's own imagebase
+    iat_va_idb: str    # VA rebased to IDA's loaded imagebase
+    idb_name: str | None  # IDA symbol at that address (e.g. "__imp_CreateFileW")
     error: str
     error_type: str
     hint: str
@@ -1045,10 +1088,23 @@ if LIEF_AVAILABLE:
     def lief_imports(
         file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
         include_delay: Annotated[bool, "Include delay-load imports for PE (default: true)"] = True,
+        pattern: Annotated[
+            str,
+            "Glob/substring filter on function name or demangled name (case-insensitive). "
+            "Plain text matches as substring; wildcards (* ?) use glob rules. "
+            "Examples: 'CreateFile', '*RenderDevice*', '?_7Foo*'. Empty = return all.",
+        ] = "",
+        library_filter: Annotated[
+            str,
+            "Filter to a specific DLL by name (case-insensitive substring). "
+            "Examples: 'kernel32', 'Core.dll'. Empty = all libraries.",
+        ] = "",
     ) -> LiefImportsResult:
-        """List all imported libraries and functions. PE: regular + delay imports,
-        with IAT addresses and optional C++ demangling. ELF: NEEDED libraries and
-        undefined dynamic symbols grouped by library."""
+        """List imported libraries and functions with IAT addresses and C++ demangling.
+        PE: regular + delay imports. ELF: NEEDED libraries + undefined dynamic symbols.
+        Use pattern= to search by function name (glob/substring, matches raw or demangled).
+        Use library_filter= to narrow to one DLL. Returns matched_imports vs total_imports
+        so agents know how many entries were filtered out."""
         try:
             path = _resolve_lief_path(file_path)
             binary = _lief.parse(path)
@@ -1118,10 +1174,32 @@ if LIEF_AVAILABLE:
                 elif undef_syms:
                     libs.append({"name": "(dynamic)", "is_delay_import": False, "functions": undef_syms})
 
-            return {
+            # Apply filters
+            lib_f = library_filter.lower()
+            if lib_f:
+                libs = [lib for lib in libs if lib_f in lib["name"].lower()]
+            matched = 0
+            if pattern:
+                filtered_libs: list[LiefImportLib] = []
+                for lib in libs:
+                    fns = [fn for fn in lib["functions"] if _match_pattern(fn.get("name"), pattern)]
+                    matched += len(fns)
+                    if fns:
+                        filtered_libs.append({**lib, "functions": fns})
+                libs = filtered_libs
+            else:
+                matched = sum(len(lib["functions"]) for lib in libs)
+
+            result: LiefImportsResult = {
                 "ok": True, "format": fmt, "libraries": libs,
-                "total_imports": total, "delay_import_count": delay_count,
+                "total_imports": total, "matched_imports": matched,
+                "delay_import_count": delay_count,
             }
+            if pattern:
+                result["filter_pattern"] = pattern
+            if library_filter:
+                result["library_filter"] = library_filter
+            return result
         except Exception as e:
             return {**tool_error(e), "ok": False}
 
@@ -1133,10 +1211,17 @@ if LIEF_AVAILABLE:
     @idasync
     def lief_exports(
         file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
+        pattern: Annotated[
+            str,
+            "Glob/substring filter on export name or demangled name (case-insensitive). "
+            "Plain text matches as substring; wildcards (* ?) use glob rules. "
+            "Examples: 'RenderDevice', '??_7URender*', '_ZN3Foo*'. Empty = return all.",
+        ] = "",
     ) -> LiefExportsResult:
-        """List all exported symbols with ordinals, addresses, and forwarding
-        information. PE: uses the export directory. ELF: uses dynamic symbols
-        with defined binding."""
+        """List exported symbols with ordinals, addresses, and forwarding information.
+        PE: uses the export directory. ELF: uses dynamic symbols with defined binding.
+        Use pattern= to filter by name (glob/substring, matches raw or demangled name).
+        Returns matched_exports vs total_exports so agents know how many were filtered."""
         try:
             path = _resolve_lief_path(file_path)
             binary = _lief.parse(path)
@@ -1172,12 +1257,20 @@ if LIEF_AVAILABLE:
                         "forwarded_to": fwd_name,
                         "demangled_name": _try_demangle(name) if name else None,
                     })
-                return {
+                total_pe = len(entries)
+                if pattern:
+                    entries = [e for e in entries if _match_pattern(e.get("name"), pattern)]
+                r: LiefExportsResult = {
                     "ok": True, "format": "PE",
                     "dll_name": exp.name if exp.name else None,
                     "base_ordinal": getattr(exp, "base", 0) or 0,
-                    "exports": entries, "total_exports": len(entries),
+                    "exports": entries,
+                    "total_exports": total_pe,
+                    "matched_exports": len(entries),
                 }
+                if pattern:
+                    r["filter_pattern"] = pattern
+                return r
 
             elif isinstance(binary, _lief.ELF.Binary):
                 elf = binary
@@ -1193,13 +1286,131 @@ if LIEF_AVAILABLE:
                             "forwarded_to": None,
                             "demangled_name": _try_demangle(sym.name),
                         })
-                return {
+                total_elf = len(entries)
+                if pattern:
+                    entries = [e for e in entries if _match_pattern(e.get("name"), pattern)]
+                r = {
                     "ok": True, "format": "ELF",
                     "dll_name": None, "base_ordinal": 0,
-                    "exports": entries, "total_exports": len(entries),
+                    "exports": entries,
+                    "total_exports": total_elf,
+                    "matched_exports": len(entries),
+                }
+                if pattern:
+                    r["filter_pattern"] = pattern
+                return r
+
+            return {"ok": True, "format": fmt, "exports": [], "total_exports": 0, "matched_exports": 0}
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # H.5b — lief_iat_resolve
+    # -----------------------------------------------------------------------
+
+    @tool
+    @idasync
+    def lief_iat_resolve(
+        dll_name: Annotated[
+            str,
+            "DLL name to search (case-insensitive substring, e.g. 'kernel32', 'Core.dll').",
+        ],
+        func_name: Annotated[
+            str,
+            "Imported function name (case-insensitive substring or glob, e.g. 'CreateFileW', '*Render*').",
+        ],
+        file_path: Annotated[str, "Path to binary; empty string uses the IDB source file"] = "",
+    ) -> LiefIatResolveResult:
+        """Resolve an imported function to its IAT slot address in IDA.
+
+        Given a DLL name and function name, finds the matching IAT entry and
+        returns both the static VA (from the PE file) and the IDA-rebased VA
+        (accounting for ASLR / IDB rebase). The IDA-rebased address is what
+        you need for hooking or patching in the loaded IDB.
+
+        Also looks up the IDA symbol name at that address (e.g. '__imp_CreateFileW',
+        'ds:CreateFileW') so you know exactly what IDA calls it.
+
+        On no match: returns ok=False with a 'candidates' list of all imports
+        from matching DLLs so the agent can pick the right name.
+        """
+        try:
+            path = _resolve_lief_path(file_path)
+            binary = _lief.parse(path)
+            if binary is None:
+                return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
+
+            if not isinstance(binary, _lief.PE.Binary):
+                return {
+                    **tool_error(ValueError("lief_iat_resolve only supports PE binaries")),
+                    "ok": False,
                 }
 
-            return {"ok": True, "format": fmt, "exports": [], "total_exports": 0}
+            pe = binary
+            pe_imagebase = pe.optional_header.imagebase
+            idb_imagebase = idaapi.get_imagebase()
+            rebase_delta = idb_imagebase - pe_imagebase
+
+            dll_f = dll_name.lower()
+            fn_p = func_name.lower()
+            if "*" not in fn_p and "?" not in fn_p:
+                fn_p = f"*{fn_p}*"
+
+            # Collect all imports from matching DLLs
+            candidates: list[dict] = []
+            for imp in list(pe.imports) + [d for d in (
+                list(pe.delay_imports) if hasattr(pe, "delay_imports") else []
+            )]:
+                is_delay = imp in (
+                    list(pe.delay_imports) if hasattr(pe, "delay_imports") else []
+                )
+                if dll_f not in imp.name.lower():
+                    continue
+                for fn in imp.entries:
+                    fname = fn.name if fn.name else None
+                    if fname and fnmatch.fnmatch(fname.lower(), fn_p):
+                        iat_va = fn.iat_address
+                        iat_va_idb = iat_va + rebase_delta
+                        idb_sym = idc.get_name(iat_va_idb, idc.GN_VISIBLE) or None
+                        return {
+                            "ok": True,
+                            "dll_name": imp.name,
+                            "func_name": fname,
+                            "demangled_name": _try_demangle(fname),
+                            "ordinal": fn.ordinal if fn.is_ordinal else None,
+                            "is_ordinal": bool(fn.is_ordinal),
+                            "is_delay_import": is_delay,
+                            "iat_va": hex(iat_va),
+                            "iat_va_idb": hex(iat_va_idb),
+                            "idb_name": idb_sym,
+                        }
+                    if fname:
+                        candidates.append({
+                            "dll": imp.name,
+                            "name": fname,
+                            "demangled": _try_demangle(fname),
+                            "iat_va": hex(fn.iat_address),
+                            "iat_va_idb": hex(fn.iat_address + rebase_delta),
+                        })
+
+            # No exact match — tell agent what IS available in those DLLs
+            dll_candidates = [c for c in candidates if dll_f in c["dll"].lower()]
+            hint = (
+                f"No import matching '{func_name}' found in DLLs containing '{dll_name}'. "
+                + (
+                    f"{len(dll_candidates)} import(s) from matching DLLs listed in 'candidates'."
+                    if dll_candidates
+                    else "No DLLs matching that name found either — check the DLL name."
+                )
+            )
+            return {
+                "ok": False,
+                "dll_name": dll_name,
+                "func_name": func_name,
+                "error": hint,
+                "hint": hint,
+                "candidates": dll_candidates[:30],
+            }
         except Exception as e:
             return {**tool_error(e), "ok": False}
 
