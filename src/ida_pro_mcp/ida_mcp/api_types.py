@@ -1768,7 +1768,17 @@ def _decompose_ptr_access(expr) -> tuple | None:
 
 
 def _guess_field_type(access_size: int) -> str:
-    return {1: "char", 2: "short", 4: "int", 8: "__int64"}.get(access_size, "void*")
+    # "void*" was the old fallback but breaks get_type_by_name; use "__int64" instead
+    return {1: "char", 2: "short", 4: "int", 8: "__int64"}.get(access_size, "__int64")
+
+
+# BTF constants mapped directly to avoid string lookup for internal struct building
+_FIELD_BTF: dict[int, int] = {
+    1: ida_typeinf.BTF_INT8,
+    2: ida_typeinf.BTF_INT16,
+    4: ida_typeinf.BTF_INT32,
+    8: ida_typeinf.BTF_INT64,
+}
 
 
 def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[str, str] | None:
@@ -1776,7 +1786,6 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
     if not fields:
         return None
     try:
-        # Deduplicate offsets, keep max access size
         offset_map: dict[int, int] = {}
         for off, sz in fields:
             offset_map[off] = max(offset_map.get(off, 0), sz)
@@ -1784,19 +1793,29 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
         sorted_offsets = sorted(offset_map.items())
 
         tif = ida_typeinf.tinfo_t()
-        tif.create_udt(ida_typeinf.BTF_STRUCT)
+        # IDA 9.0: create_udt requires udt_type_data_t, not a bare BTF constant.
+        mudt = ida_typeinf.udt_type_data_t()
+        if not tif.create_udt(mudt):
+            logger.warning("_build_struct_type: create_udt failed for %s", base_name)
+            return None
 
-        # Add fields at observed offsets
         for off, sz in sorted_offsets:
             fname = f"field_{off:X}"
-            ftype_str = _guess_field_type(sz)
-            tif.add_udm(fname, ftype_str, offset=off * 8)
-
-        # Set alignment; IDA auto-computes struct size from UDT layout
-        tif.set_udt_align(8)
+            # Use BTF constants directly — never throws unlike get_type_by_name
+            btf = _FIELD_BTF.get(sz, ida_typeinf.BTF_INT32)
+            udm = ida_typeinf.udm_t()
+            udm.name = fname
+            udm.type = ida_typeinf.tinfo_t(btf)
+            udm.offset = off * 8
+            udm.size = sz * 8
+            rc = tif.add_udm(udm)
+            if rc != ida_typeinf.TERR_OK:
+                logger.debug(
+                    "_build_struct_type: add_udm %s@+0x%X failed: %s",
+                    fname, off, ida_typeinf.tinfo_errstr(rc),
+                )
 
         til = ida_typeinf.get_idati()
-        # Ensure unique name
         struct_name = base_name
         counter = 0
         while True:
@@ -1808,10 +1827,12 @@ def _build_struct_type(fields: list[tuple[int, int]], base_name: str) -> tuple[s
 
         res = tif.set_named_type(til, struct_name, ida_typeinf.NTF_TYPE)
         if res != ida_typeinf.TERR_OK:
-            logger.warning("set_named_type failed for %s: %d", struct_name, res)
+            logger.warning(
+                "_build_struct_type: set_named_type failed for %s: %s",
+                struct_name, ida_typeinf.tinfo_errstr(res),
+            )
             return None
 
-        # Build C-like definition string
         lines = [f"struct {struct_name} {{"]
         for off, sz in sorted_offsets:
             lines.append(f"    {_guess_field_type(sz)} field_{off:X}; // +0x{off:X}")
@@ -2478,7 +2499,7 @@ class _ConstructorVisitor(ida_hexrays.ctree_visitor_t):
 @idasync
 @tool_timeout(60.0)
 def analyze_constructor(
-    address: Annotated[str, "Constructor function address or name"],
+    addr: Annotated[str, "Constructor function address or name"],
     infer_struct: Annotated[bool, "Create struct from observed field layout (default: True)"] = True,
     apply_type: Annotated[bool, "Apply inferred struct* type to the this parameter (default: False)"] = False,
 ) -> AnalyzeConstructorResult:
@@ -2513,7 +2534,7 @@ def analyze_constructor(
                 "hint": "Ensure Hex-Rays is installed and licensed.",
             }
 
-        func_ea = parse_address(address)
+        func_ea = parse_address(addr)
         func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
 
         cfunc = _decompile_func(func_ea)
@@ -2612,7 +2633,7 @@ def analyze_constructor(
 @idasync
 @tool_timeout(120.0)
 def type_propagate(
-    address: Annotated[
+    addr: Annotated[
         str,
         "Starting point: global address (hex or symbol), or 'function::variable' syntax "
         "(e.g. 'main::ptr' or '0x401000::ptr') to target a local variable.",
@@ -2684,12 +2705,12 @@ def type_propagate(
             }
 
         # Parse input address
-        func_ea, var_name, parse_err = _resolve_target(address)
+        func_ea, var_name, parse_err = _resolve_target(addr)
         target_global_ea: int | None = None
         containing_func_ea: int | None = None
 
         if parse_err:
-            return {"ok": False, "error": parse_err, "address": address}
+            return {"ok": False, "error": parse_err, "address": addr}
 
         if func_ea is not None and var_name is not None:
             # Function::variable mode
@@ -2698,11 +2719,11 @@ def type_propagate(
         else:
             # Raw address mode
             try:
-                target_global_ea = parse_address(address)
+                target_global_ea = parse_address(addr)
             except Exception:
-                target_global_ea = ida_name.get_name_ea(idaapi.BADADDR, address)
+                target_global_ea = ida_name.get_name_ea(idaapi.BADADDR, addr)
                 if target_global_ea == idaapi.BADADDR:
-                    return {"ok": False, "error": f"Address '{address}' not found", "address": address}
+                    return {"ok": False, "error": f"Address '{addr}' not found", "address": addr}
 
             # Find containing function
             func = ida_funcs.get_func(target_global_ea)
@@ -2729,10 +2750,10 @@ def type_propagate(
         func_eas = set(sorted(func_eas)[:max_functions])
 
         if not func_eas:
-            logger.info("type_propagate: no functions to analyze for %s", address)
+            logger.info("type_propagate: no functions to analyze for %s", addr)
             return {
                 "ok": True,
-                "address": address,
+"address": addr,
                 "inferred_type": "unknown",
                 "confidence": 0.0,
                 "confidence_breakdown": [],
@@ -2933,7 +2954,7 @@ def type_propagate(
 
         result: dict = {
             "ok": True,
-            "address": address,
+            "address": addr,
             "inferred_type": inferred_type,
             "confidence": round(confidence, 3),
             "confidence_breakdown": confidence_breakdown,
