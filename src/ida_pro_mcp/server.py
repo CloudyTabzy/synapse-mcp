@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -424,23 +425,71 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
             pass  # IDA unreachable — local tools still work
         return local_result
 
+    request_id = request_obj.get("id")
+    tool_name = request_obj.get("params", {}).get("name", "<unknown>")
+    shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
+
     try:
         return _proxy_to_ida(request)
-    except Exception as e:
-        full_info = traceback.format_exc()
-        request_id = request_obj.get("id")
-        if request_id is None:
-            return None  # Notification, no response needed
 
-        shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
+    except (TimeoutError, socket.timeout) as e:
+        # IDA is reachable but not responding — main thread is almost certainly blocked.
+        if request_id is None:
+            return None
         return JsonRpcResponse(
             {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32000,
                     "message": (
-                        "Failed to complete request to IDA Pro. "
-                        f"Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n"
+                        f"IDA Pro timed out on tool '{tool_name}' (30 s limit exceeded). "
+                        "The IDA main thread is blocked and cannot process new requests. "
+                        "Common causes: a py_eval/py_exec script that is still running "
+                        "(e.g. pip install, a long loop), or a previous heavy tool that has "
+                        "not finished yet. "
+                        "What to do: wait ~30 s and retry once — if still unresponsive, "
+                        "interrupt or restart IDA. "
+                        "Do NOT retry mutating tools (rename, patch, define_func) until you "
+                        "have confirmed IDA state, as the previous call may have partially "
+                        "completed."
+                    ),
+                    "data": str(e),
+                },
+                "id": request_id,
+            }
+        )
+
+    except (ConnectionRefusedError, ConnectionResetError) as e:
+        # IDA server is not running or was killed mid-request.
+        if request_id is None:
+            return None
+        return JsonRpcResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": (
+                        f"Cannot reach IDA Pro for tool '{tool_name}': {e}. "
+                        f"Start the MCP plugin via Edit → Plugins → MCP ({shortcut}), "
+                        "then retry."
+                    ),
+                    "data": str(e),
+                },
+                "id": request_id,
+            }
+        )
+
+    except Exception as e:
+        full_info = traceback.format_exc()
+        if request_id is None:
+            return None
+        return JsonRpcResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": (
+                        f"Unexpected error proxying tool '{tool_name}' to IDA Pro. "
                         "The request was not retried automatically. "
                         "If this was a mutating operation, verify IDA state before retrying.\n"
                         f"{full_info}"
