@@ -653,7 +653,12 @@ def item_error(exc: Exception, context: str = "", hint: str | None = None) -> di
     result: dict = {"error": error_str, "error_type": _classify_exc(exc)}
     if hint:
         result["hint"] = hint
-    _log.exception("Item error [%s]: %s", context or type(exc).__name__, msg)
+    if isinstance(exc, IDAError):
+        # IDAError is an expected, user-facing condition (not found, bad input, etc.).
+        # Log at WARNING without traceback to avoid flooding the IDA output log.
+        _log.warning("Item error [%s]: %s", context or type(exc).__name__, msg)
+    else:
+        _log.exception("Item error [%s]: %s", context or type(exc).__name__, msg)
     return result
 
 
