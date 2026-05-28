@@ -446,7 +446,7 @@ def get_binary_sections() -> SectionsResult:
 @idasync
 def find_global_writers(
     addr: Annotated[str, "Address or name of the global to find writers for"],
-    max_results: Annotated[int, "Cap on returned writer sites (default 200)"] = 200,
+    limit: Annotated[int, "Cap on returned writer sites (default 200)"] = 200,
 ) -> WritersResult:
     """Find every instruction that WRITES to a given global address.
 
@@ -468,7 +468,7 @@ def find_global_writers(
         writers: list[WriterSite] = []
         xb = ida_xref.xrefblk_t()
         ok = xb.first_to(target_ea, ida_xref.XREF_ALL)
-        while ok and len(writers) < max_results:
+        while ok and len(writers) < limit:
             # The `.type` field uses dref_t for data xrefs and cref_t for code
             # xrefs — the integer values overlap (e.g. cref_t.fl_CN == 18 vs
             # dref_t.dr_W == 2). Always gate on `.iscode` before comparing to
@@ -582,7 +582,7 @@ def find_vtable_candidates(
 def _read_vtable_single(
     vtable_ea: int,
     vtable_name: str,
-    max_entries: int,
+    limit: int,
     include_decompile: bool,
 ) -> dict:
     """Read one vtable and return a result dict (never raises)."""
@@ -593,7 +593,7 @@ def _read_vtable_single(
         entries: list[dict] = []
         decompile_cache: dict[int, str] = {}
 
-        for idx in range(max_entries):
+        for idx in range(limit):
             slot_ea = vtable_ea + idx * ptr_size
             if not idaapi.is_loaded(slot_ea):
                 break
@@ -694,7 +694,7 @@ def dump_vtable(
         "Supports * and ? wildcards (case-insensitive). Plain text is treated as *substring*. "
         "Searches mangled names AND demangled names. Ignored when addr= or addrs= is set.",
     ] = None,
-    max_entries: Annotated[int, "Max vtable slots to read per vtable (default: 128)"] = 128,
+    limit: Annotated[int, "Max vtable slots to read per vtable (default: 128)"] = 128,
     include_decompile: Annotated[
         bool,
         "Include first 5 pseudocode lines per method. Token-expensive — "
@@ -733,7 +733,7 @@ def dump_vtable(
                 try:
                     ea = parse_address(raw_addr)
                     name = idc.get_name(ea, idc.GN_VISIBLE) or hex(ea)
-                    r = _read_vtable_single(ea, name, max_entries, include_decompile)
+                    r = _read_vtable_single(ea, name, limit, include_decompile)
                     results[hex(ea)] = r
                     if r.get("ok"):
                         success += 1
@@ -753,7 +753,7 @@ def dump_vtable(
         if addr is not None:
             vtable_ea = parse_address(addr)
             vtable_name = idc.get_name(vtable_ea, idc.GN_VISIBLE) or hex(vtable_ea)
-            return _read_vtable_single(vtable_ea, vtable_name, max_entries, include_decompile)
+            return _read_vtable_single(vtable_ea, vtable_name, limit, include_decompile)
 
         # --- class_name search mode ---
         if class_name:
@@ -820,7 +820,7 @@ def dump_vtable(
             hit = search_hits[0]
             vtable_ea = int(hit["ea"], 16)
             vtable_name = hit["name"]
-            return _read_vtable_single(vtable_ea, vtable_name, max_entries, include_decompile)
+            return _read_vtable_single(vtable_ea, vtable_name, limit, include_decompile)
 
         return _annotate({
             "ok": False,
@@ -967,7 +967,7 @@ def find_indirect_calls(
         "Only return calls at this vtable offset. -1 = no filter. Common values: "
         "0x10 (IUnknown::Release), 0x40 (IDXGISwapChain::Present).",
     ] = -1,
-    max_results: Annotated[int, "Cap on returned call sites (default 500)"] = 500,
+    limit: Annotated[int, "Cap on returned call sites (default 500)"] = 500,
 ) -> IndirectCallsResult:
     """Find all `call [reg+offset]` (and `call [reg]`) sites in a range.
 
@@ -1013,7 +1013,7 @@ def find_indirect_calls(
         by_offset: dict[str, int] = {}
         instructions_scanned = 0
         ea = start_ea
-        while ea < end_ea and len(sites) < max_results:
+        while ea < end_ea and len(sites) < limit:
             insn = _decoded_or_none(ea)
             if insn is None:
                 ea = idc.next_head(ea, end_ea)
@@ -1358,7 +1358,7 @@ def find_function_prologues(
         "When True, call ida_funcs.add_func on each hit to materialise the function "
         "(@unsafe — modifies IDB). Default False = dry-run only.",
     ] = False,
-    max_results: Annotated[int, "Cap on reported hits (default 1000)"] = 1000,
+    limit: Annotated[int, "Cap on reported hits (default 1000)"] = 1000,
 ) -> ProloguesResult:
     """Scan an address range for common function prologues.
 
@@ -1426,7 +1426,7 @@ def find_function_prologues(
         hits: list[PrologueHit] = []
         created = 0
         ea = start_ea
-        while ea < end_ea and len(hits) < max_results:
+        while ea < end_ea and len(hits) < limit:
             # Skip addresses already inside a known function.
             existing = ida_funcs.get_func(ea)
             if existing is not None and existing.start_ea == ea:

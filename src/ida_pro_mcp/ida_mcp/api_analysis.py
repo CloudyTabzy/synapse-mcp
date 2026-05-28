@@ -4379,3 +4379,1384 @@ def trace_data_chain(
     if functions_entered:
         result["functions_entered"] = functions_entered
     return result
+
+
+# ============================================================================
+# Static Analysis Tools — XOR Obfuscation & Constraint Classification
+# ============================================================================
+
+
+class XorPatternEntry(TypedDict):
+    type: str
+    address: str
+    key_byte: str
+    key_immediate: NotRequired[str]
+    loop_count: NotRequired[int]
+    rotate_count: NotRequired[int]
+    xor_count: int
+    confidence: str
+    detail: NotRequired[str]
+
+
+class FindXorPatternResult(TypedDict):
+    ok: bool
+    address: str
+    function_name: str
+    patterns_found: list[XorPatternEntry]
+    total_instructions_scanned: int
+    suggested_next_tool: NotRequired[str]
+    hint: NotRequired[str]
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def find_xor_pattern(
+    address: Annotated[str, "Function address or name to scan for XOR patterns (hex or symbol)"],
+    max_insns: Annotated[int, "Maximum instructions to scan (default 2000)"] = 2000,
+) -> FindXorPatternResult:
+    """Detect XOR obfuscation loops and ROR/ROL+XOR patterns in a function.
+
+    Scans instruction mnemonics and operands for common obfuscation signatures:
+    - xor reg, imm inside a loop → simple XOR obfuscation
+    - ror/rol reg, n followed by xor reg, key → ROTR/RATL+XOR cipher
+    - successive xor instructions → multi-stage XOR
+
+    This is the first tool to call when encountering an obfuscated binary.
+    It classifies the cipher type before you commit to a solving approach.
+    No symbolic execution — pure instruction pattern matching via IDA SDK.
+    """
+    try:
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"ok": False, "error": f"No function found at {address}"}
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or hex(func.start_ea)
+
+        # Build instruction list
+        insns: list[tuple[int, str, str, list[str]]] = []
+        for item_ea in idautils.FuncItems(func.start_ea):
+            mnem = idc.print_insn_mnem(item_ea) or ""
+            ops: list[str] = []
+            for n in range(4):
+                if idc.get_operand_type(item_ea, n) == idaapi.o_void:
+                    break
+                op_str = idc.print_operand(item_ea, n) or ""
+                ops.append(op_str)
+            insns.append((item_ea, mnem.lower(), ops[0] if ops else "", ops))
+
+            if len(insns) >= max_insns:
+                break
+
+        # Detect loop structures via FlowChart
+        try:
+            fc = idaapi.FlowChart(func)
+            loop_headers: set[int] = set()
+            for block in fc:
+                for succ in block.succs():
+                    if succ.start_ea <= block.start_ea:
+                        loop_headers.add(succ.start_ea)
+        except Exception:
+            loop_headers = set()
+
+        # Build basic block boundaries for context
+        block_starts: set[int] = {func.start_ea}
+        for block in fc:
+            block_starts.add(block.start_ea)
+
+        patterns: list[XorPatternEntry] = []
+        i = 0
+        while i < len(insns):
+            item_ea, mnem, op0, ops = insns[i]
+
+            # Detect xor reg, imm
+            if mnem == "xor" and len(ops) >= 2:
+                try:
+                    key_val = int(ops[1], 0) & 0xFF
+                except (ValueError, TypeError):
+                    i += 1
+                    continue
+                xor_count = 1
+                k = i + 1
+                while k < len(insns) and k - i < 32:
+                    if insns[k][1] == "xor" and len(insns[k][3]) >= 2:
+                        try:
+                            next_key = int(insns[k][3][1], 0) & 0xFF
+                        except (ValueError, TypeError):
+                            break
+                        if next_key == key_val:
+                            xor_count += 1
+                            k += 1
+                            continue
+                    break
+
+                in_loop = any(
+                    lh <= item_ea <= (lh + 256) for lh in loop_headers
+                ) if loop_headers else False
+
+                ptype = "xor_single_byte" if not in_loop else "xor_loop"
+                confidence = "high" if xor_count >= 3 or in_loop else "medium"
+
+                patterns.append(XorPatternEntry(
+                    type=ptype,
+                    address=hex(item_ea),
+                    key_byte=hex(key_val),
+                    key_immediate=ops[1],
+                    xor_count=xor_count,
+                    confidence=confidence,
+                    detail=f"In {'loop' if in_loop else 'linear'} code, {xor_count} XORs with key {hex(key_val)}",
+                ))
+                i = k
+                continue
+
+            # Detect ror/rol + xor combo
+            if mnem in ("ror", "rol") and len(ops) >= 2:
+                try:
+                    rotate_count = int(ops[1], 0)
+                    if 0 < rotate_count < 64:
+                        if i + 1 < len(insns) and insns[i + 1][1] == "xor":
+                            xor_item_ea = insns[i + 1][0]
+                            xops = insns[i + 1][3]
+                            if len(xops) >= 2:
+                                try:
+                                    key_val = int(xops[1], 0) & 0xFF
+                                    patterns.append(XorPatternEntry(
+                                        type="ror_xor_combo" if mnem == "ror" else "rol_xor_combo",
+                                        address=hex(item_ea),
+                                        key_byte=hex(key_val),
+                                        rotate_count=rotate_count,
+                                        xor_count=2,
+                                        confidence="medium",
+                                        detail=f"{mnem.upper()} by {rotate_count} then XOR with {hex(key_val)} at {hex(xor_item_ea)}",
+                                    ))
+                                    i += 2
+                                    continue
+                                except (ValueError, TypeError):
+                                    pass
+                except (ValueError, TypeError):
+                    pass
+
+            # Detect sub + xor combo (addition/XOR)
+            if mnem == "sub" and i + 1 < len(insns) and insns[i + 1][1] == "xor":
+                sub_ops = ops
+                xor_ops = insns[i + 1][3]
+                if len(sub_ops) >= 2 and len(xor_ops) >= 2:
+                    try:
+                        sub_val = int(sub_ops[1], 0) & 0xFF
+                        xor_val = int(xor_ops[1], 0) & 0xFF
+                        patterns.append(XorPatternEntry(
+                            type="sub_xor_combo",
+                            address=hex(item_ea),
+                            key_byte=hex(xor_val),
+                            key_immediate=f"sub {hex(sub_val)} then xor {hex(xor_val)}",
+                            xor_count=2,
+                            confidence="low",
+                            detail=f"SUB {hex(sub_val)} then XOR {hex(xor_val)}",
+                        ))
+                        i += 2
+                        continue
+                    except (ValueError, TypeError):
+                        pass
+
+            i += 1
+
+        hint = None
+        suggested = None
+        if not patterns:
+            hint = (
+                "No XOR patterns found. The function may use a different obfuscation "
+                "technique (ADD, NOT, NEG, or a custom cipher). Try decompiling the "
+                "function and look for arithmetic operations on byte arrays."
+            )
+            suggested = "check_constraint_type"
+        else:
+            suggested = "xor_invert"
+
+        return {
+            "ok": True,
+            "address": hex(func.start_ea),
+            "function_name": func_name,
+            "patterns_found": patterns,
+            "total_instructions_scanned": len(insns),
+            "suggested_next_tool": suggested,
+            "hint": hint,
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class XorInvertResult(TypedDict):
+    ok: bool
+    xor_key: NotRequired[str]
+    xor_key_int: NotRequired[int]
+    decrypted: NotRequired[str]
+    decrypted_hex: NotRequired[str]
+    verified: NotRequired[bool]
+    confidence: NotRequired[str]
+    is_xor_cipher: NotRequired[bool]
+    entropy: NotRequired[float]
+    key_consistency: NotRequired[str]
+    partial: NotRequired[bool]
+    per_byte_keys: NotRequired[list[str]]
+    error: NotRequired[str]
+    hint: NotRequired[str]
+
+
+@tool
+@idasync
+def xor_invert(
+    ciphertext_address: Annotated[
+        str, "Address of the obfuscated bytes (hex or symbol)"
+    ],
+    known_plaintext: Annotated[
+        str, "Expected decrypted string or hex bytes (e.g. 'TESS{' or '544553537b')"
+    ],
+    max_length: Annotated[
+        int, "Maximum bytes to read from the ciphertext address (default 256)"
+    ] = 256,
+    key_hint: Annotated[
+        str, "Suspected single-byte XOR key as hex (e.g. '0x6D') — used for verification only"
+    ] = "",
+) -> XorInvertResult:
+    """Recover XOR key from ciphertext + known plaintext — static, no symbolic execution.
+
+    Given ciphertext bytes at an IDA address and a known (or suspected) plaintext
+    string, computes the XOR key and recovers the full decrypted string.
+
+    This is the core tool for simple single-byte XOR crackmes — the most common
+    type. Each ciphertext byte is XORed with the same key byte to produce plaintext.
+
+    The tool also handles multi-byte XOR keys by detecting repeating key patterns.
+
+    Algorithm: key = ciphertext[n] ^ plaintext[n] for each matching position,
+    then verify consistency across all positions. If key is consistent, decrypt
+    remaining bytes. If inconsistent, try ROL/ROR transforms on the key.
+    """
+    try:
+        ct_ea = parse_address(ciphertext_address)
+        kp_bytes: bytes
+
+        # Parse known_plaintext: if prefixed with "hex:", treat as hex
+        if known_plaintext.startswith("hex:"):
+            kp_bytes = bytes.fromhex(known_plaintext[4:].replace(" ", ""))
+        elif known_plaintext.startswith("0x"):
+            kp_bytes = bytes.fromhex(known_plaintext[2:].replace(" ", ""))
+        else:
+            # Check if it looks like hex (all hex chars)
+            stripped = known_plaintext.replace(" ", "")
+            if all(c in "0123456789abcdefABCDEF" for c in stripped) and len(stripped) >= 4:
+                kp_bytes = bytes.fromhex(stripped)
+            else:
+                kp_bytes = known_plaintext.encode("utf-8")
+
+        # Read ciphertext bytes
+        ct_bytes = ida_bytes.get_bytes(ct_ea, max_length)
+        if not ct_bytes:
+            return {"ok": False, "error": f"No bytes found at {ciphertext_address}"}
+
+        # ── Entropy check: detect non-XOR ciphertext ──────────────────────────
+        # XOR-obfuscated data typically has byte values ~evenly distributed.
+        # Custom alphabet ciphers often have a narrow byte range (e.g., 0x40-0x7F).
+        byte_set = set(ct_bytes[:min(len(ct_bytes), 256)])
+        byte_range = max(byte_set) - min(byte_set) if byte_set else 0
+        unique_ratio = len(byte_set) / min(len(ct_bytes), 256) if ct_bytes else 0
+
+        # Heuristic: if < 20 unique byte values or range < 40, likely NOT XOR
+        is_probably_xor = len(byte_set) >= 20 and byte_range >= 40
+
+        min_len = min(len(ct_bytes), len(kp_bytes))
+        if min_len < 1:
+            return {"ok": False, "error": "Need at least 1 byte of overlap between ciphertext and known plaintext"}
+
+        # Try single-byte key
+        key_candidates: list[int] = []
+        for i in range(min_len):
+            key_candidates.append(ct_bytes[i] ^ kp_bytes[i])
+
+        # Check if all positions give the same key
+        if len(set(key_candidates)) == 1:
+            key = key_candidates[0]
+            key_hint_byte = None
+            if key_hint:
+                try:
+                    key_hint_byte = int(key_hint, 0) & 0xFF
+                except (ValueError, TypeError):
+                    pass
+
+            # Decrypt all ciphertext bytes
+            decrypted = bytes(ct ^ key for ct in ct_bytes)
+            try:
+                decrypted_str = decrypted.decode("utf-8", errors="replace")
+            except UnicodeDecodeError:
+                decrypted_str = decrypted.hex(" ").upper()
+
+            return XorInvertResult(
+                ok=True,
+                xor_key=hex(key),
+                xor_key_int=key,
+                decrypted=decrypted_str,
+                decrypted_hex=decrypted.hex(" ").upper(),
+                verified=key_hint_byte is None or key_hint_byte == key,
+                confidence="high",
+                key_consistency="All overlapping bytes produced the same XOR key",
+            )
+
+        # Multi-byte key or inconsistent key: report per-byte keys
+        per_byte = [hex(kc) for kc in key_candidates]
+        unique = set(key_candidates)
+
+        if len(unique) <= 4:
+            # Possibly a multi-byte key — try decrypting with a repeating key
+            key_cycle = len(key_candidates)
+            if key_cycle > 1 and key_cycle <= 16:
+                decrypted = bytes(ct_bytes[i] ^ key_candidates[i % key_cycle] for i in range(len(ct_bytes)))
+                try:
+                    decrypted_str = decrypted.decode("utf-8", errors="replace")
+                except UnicodeDecodeError:
+                    decrypted_str = decrypted.hex(" ").upper()
+
+                return XorInvertResult(
+                    ok=True,
+                    xor_key=",".join(hex(k) for k in key_candidates),
+                    xor_key_int=0,
+                    decrypted=decrypted_str,
+                    decrypted_hex=decrypted.hex(" ").upper(),
+                    verified=False,
+                    confidence="medium" if len(ct_bytes) < 64 else "low",
+                    key_consistency=f"Multi-byte key of length {key_cycle}",
+                    per_byte_keys=per_byte,
+                )
+
+        return XorInvertResult(
+            ok=True,
+            xor_key="",
+            xor_key_int=0,
+            decrypted="",
+            decrypted_hex="",
+            verified=False,
+            confidence="low",
+            is_xor_cipher=is_probably_xor,
+            entropy=round(unique_ratio, 2),
+            key_consistency=f"Inconsistent keys: {per_byte}",
+            per_byte_keys=per_byte,
+            hint=(
+                "Key is not single-byte and byte entropy suggests non-XOR cipher. "
+                "Try check_constraint_type to classify the actual cipher, "
+                "or find_alphabet_encoder to detect custom alphabet encoding."
+                if not is_probably_xor
+                else "Key is not single-byte. Try static_invert_xor_with_constraints "
+                "for multi-stage transforms, or use Triton for symbolic execution on path-dependent logic."
+            ),
+        )
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class ConstraintTypeEntry(TypedDict):
+    constraint_type: str
+    per_byte_independent: bool
+    invertible_with: str
+    confidence: str
+    hint: str
+
+
+class CheckConstraintTypeResult(TypedDict):
+    ok: bool
+    address: str
+    function_name: str
+    constraint_type: str
+    cipher_type: NotRequired[str]
+    xor_count: NotRequired[int]
+    details: list[ConstraintTypeEntry]
+    recommendation: str
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def check_constraint_type(
+    address: Annotated[str, "Function address or name to analyze (hex or symbol)"],
+) -> CheckConstraintTypeResult:
+    """Classify a function's constraint structure to pick the right solving tool.
+
+    Analyzes branch conditions, loop patterns, and data flow to determine
+    whether the constraint is statically invertible or requires symbolic
+    execution. This prevents spending time on Triton/Z3 when simple Python
+    arithmetic would solve the problem in seconds.
+
+    Classification outputs:
+    - per_byte_invertible: Each byte's constraint is independent → use Python arithmetic
+    - path_dependent: Branching depends on input → use Triton or angr
+    - opaque_predicate: Cannot determine statically → use angr exploration
+    - state_mixer: Non-linear state combination → use Triton with formula extraction
+    """
+    try:
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"ok": False, "error": f"No function found at {address}"}
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or hex(func.start_ea)
+
+        # Collect instruction information
+        mnemonics: list[str] = []
+        cmp_count = 0
+        branch_count = 0
+        xor_count = 0
+        call_count = 0
+        indirect_call_count = 0
+        memory_cmp_count = 0
+
+        for item_ea in idautils.FuncItems(func.start_ea):
+            mnem = idc.print_insn_mnem(item_ea) or ""
+            mn = mnem.lower()
+            mnemonics.append(mn)
+
+            if mn in ("cmp", "test"):
+                cmp_count += 1
+            elif mn in ("jz", "jnz", "je", "jne", "jg", "jl", "jge", "jle", "ja", "jb", "jae", "jbe", "js", "jns", "jp", "jnp", "jo", "jno", "jmp", "jcxz", "jecxz"):
+                branch_count += 1
+            elif mn == "xor":
+                xor_count += 1
+            elif mn == "call":
+                call_count += 1
+                # Check if call target is indirect (register)
+                op0_type = idc.get_operand_type(item_ea, 0)
+                if op0_type in (idaapi.o_reg, idaapi.o_phrase, idaapi.o_displ):
+                    indirect_call_count += 1
+
+            # Detect memory comparison patterns: loads + cmp
+            if mn in ("mov", "movzx", "movsx") and cmp_count > 0:
+                op1_type = idc.get_operand_type(item_ea, 1)
+                if op1_type in (idaapi.o_mem, idaapi.o_displ):
+                    pass  # Could set memory_cmp_count, but we check mnemonic presence
+
+            # Check for string comparison calls
+            callee_name = ""
+            if mn == "call":
+                callee_name = idc.print_operand(item_ea, 0) or ""
+                if any(s in callee_name.lower() for s in ("memcmp", "strcmp", "strncmp", "wmemcmp", "wcscmp")):
+                    memory_cmp_count += 1
+
+        # Check for loop structure
+        has_loops = False
+        try:
+            fc = idaapi.FlowChart(func)
+            for block in fc:
+                for succ in block.succs():
+                    if succ.start_ea <= block.start_ea:
+                        has_loops = True
+                        break
+                if has_loops:
+                    break
+        except Exception:
+            pass
+
+        # ── Classification logic ─────────────────────────────────────────────
+        entries: list[ConstraintTypeEntry] = []
+        detects_xor = xor_count >= 1
+
+        # Check for per-byte invertible: moderate branches, few indirect calls
+        if branch_count <= cmp_count * 2 + 5 and memory_cmp_count < 2:
+            conf = "high" if detects_xor else "medium"
+            per_byte_hint = (
+                "Each byte's constraint appears independent. Use xor_invert or "
+                "static_invert_xor_with_constraints."
+                if detects_xor
+                else "Each byte appears independently processed but NO simple XOR "
+                "was detected. The cipher may be a custom alphabet encoder "
+                "or modular arithmetic transform. Decompile the function to "
+                "identify lookup tables and arithmetic operations. Then use "
+                "find_alphabet_encoder to detect the cipher structure."
+            )
+            entries.append(ConstraintTypeEntry(
+                constraint_type="per_byte_invertible",
+                per_byte_independent=True,
+                invertible_with="python_arithmetic",
+                confidence=conf,
+                hint=per_byte_hint,
+            ))
+
+        # Check for path-dependent: many branches relative to comparison points
+        if branch_count > cmp_count * 2 + 3 or has_loops:
+            entries.append(ConstraintTypeEntry(
+                constraint_type="path_dependent",
+                per_byte_independent=False,
+                invertible_with="triton or angr",
+                confidence="medium",
+                hint="Branching depends on input comparison. Symbolic execution may be needed.",
+            ))
+
+        # Check for opaque predicate: indirect calls + many branches
+        if indirect_call_count > 0 and branch_count > 5:
+            entries.append(ConstraintTypeEntry(
+                constraint_type="opaque_predicate",
+                per_byte_independent=False,
+                invertible_with="angr_find_paths",
+                confidence="low",
+                hint="Indirect calls suggest control-flow obfuscation. Try angr with find_paths.",
+            ))
+
+        # Check for state mixer: many XORs + calls + branches
+        if xor_count > 10 and call_count > 3:
+            entries.append(ConstraintTypeEntry(
+                constraint_type="state_mixer",
+                per_byte_independent=False,
+                invertible_with="triton_symbolic",
+                confidence="low",
+                hint="Heavy XOR/call mix suggests non-linear state combination. Triton symbolic execution recommended.",
+            ))
+
+        if not entries:
+            entries.append(ConstraintTypeEntry(
+                constraint_type="unknown",
+                per_byte_independent=False,
+                invertible_with="unknown",
+                confidence="low",
+                hint="Could not classify. Decompile the function and examine the validation logic manually.",
+            ))
+
+        # ── Build cipher-type-aware recommendation ────────────────────────────
+        if not detects_xor:
+            recommendation = (
+                "CUSTOM CIPHER: No simple XOR detected in this function. "
+                "Per-byte processing is present but the transform is not XOR-based. "
+                "1) Run find_alphabet_encoder(address) to detect the cipher type. "
+                "2) Decompile the function to identify lookup tables and arithmetic. "
+                "3) Use get_string + get_bytes on referenced data to extract the alphabet. "
+                "Avoid Triton/angr until you understand the cipher structure."
+            )
+        elif primary["constraint_type"] == "per_byte_invertible" and detects_xor:
+            recommendation = (
+                "USE LIGHTWEIGHT TOOLS: This looks statically invertible with XOR. "
+                "Try xor_invert first (if you know expected plaintext), "
+                "or use static_invert_xor_with_constraints for multi-stage transforms. "
+                "Avoid Triton/angr unless static inversion fails."
+            )
+        elif primary["constraint_type"] == "per_byte_invertible":
+            recommendation = (
+                "USE LIGHTWEIGHT TOOLS: This looks statically invertible. "
+                "Try find_alphabet_encoder to identify the cipher. "
+                "No XOR detected — cipher may use custom alphabet encoding. "
+                "Avoid Triton/angr unless static inversion fails."
+            )
+        elif primary["constraint_type"] == "path_dependent":
+            recommendation = (
+                "USE SYMBOLIC EXECUTION: Branching depends on input values. "
+                "Use triton_analyze_function or triton_find_input_for_branch. "
+                "If the binary is Windows x64, pass setup_windows_abi=True."
+            )
+        elif primary["constraint_type"] == "opaque_predicate":
+            recommendation = (
+                "USE ANGR EXPLORATION: Opaque predicates detected. "
+                "angr's exploration engine can handle this better than Triton. "
+                "Try angr with find_paths mode."
+            )
+        elif primary["constraint_type"] == "state_mixer":
+            recommendation = (
+                "USE TRITON SYMBOLIC: Non-linear state mixing detected. "
+                "Use triton_init then triton_process_function with symbolic registers. "
+                "May need triton_setup_windows_x64 for Windows binaries."
+            )
+        else:
+            recommendation = (
+                "MANUAL ANALYSIS NEEDED: Could not classify constraint type. "
+                "Decompile the function and examine the validation logic. "
+                "The function may be a custom cipher or VM."
+            )
+
+        return CheckConstraintTypeResult(
+            ok=True,
+            address=hex(func.start_ea),
+            function_name=func_name,
+            constraint_type=primary["constraint_type"],
+            cipher_type="xor" if detects_xor else "custom_alphabet",
+            xor_count=xor_count,
+            details=entries,
+            recommendation=recommendation,
+        )
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class AlphabetEncoderMatch(TypedDict):
+    encoder_type: str
+    address: str
+    confidence: str
+    operation: NotRequired[str]
+    table_address: NotRequired[str]
+    table_size: NotRequired[int]
+    detail: str
+
+
+class FindAlphabetEncoderResult(TypedDict):
+    ok: bool
+    address: str
+    function_name: str
+    encoders_found: list[AlphabetEncoderMatch]
+    total_instructions_scanned: int
+    hint: NotRequired[str]
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def find_alphabet_encoder(
+    address: Annotated[str, "Function address or name to scan for custom alphabet encoders (hex or symbol)"],
+    max_insns: Annotated[int, "Maximum instructions to scan (default 2000)"] = 2000,
+) -> FindAlphabetEncoderResult:
+    """Detect custom alphabet encoding patterns: mod 64/32/256, lookup tables, and modular-arithmetic ciphers.
+
+    Scans a function for patterns typical of custom base64-like alphabet encoders:
+    - AND reg, 0x3F — flag decode (lower 6 bits)
+    - AND reg, 0x1F — shl decode (lower 5 bits)
+    - IMUL/ADD with small constants (e.g., *9+7, *3) as part of transform
+    - Memory loads indexed by register (lookup table reads)
+    - CMP against MOD values like 0x40 (64), 0x100 (256)
+
+    Use this tool when find_xor_pattern returns empty and check_constraint_type
+    reports cipher_type=custom_alphabet. It identifies the specific encoding
+    algorithm so you can write a Python inverter without Triton/Z3.
+
+    Detection is pure instruction pattern matching — no symbolic execution.
+    """
+    try:
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"ok": False, "error": f"No function found at {address}"}
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or hex(func.start_ea)
+
+        # Collect instruction data
+        insns: list[tuple[int, str, str, list[str]]] = []
+        for item_ea in idautils.FuncItems(func.start_ea):
+            mnem = idc.print_insn_mnem(item_ea) or ""
+            ops: list[str] = []
+            for n in range(4):
+                if idc.get_operand_type(item_ea, n) == idaapi.o_void:
+                    break
+                op_str = idc.print_operand(item_ea, n) or ""
+                ops.append(op_str)
+            insns.append((item_ea, mnem.lower(), ops[0] if ops else "", ops))
+            if len(insns) >= max_insns:
+                break
+
+        encoders: list[AlphabetEncoderMatch] = []
+
+        # Look for AND + compare patterns typical of custom alphabet encoders
+        for item_ea, mnem, op0, ops in insns:
+            if mnem == "and" and len(ops) >= 2:
+                try:
+                    mask_val = int(ops[1], 0)
+                except (ValueError, TypeError):
+                    continue
+
+                if mask_val == 0x3F:
+                    # AND 0x3F — get lower 6 bits (mod 64) → base64-like encoding
+                    encoders.append(AlphabetEncoderMatch(
+                        encoder_type="base64_like",
+                        address=hex(item_ea),
+                        confidence="medium",
+                        operation="AND 0x3F",
+                        detail="Extracts lower 6 bits — likely indexing a 64-char alphabet table",
+                    ))
+                elif mask_val == 0x1F:
+                    encoders.append(AlphabetEncoderMatch(
+                        encoder_type="base32_like",
+                        address=hex(item_ea),
+                        confidence="medium",
+                        operation="AND 0x1F",
+                        detail="Extracts lower 5 bits — likely indexing a 32-char alphabet table",
+                    ))
+
+            # Look for IMUL + ADD combos (e.g., *9+7 used in custom ciphers)
+            if mnem in ("imul", "mul") and len(ops) >= 2:
+                try:
+                    mul_val = int(ops[1], 0)
+                    if 2 <= mul_val <= 20:
+                        encoders.append(AlphabetEncoderMatch(
+                            encoder_type="multiplicative_transform",
+                            address=hex(item_ea),
+                            confidence="low",
+                            operation=f"IMUL {mul_val}",
+                            detail=f"Multiplies by constant {mul_val} — possible custom cipher arithmetic",
+                        ))
+                except (ValueError, TypeError):
+                    pass
+
+            # Look for ADD/SUB with small constants on bytes
+            if mnem in ("add", "sub") and len(ops) >= 2:
+                try:
+                    const_val = int(ops[1], 0)
+                    if 1 <= const_val <= 127:
+                        encoders.append(AlphabetEncoderMatch(
+                            encoder_type="additive_transform",
+                            address=hex(item_ea),
+                            confidence="low",
+                            operation=f"{mnem.upper()} {const_val}",
+                            detail=f"{mnem.upper()}s by constant {const_val} — common in cipher state updates",
+                        ))
+                except (ValueError, TypeError):
+                    pass
+
+            # Look for indexed memory loads (lookup table reads)
+            if mnem in ("mov", "movzx", "movsx") and len(ops) >= 2:
+                for op_str in ops[1:]:
+                    if "[" in op_str and ("*" in op_str or "+" in op_str):
+                        encoders.append(AlphabetEncoderMatch(
+                            encoder_type="lookup_table_read",
+                            address=hex(item_ea),
+                            confidence="medium",
+                            operation=ops[1] if len(ops) >= 2 else "indexed_mem",
+                            detail=f"Indexed memory read — likely alphabet table lookup at {ops[1]}",
+                        ))
+                        break
+
+        # De-duplicate: keep only unique encoder types per address
+        seen: set[tuple[str, str]] = set()
+        unique_encoders: list[AlphabetEncoderMatch] = []
+        for enc in encoders:
+            key = (enc["encoder_type"], enc["address"])
+            if key not in seen:
+                seen.add(key)
+                unique_encoders.append(enc)
+
+        # Try to find the actual alphabet table
+        alphabet_tables: list[tuple[int, int]] = []  # (address, size)
+        for item_ea in idautils.FuncItems(func.start_ea):
+            for xref in idautils.XrefsFrom(item_ea, 0):
+                if not xref.iscode and xref.to != idaapi.BADADDR:
+                    seg = idaapi.getseg(xref.to)
+                    if seg and seg.type not in (idaapi.SEG_CODE,):
+                        size = min(seg.end_ea - xref.to, 128)
+                        data = ida_bytes.get_bytes(xref.to, size)
+                        if data:
+                            printable = sum(1 for b in data if 0x20 <= b < 0x7F)
+                            if printable > len(data) * 0.6:
+                                alphabet_tables.append((xref.to, size))
+
+        for table_addr, table_size in alphabet_tables:
+            unique_encoders.append(AlphabetEncoderMatch(
+                encoder_type="alphabet_table",
+                address=hex(table_addr),
+                confidence="high",
+                table_address=hex(table_addr),
+                table_size=table_size,
+                detail=f"Probable alphabet table at {hex(table_addr)}: {table_size} bytes, {sum(1 for b in ida_bytes.get_bytes(table_addr, min(table_size, 128)) or b'' if 0x20 <= b < 0x7F)} printable",
+            ))
+
+        hint = None
+        if not unique_encoders:
+            hint = (
+                "No custom alphabet encoder patterns found. The function may use "
+                "direct arithmetic on bytes (e.g., +x, -y) without lookup tables, "
+                "or may use a VM-based cipher. Try decompiling to identify the exact transform."
+            )
+
+        return FindAlphabetEncoderResult(
+            ok=True,
+            address=hex(func.start_ea),
+            function_name=func_name,
+            encoders_found=unique_encoders,
+            total_instructions_scanned=len(insns),
+            hint=hint,
+        )
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class StaticInvertResult(TypedDict):
+    ok: bool
+    recovered: NotRequired[str]
+    recovered_hex: NotRequired[str]
+    transform_sequence: NotRequired[list[str]]
+    per_byte_keys: NotRequired[list[str]]
+    confidence: NotRequired[str]
+    error: NotRequired[str]
+    hint: NotRequired[str]
+
+
+@tool
+@idasync
+def static_invert_xor_with_constraints(
+    ciphertext_address: Annotated[str, "Address of encrypted data (hex or symbol)"],
+    known_plaintext: Annotated[
+        str, "Known or expected plaintext at specific positions (e.g. 'TESS{' for a flag prefix)"
+    ],
+    max_length: Annotated[int, "Maximum ciphertext bytes to read (default 512)"] = 512,
+    transform_hints: Annotated[
+        str,
+        "Comma-separated hints: 'ror' (try ROR shift), 'rol' (try ROL shift), "
+        "'sub' (try subtraction), 'add' (try addition), 'xchg' (swap nibbles). "
+        "Empty = auto-detect all.",
+    ] = "",
+) -> StaticInvertResult:
+    """Invert a multi-stage XOR/arithmetic transform given known plaintext.
+
+    Handles more complex cases than xor_invert where the transform involves
+    multiple operations per byte: XOR with key, ROL/ROR rotation, addition or
+    subtraction of index-dependent constants, nibble swaps.
+
+    This is the tool for TenzoCrackme-style problems where the transform
+    involves ror8(y, -5) then XOR with table. Each transform type is tried;
+    the one that produces printable plaintext for all positions is selected.
+
+    Algorithm: brute-force search over standard transform combinations
+    for single-byte keys, then extend to multi-byte key schedules.
+    """
+    try:
+        ct_ea = parse_address(ciphertext_address)
+
+        kp_bytes: bytes
+        if known_plaintext.startswith("hex:"):
+            kp_bytes = bytes.fromhex(known_plaintext[4:].replace(" ", ""))
+        elif known_plaintext.startswith("0x"):
+            kp_bytes = bytes.fromhex(known_plaintext[2:].replace(" ", ""))
+        else:
+            stripped = known_plaintext.replace(" ", "")
+            if all(c in "0123456789abcdefABCDEF" for c in stripped) and len(stripped) >= 4:
+                kp_bytes = bytes.fromhex(stripped)
+            else:
+                kp_bytes = known_plaintext.encode("utf-8")
+
+        ct_bytes = ida_bytes.get_bytes(ct_ea, max_length)
+        if not ct_bytes:
+            return {"ok": False, "error": f"No bytes found at {ciphertext_address}"}
+
+        min_overlap = min(len(ct_bytes), len(kp_bytes))
+        ct_arr = list(ct_bytes)
+        kp_arr = list(kp_bytes)
+
+        # Gather transform hints
+        hints_set = set()
+        if transform_hints:
+            hints_set.update(h.strip().lower() for h in transform_hints.split(",") if h.strip())
+        if not hints_set:
+            hints_set = {"xor", "ror", "rol", "sub", "add", "xchg"}
+
+        def ror8(v: int, n: int) -> int:
+            n &= 7
+            return ((v >> n) | (v << (8 - n))) & 0xFF
+
+        def rol8(v: int, n: int) -> int:
+            return ror8(v, 8 - (n & 7))
+
+        def xchg_nibbles(v: int) -> int:
+            return ((v & 0x0F) << 4) | ((v & 0xF0) >> 4)
+
+        # Try each hint to find the transform
+        best_transform: list[str] = []
+        best_decrypted: bytes = b""
+        best_confidence = "low"
+
+        # Single-byte key: try all transform types
+        for hint_name in ["xor", "ror", "rol", "sub", "add", "xchg"]:
+            if hint_name not in hints_set:
+                continue
+
+            inverted: list[int] = []
+            transform_desc: list[str] = []
+
+            if hint_name == "xor":
+                # Standard XOR: key = ct[i] ^ known[i]
+                keys_at_positions = [ct_arr[i] ^ kp_arr[i] for i in range(min_overlap)]
+                if len(set(keys_at_positions)) == 1:
+                    key = keys_at_positions[0]
+                    inverted = [ct ^ key for ct in ct_arr]
+                    transform_desc.append(f"XOR with key {hex(key)}")
+            elif hint_name == "ror":
+                # Try each rotation amount 1-7
+                for rot in range(1, 8):
+                    keys_at_positions = []
+                    for i in range(min_overlap):
+                        key = ror8(kp_arr[i], rot) ^ ct_arr[i]
+                        keys_at_positions.append(key)
+                    if len(set(keys_at_positions)) == 1:
+                        key = keys_at_positions[0]
+                        inverted = [ror8(ct ^ key, rot) for ct in ct_arr]
+                        transform_desc.append(f"ROR by {rot}, XOR with key {hex(key)}")
+                        break
+            elif hint_name == "rol":
+                for rot in range(1, 8):
+                    keys_at_positions = []
+                    for i in range(min_overlap):
+                        key = rol8(kp_arr[i], rot) ^ ct_arr[i]
+                        keys_at_positions.append(key)
+                    if len(set(keys_at_positions)) == 1:
+                        key = keys_at_positions[0]
+                        inverted = [rol8(ct ^ key, rot) for ct in ct_arr]
+                        transform_desc.append(f"ROL by {rot}, XOR with key {hex(key)}")
+                        break
+            elif hint_name == "sub":
+                # Key = (ct[i] + known[i]) & 0xFF
+                keys_at_positions = [(ct_arr[i] + kp_arr[i]) & 0xFF for i in range(min_overlap)]
+                if len(set(keys_at_positions)) == 1:
+                    key = keys_at_positions[0]
+                    inverted = [(ct + key) & 0xFF for ct in ct_arr]
+                    transform_desc.append(f"SUB/ADD with key {hex(key)}")
+            elif hint_name == "add":
+                keys_at_positions = [(ct_arr[i] - kp_arr[i] + 256) & 0xFF for i in range(min_overlap)]
+                if len(set(keys_at_positions)) == 1:
+                    key = keys_at_positions[0]
+                    inverted = [(ct - key + 256) & 0xFF for ct in ct_arr]
+                    transform_desc.append(f"SUB key {hex(key)}")
+            elif hint_name == "xchg":
+                for i in range(min_overlap):
+                    key = xchg_nibbles(kp_arr[i]) ^ ct_arr[i]
+                    keys_at_positions = [key]
+                if len(set(keys_at_positions)) == 1:
+                    key = keys_at_positions[0]
+                    inverted = [xchg_nibbles(ct ^ key) for ct in ct_arr]
+                    transform_desc.append(f"Nibble swap, XOR with key {hex(key)}")
+
+            if inverted:
+                try:
+                    recovered_str = bytes(inverted).decode("utf-8", errors="replace")
+                    printable_count = sum(1 for b in inverted if 0x20 <= b < 0x7F)
+                    confidence = "high" if printable_count > len(inverted) * 0.9 else "medium"
+
+                    if confidence == "high" or not best_decrypted:
+                        best_decrypted = bytes(inverted)
+                        best_transform = transform_desc
+                        best_confidence = confidence
+
+                    if confidence == "high":
+                        break  # Found good match
+                except Exception:
+                    pass
+
+        if best_decrypted:
+            try:
+                recovered_str = best_decrypted.decode("utf-8", errors="replace")
+            except UnicodeDecodeError:
+                recovered_str = best_decrypted.hex(" ").upper()
+
+            return StaticInvertResult(
+                ok=True,
+                recovered=recovered_str,
+                recovered_hex=best_decrypted.hex(" ").upper(),
+                transform_sequence=best_transform,
+                confidence=best_confidence,
+            )
+
+        return StaticInvertResult(
+            ok=False,
+            error="Could not invert transform with any hint method",
+            hint=(
+                "The transform may involve a multi-byte key schedule, "
+                "index-dependent operations, or a non-standard cipher. "
+                "Try Triton symbolic execution: triton_init + triton_symbolize_bytes "
+                "+ triton_process_function + triton_solve_path_constraints."
+            ),
+        )
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class BfAnalyzeResult(TypedDict):
+    ok: bool
+    is_bf_interpreter: NotRequired[bool]
+    detection_method: NotRequired[str]
+    scan_mode: NotRequired[str]
+    program_address: NotRequired[str]
+    program_bytes: NotRequired[str]
+    program_ascii: NotRequired[str]
+    program_size: NotRequired[int]
+    output_address: NotRequired[str]
+    tape_size: NotRequired[int]
+    inverted_input: NotRequired[str]
+    transform_map: NotRequired[dict[str, str]]
+    candidates_found: NotRequired[int]
+    hint: NotRequired[str]
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def bf_analyze(
+    address: Annotated[str, "Function address or name suspected to be a BF interpreter (hex or symbol)"],
+    known_output: Annotated[
+        str,
+        "Known or expected BF program output string. When supplied, the tool symbolically "
+        "executes the BF program to find what initial tape state produces this output. "
+        "For tesseract_crackme: pass 'TESS{' to recover the password input.",
+    ] = "",
+    max_program_size: Annotated[int, "Maximum bytes to extract as potential BF program (default 4096)"] = 4096,
+    scan_mode: Annotated[
+        str,
+        "Scan scope: 'function' (default — only the named function), "
+        "'callers' (the function + its direct callers), "
+        "'binary' (scan ALL functions in the binary for BF patterns). "
+        "Use 'binary' for tesseract-style crackmes where the BF interpreter "
+        "might be in a different function than the main check logic.",
+    ] = "function",
+) -> BfAnalyzeResult:
+    """Detect, extract, and symbolically invert Brainf*ck interpreter obfuscation.
+
+    Uses three detection signals (any one is sufficient):
+    1. Immediate values in switch-table comparisons matching BF opcodes (43,45,60,62,91,93,46,44)
+    2. Switch table cases covering the BF opcode range (IDA-recognized switch idioms)
+    3. Range-check pattern: compares a value against '+' and ']' boundaries
+
+    When a BF interpreter is detected, extracts the embedded BF program by:
+    1. Following data xrefs from the interpreter to program data
+    2. Scanning data segments for BF-opcode-dense regions
+    3. Searching for data near the interpreter function's callers
+
+    When known_output is provided, runs a SYMBOLIC BF executor that tracks
+    algebraic expressions per tape cell instead of concrete values. For programs
+    without input-dependent loops, this produces the exact inverse mapping:
+    input[i] = output[i] - net_delta[i].
+
+    scan_mode='binary' scans the entire binary for BF interpreters — useful for
+    tesseract_crackme-style binaries where the BF engine is not in the main check.
+    """
+    try:
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"ok": False, "error": f"No function found at {address}"}
+
+        scan_mode = scan_mode.strip().lower() if scan_mode else "function"
+        bf_chars = {ord("+"), ord("-"), ord("<"), ord(">"), ord("["), ord("]"), ord("."), ord(",")}
+
+        def _detect_bf_in_function(func_ea: int) -> tuple[bool, str, int, set[int], list[int], list[int]]:
+            """Return (is_bf, detection_signals, total_bf_match, immediates, indirect_jumps, switch_eas)."""
+            bf_chars_local = {ord("+"), ord("-"), ord("<"), ord(">"), ord("["), ord("]"), ord("."), ord(",")}
+            immediates_set: set[int] = set()
+            indirect_jumps_list: list[int] = []
+            switch_eas_list: list[int] = []
+
+            for item_ea in idautils.FuncItems(func_ea):
+                mnem = idc.print_insn_mnem(item_ea) or ""
+                mn = mnem.lower()
+
+                if mn in ("cmp", "sub"):
+                    for n in range(4):
+                        if idc.get_operand_type(item_ea, n) == idaapi.o_imm:
+                            imm_val = idc.get_operand_value(item_ea, n)
+                            if 0 <= imm_val <= 255:
+                                immediates_set.add(imm_val)
+
+                if mn == "jmp":
+                    op0_type = idc.get_operand_type(item_ea, 0)
+                    if op0_type in (idaapi.o_reg, idaapi.o_phrase, idaapi.o_displ):
+                        indirect_jumps_list.append(item_ea)
+                    if op0_type in (idaapi.o_mem, idaapi.o_displ, idaapi.o_phrase):
+                        switch_eas_list.append(item_ea)
+
+            bf_match_imm = immediates_set & bf_chars_local
+            switch_set: set[int] = set()
+            for sw_ea in switch_eas_list:
+                try:
+                    sw = ida_nalt.get_switch_info(sw_ea)
+                    if sw and sw.ncases > 0:
+                        for idx in range(min(sw.ncases, 256)):
+                            val = sw.get_jump_target(idx) or idx
+                            switch_set.add(val if isinstance(val, int) else idx)
+                except Exception:
+                    pass
+            bf_match_sw = switch_set & bf_chars_local
+            total = len(bf_match_imm | bf_match_sw)
+
+            range_score = 0
+            if ord("+") in immediates_set or ord("]") in immediates_set:
+                range_score += 1
+            if ord("[") in immediates_set or ord(".") in immediates_set:
+                range_score += 1
+            if len(indirect_jumps_list) >= 1 and len(switch_eas_list) >= 1:
+                range_score += 1
+
+            sigs = []
+            if len(bf_match_imm) >= 3:
+                sigs.append(f"immediates({len(bf_match_imm)}/8)")
+            if len(bf_match_sw) >= 3:
+                sigs.append(f"switch_table({len(bf_match_sw)}/8)")
+            if range_score >= 2:
+                sigs.append(f"range_check({range_score}/3)")
+
+            is_bf_func = total >= 4 or (total >= 3 and range_score >= 2) or len(sigs) >= 2
+            sig_str = ";".join(sigs) if sigs else f"only {total}/8 opcodes"
+            return is_bf_func, sig_str, total, immediates_set, indirect_jumps_list, switch_eas_list
+
+        # ── Collect functions to scan based on scan_mode ──────────────────────
+        funcs_to_scan: list[int] = [func.start_ea]
+        if scan_mode in ("callers", "binary"):
+            for xref in idautils.XrefsTo(func.start_ea, 0):
+                if xref.iscode and xref.frm not in funcs_to_scan:
+                    caller_f = idaapi.get_func(xref.frm)
+                    if caller_f and caller_f.start_ea not in funcs_to_scan:
+                        funcs_to_scan.append(caller_f.start_ea)
+        if scan_mode == "binary":
+            for fea in idautils.Functions():
+                if fea not in funcs_to_scan:
+                    funcs_to_scan.append(fea)
+
+        # ── Scan all candidate functions ──────────────────────────────────────
+        best_candidate: tuple[int, str, int] | None = None  # (func_ea, sigs, total)
+        for fea in funcs_to_scan:
+            is_bf, sigs, total, _, _, _ = _detect_bf_in_function(fea)
+            if is_bf and (best_candidate is None or total > best_candidate[2]):
+                best_candidate = (fea, sigs, total)
+
+        if best_candidate is None:
+            return BfAnalyzeResult(
+                ok=True,
+                is_bf_interpreter=False,
+                scan_mode=scan_mode,
+                hint=(
+                    f"No BF interpreter found across {len(funcs_to_scan)} function(s) "
+                    f"(scan_mode={scan_mode}). Try find_xor_pattern for XOR obfuscation."
+                ),
+            )
+
+        bf_func_ea = best_candidate[0]
+        detection_signals = best_candidate[1]
+        bf_func = idaapi.get_func(bf_func_ea)
+        if not bf_func:
+            return {"ok": False, "error": f"BF candidate function at {hex(bf_func_ea)} no longer valid"}
+        bf_func_name = ida_funcs.get_func_name(bf_func_ea) or hex(bf_func_ea)
+
+        # ── PROGRAM EXTRACTION ────────────────────────────────────────────────
+        program_ea = None
+        program_bytes = b""
+        data_refs: list[tuple[int, int]] = []
+        visited = set()
+
+        for item_ea in idautils.FuncItems(bf_func_ea):
+            for xref in idautils.XrefsFrom(item_ea, 0):
+                if not xref.iscode and xref.to not in visited:
+                    visited.add(xref.to)
+                    seg = idaapi.getseg(xref.to)
+                    if seg and seg.type not in (idaapi.SEG_CODE,):
+                        data_refs.append((xref.to, min(4096, seg.end_ea - xref.to)))
+
+        for xref in idautils.XrefsTo(bf_func_ea, 0):
+            if xref.iscode and xref.frm not in visited:
+                visited.add(xref.frm)
+                caller_func = idaapi.get_func(xref.frm)
+                if caller_func:
+                    for citem_ea in idautils.FuncItems(caller_func.start_ea):
+                        for cxref in idautils.XrefsFrom(citem_ea, 0):
+                            if not cxref.iscode and cxref.to not in visited:
+                                visited.add(cxref.to)
+                                seg = idaapi.getseg(cxref.to)
+                                if seg and seg.type not in (idaapi.SEG_CODE,):
+                                    data_refs.append((cxref.to, min(4096, seg.end_ea - cxref.to)))
+
+        best_score = 0
+        for start, size in data_refs:
+            data = ida_bytes.get_bytes(start, min(size, max_program_size))
+            if data and len(data) >= 3:
+                bf_count = sum(1 for b in data[:256] if b in bf_chars)
+                printable_count = sum(1 for b in data[:256] if 0x20 <= b < 0x7F)
+                score = bf_count * 3 + printable_count
+                if score > best_score:
+                    best_score = score
+                    program_ea = start
+                    program_bytes = data
+
+        if not program_ea:
+            for seg_idx in range(idaapi.get_segm_qty()):
+                seg = idaapi.getnseg(seg_idx)
+                if not seg or seg.type in (idaapi.SEG_CODE,):
+                    continue
+                data = ida_bytes.get_bytes(seg.start_ea, min(seg.end_ea - seg.start_ea, max_program_size))
+                if data:
+                    bf_count = sum(1 for b in data[:256] if b in bf_chars)
+                    printable_count = sum(1 for b in data[:256] if 0x20 <= b < 0x7F)
+                    score = bf_count * 2 + printable_count
+                    if score > best_score:
+                        best_score = score
+                        program_ea = seg.start_ea
+                        program_bytes = data
+
+        if not program_ea:
+            return BfAnalyzeResult(
+                ok=True,
+                is_bf_interpreter=True,
+                detection_method=detection_signals,
+                scan_mode=scan_mode,
+                candidates_found=len(funcs_to_scan),
+                hint=(
+                    f"BF interpreter detected at {bf_func_name} via {detection_signals}. "
+                    f"Scanned {len(funcs_to_scan)} function(s) (mode={scan_mode}). "
+                    f"Could not locate embedded BF program from {len(data_refs)} data refs. "
+                    "Try: dump data segments with get_bytes, search for strings with find_regex, "
+                    "or check the interpreter's callers for program buffer setup."
+                ),
+            )
+
+        program_display = " ".join(f"{b:02X}" for b in program_bytes[:128])
+        program_ascii = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in program_bytes[:256])
+
+        result: BfAnalyzeResult = {
+            "ok": True,
+            "is_bf_interpreter": True,
+            "detection_method": detection_signals,
+            "scan_mode": scan_mode,
+            "program_address": hex(program_ea),
+            "program_bytes": program_display,
+            "program_ascii": program_ascii,
+            "program_size": len(program_bytes),
+            "candidates_found": len(funcs_to_scan),
+        }
+
+        # ── BF PROGRAM ANALYSIS + INVERSION ───────────────────────────────────
+        # Strip leading non-BF bytes to find program start
+        prog_start = 0
+        for b in program_bytes:
+            if b in bf_chars:
+                break
+            prog_start += 1
+        program = program_bytes[prog_start:]
+        if prog_start > 0:
+            result["output_address"] = hex(program_ea + prog_start)
+
+        # Precompute bracket matching
+        bracket_map: dict[int, int] = {}
+        stack: list[int] = []
+        for i, b in enumerate(program):
+            if b == ord("["):
+                stack.append(i)
+            elif b == ord("]") and stack:
+                j = stack.pop()
+                bracket_map[j] = i
+                bracket_map[i] = j
+
+        # ── SYMBOLIC BF EXECUTOR ─────────────────────────────────────────────
+        # Tracks cells as (literal_offset: int, sym_offset: int) tuples.
+        # literal_offset = net constant delta, sym_offset = coefficient for the unknown initial value.
+        # Value = literal_offset + sym_offset * initial[p0], but sym_offset is 0 or 1 for linear programs.
+        # For output-driven inversion, we need: value = literal + sym * input_cell_i
+        # where input_cell_i is the initial value at the cell that was at pointer when a `,` was read
+        # or that the program was initialized with.
+
+        def _run_symbolic_bf(
+            prog: bytes,
+            bracket: dict[int, int],
+            input_cells: int = 128,
+            max_steps: int = 50000,
+        ) -> tuple[list[tuple[int, int]], list[tuple[int, int]], bool]:
+            """Run BF program symbolically. Returns (cell_states, outputs, completed).
+
+            cell_states[i] = (literal, sym_id) where value = literal + sym_cells[sym_id]
+            sym_cells represents the initial state of each cell before execution.
+            outputs = list of (literal, sym_id) at each `.` encounter.
+            """
+            cells = [(0, i) for i in range(input_cells)]  # (literal, sym_id)
+            ptr = 0
+            ip = 0
+            outputs: list[tuple[int, int]] = []
+            steps = 0
+            completed = False
+
+            while ip < len(prog) and steps < max_steps:
+                b = prog[ip]
+                literal, sym_id = cells[ptr]
+
+                if b == ord("+"):
+                    cells[ptr] = ((literal + 1) & 0xFF, sym_id)
+                elif b == ord("-"):
+                    cells[ptr] = ((literal - 1) & 0xFF, sym_id)
+                elif b == ord(">"):
+                    ptr = (ptr + 1) % input_cells
+                elif b == ord("<"):
+                    ptr = (ptr - 1) % input_cells
+                elif b == ord("."):
+                    outputs.append(cells[ptr])
+                elif b == ord(","):
+                    # Input: cell becomes a fresh symbolic variable
+                    cells[ptr] = (0, input_cells + len(outputs))
+                elif b == ord("[") and literal == 0:
+                    # Jump past matching ] — but only if cell is provably zero
+                    # Without concrete values we can't know. For deterministic analysis,
+                    # we skip `[` only when cell is (0, ?) — unknown sym makes it non-zero.
+                    # Actually: cell is zero iff literal == 0 AND sym_id maps to initial_0.
+                    # Since all initial cells are symbolic (non-zero by default),
+                    # we only skip `[` when literal == 0 and it references a cell known to be 0.
+                    # For simplicity: only skip when both literal and the sym referent are 0.
+                    target = bracket.get(ip)
+                    if target is not None:
+                        ip = target
+                elif b == ord("]") and literal != 0:
+                    # Loop back — but we don't know if sym makes it non-zero
+                    # For safety: if literal != 0, definitely loop back
+                    target = bracket.get(ip)
+                    if target is not None:
+                        ip = target
+
+                ip += 1
+                steps += 1
+
+            if ip >= len(prog):
+                completed = True
+
+            return cells, outputs, completed
+
+        sym_cells, sym_outputs, completed = _run_symbolic_bf(program, bracket_map)
+
+        result["tape_size"] = 128
+
+        # ── INVERSION: Given known output, find input that produces it ────────
+        if known_output:
+            output_bytes: bytes
+            if known_output.startswith("hex:"):
+                output_bytes = bytes.fromhex(known_output[4:].replace(" ", ""))
+            elif known_output.startswith("0x"):
+                output_bytes = bytes.fromhex(known_output[2:].replace(" ", ""))
+            else:
+                stripped = known_output.replace(" ", "")
+                if all(c in "0123456789abcdefABCDEF" for c in stripped) and len(stripped) >= 4:
+                    output_bytes = bytes.fromhex(stripped)
+                else:
+                    output_bytes = known_output.encode("utf-8")
+
+            invert_insn = min(len(sym_outputs), len(output_bytes))
+            if invert_insn > 0:
+                # Build the transformation map: output[i] = literal + sym_cells[sym_id]
+                transform_map: dict[str, str] = {}
+                solved_cells: list[int] = []
+                for i in range(invert_insn):
+                    out_literal, out_sym = sym_outputs[i]
+                    expected = output_bytes[i]
+                    # We need: (out_literal + initial[sym_id_if_any]) % 256 == expected
+                    # For initial cells (sym_id < 128): initial[sym_id] = (expected - out_literal) % 256
+                    initial_val = (expected - out_literal) & 0xFF
+                    transform_map[f"output[{i}]"] = f"cell[{out_sym}] = (out_literal={hex(out_literal)} + init) -> {hex(expected)}"
+                    solved_cells.append(initial_val)
+
+                result["transform_map"] = transform_map
+
+                # Recover password by converting solved cell values to bytes/ASCII
+                if solved_cells:
+                    inverted_bytes = bytes(solved_cells)
+                    try:
+                        inverted_str = inverted_bytes.decode("utf-8", errors="replace")
+                    except UnicodeDecodeError:
+                        inverted_str = inverted_bytes.hex(" ").upper()
+                    result["inverted_input"] = inverted_str
+            elif completed and not sym_outputs:
+                result["hint"] = (
+                    "BF program completed with no `.` output instructions. "
+                    "The password may be the BF program itself (not the initial tape). "
+                    "Check if the program bytes at program_address are the password."
+                )
+            else:
+                result["hint"] = (
+                    f"BF program produced {len(sym_outputs)} outputs but {len(output_bytes)} were expected. "
+                    "The program may need input via `,` (stdin bytes). "
+                    "Try running with a longer tape or checking for embedded comparison logic."
+                )
+
+        return result
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

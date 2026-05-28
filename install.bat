@@ -277,6 +277,29 @@ if "!ANY_INSTALLED!"=="N" (
     )
 )
 
+:: --- TOON server-side encoding (separate from IDA-side engines) ---------------
+echo.
+echo [4b/5] Server-side token compression
+echo -------------------------------------------------------
+echo toon_format auto-compresses large list responses from tools like
+echo lief_exports, list_functions_enhanced, find_function_prologues, and
+echo get_bulk_function_hashes — ~40%% fewer tokens on qualifying calls.
+echo This installs into the MCP server's Python (NOT IDA's Python).
+echo.
+set /p TOON_CHOICE="Install toon_format (TOON response compression)?  [Y/N] (default N): "
+if /i "!TOON_CHOICE!"=="" set TOON_CHOICE=N
+if /i "!TOON_CHOICE!"=="Y" (
+    echo Installing toon_format...
+    pip install toon_format >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARNING] toon_format install failed. Run manually: pip install toon_format
+    ) else (
+        echo   [OK] toon_format installed — large list responses will be auto-compressed.
+    )
+) else (
+    echo   [SKIP] toon_format skipped. Run later: pip install toon_format
+)
+
 :: --- Show MCP config to paste ------------------------------------------------
 echo.
 echo [5/5] MCP Client Configuration
@@ -324,4 +347,7 @@ echo   ida-pro-mcp --install-deps lief
 echo   ida-pro-mcp --install-deps yara
 echo   ida-pro-mcp --install-deps networkx
 echo   pip install angr construct dissect.cstruct filetype
+echo.
+echo To enable server-side TOON response compression later:
+echo   pip install toon_format
 pause

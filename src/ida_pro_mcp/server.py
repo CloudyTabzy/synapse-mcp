@@ -1,4 +1,5 @@
 import argparse
+import copy
 import http.client
 import json
 import os
@@ -11,6 +12,12 @@ import traceback
 from collections import OrderedDict
 from typing import Annotated, TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, urlparse
+
+try:
+    from toon_format import encode as _toon_encode
+    _TOON_AVAILABLE = True
+except ImportError:
+    _TOON_AVAILABLE = False
 
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import (
@@ -61,6 +68,17 @@ except ImportError:
         sys.path.pop(0)
 
 try:
+    from .ida_mcp.cross_ref import run_compare_instances, run_invoke_on_instance
+except ImportError:
+    try:
+        from ida_mcp.cross_ref import run_compare_instances, run_invoke_on_instance
+    except ImportError:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
+        from cross_ref import run_compare_instances, run_invoke_on_instance
+
+        sys.path.pop(0)
+
+try:
     from .ida_mcp.rpc import MCP_SERVER_NAME, get_tool_group
 except ImportError:
     try:
@@ -97,7 +115,52 @@ IDA_PORT = DEFAULT_IDA_PORT
 mcp = McpServer(MCP_SERVER_NAME)
 dispatch_original = mcp.registry.dispatch
 
-LOCAL_TOOLS = {"list_instances", "select_instance"}
+LOCAL_TOOLS = {"list_instances", "select_instance", "invoke_on_instance", "compare_instances"}
+
+# ---------------------------------------------------------------------------
+# Backward-compat argument aliases
+# Applied before every tools/call proxy so old agent prompts keep working
+# after parameter renames. Maps old_name → new_name.
+# ---------------------------------------------------------------------------
+# Global aliases applied to every tool call.
+# Most tools use `address` (singular) and `addrs` (plural) as canonical names.
+# Per-tool overrides below handle the two outliers (decompile, disasm) that use `addr`,
+# and the two tools (decompile_batch, triton_replay_instructions) that use `addresses`.
+_GLOBAL_ARG_ALIASES: dict[str, str] = {
+    "addr":        "address",   # address is canonical for the majority of tools
+    "addresses":   "addrs",     # addrs is canonical for most plural-address tools
+    "max_results": "limit",     # recon tools renamed to limit
+    "max_entries": "limit",     # dump_vtable renamed to limit
+}
+# Per-tool aliases applied only when that specific tool is being called.
+# Global addr→address fires first; these per-tool entries then convert back for the
+# two analysis tools whose actual parameter is named `addr` / `addresses`.
+_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "search_text":                {"start": "cursor"},    # cursor matches the response field name
+    "decompile":                  {"address": "addr"},    # decompile's param is addr, not address
+    "disasm":                     {"address": "addr"},    # disasm's param is addr, not address
+    "decompile_batch":            {"addrs": "addresses"}, # decompile_batch uses addresses (plural)
+    "triton_replay_instructions": {"addrs": "addresses"}, # triton_replay_instructions uses addresses
+}
+
+
+def _normalize_tool_args(tool_name: str, args: dict) -> dict:
+    """Rewrite deprecated/variant arg names to their canonical equivalents.
+
+    Never drops unrecognised keys — only renames known aliases so a call with
+    both the old and new name keeps whichever value was supplied last (new wins
+    because global aliases are applied first, then per-tool aliases).
+    """
+    if not args:
+        return args
+    result = dict(args)
+    for old, new in _GLOBAL_ARG_ALIASES.items():
+        if old in result and new not in result:
+            result[new] = result.pop(old)
+    for old, new in _TOOL_ARG_ALIASES.get(tool_name, {}).items():
+        if old in result and new not in result:
+            result[new] = result.pop(old)
+    return result
 LAZY_TOOLS = {"list_modules", "list_tools", "describe_tool", "invoke_tool"}
 LAZY_MODE = False
 
@@ -346,6 +409,7 @@ _CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "list_funcs", "func_query", "list_globals", "entity_query",
     "imports", "imports_query", "idb_save", "find_regex", "search_text",
     "read_mcp_output", "list_instances", "select_instance", "get_active_instance",
+    "invoke_on_instance", "compare_instances",
     "task_submit", "task_cancel", "task_list", "task_poll",
     "idalib_open", "idalib_close", "idalib_switch", "idalib_unbind",
     "idalib_list", "idalib_current", "idalib_save", "idalib_health", "idalib_warmup",
@@ -361,6 +425,74 @@ def _proxy_to_ida(payload: bytes | str | dict) -> dict:
     """Send a JSON-RPC request to the active IDA instance and return the response."""
     host, port = _get_active_ida_target()
     return _proxy_to_instance(host, port, payload)
+
+
+# ---------------------------------------------------------------------------
+# TOON response post-processor
+# Auto-encodes tool results that contain large uniform flat arrays into the
+# compact TOON tabular format, reducing agent context usage by ~40%.
+# Requires: pip install toon_format  (optional — falls back silently)
+# ---------------------------------------------------------------------------
+
+_TOON_MIN_ROWS = 20  # minimum array length to trigger tabular encoding
+
+
+def _is_uniform_flat_array(lst: list) -> bool:
+    """True when every item is a dict with the same keys and all-primitive values."""
+    if not lst or not isinstance(lst[0], dict):
+        return False
+    first_keys = set(lst[0].keys())
+    if not first_keys:
+        return False
+    _primitive = (str, int, float, bool, type(None))
+    for item in lst:
+        if not isinstance(item, dict):
+            return False
+        if set(item.keys()) != first_keys:
+            return False
+        if not all(isinstance(v, _primitive) for v in item.values()):
+            return False
+    return True
+
+
+def _response_qualifies_for_toon(data: dict) -> bool:
+    """True when the response dict contains at least one large uniform flat array."""
+    for v in data.values():
+        if isinstance(v, list) and len(v) >= _TOON_MIN_ROWS and _is_uniform_flat_array(v):
+            return True
+    return False
+
+
+def _maybe_toon_encode_response(response: dict | None) -> dict | None:
+    """TOON-encode the text content of a tools/call JSON-RPC response.
+
+    Only fires when:
+    - toon_format is installed
+    - Response carries a successful (ok: true) tool result
+    - That result contains at least one array of >=20 uniform flat objects
+
+    Falls back to the original response on any error, including import errors.
+    """
+    if not _TOON_AVAILABLE or response is None:
+        return response
+    try:
+        content_list = response.get("result", {}).get("content", [])
+        if not content_list or content_list[0].get("type") != "text":
+            return response
+        text = content_list[0].get("text", "")
+        data = json.loads(text)
+        if not isinstance(data, dict) or not data.get("ok"):
+            return response
+        if not _response_qualifies_for_toon(data):
+            return response
+        # Prepend _format hint so agents immediately know the encoding.
+        annotated = {"_format": "TOON_TABULAR", **data}
+        toon_text = _toon_encode(annotated)
+        encoded = copy.deepcopy(response)
+        encoded["result"]["content"][0]["text"] = toon_text
+        return encoded
+    except Exception:
+        return response
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -429,8 +561,20 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     tool_name = request_obj.get("params", {}).get("name", "<unknown>")
     shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
 
+    # Normalize deprecated/variant argument names before forwarding.
+    if request_obj.get("method") == "tools/call":
+        raw_args = request_obj.get("params", {}).get("arguments", {})
+        normalized = _normalize_tool_args(tool_name, raw_args)
+        if normalized is not raw_args:
+            request_obj = copy.deepcopy(request_obj)
+            request_obj["params"]["arguments"] = normalized
+            request = request_obj
+
     try:
-        return _proxy_to_ida(request)
+        result = _proxy_to_ida(request)
+        if request_obj.get("method") == "tools/call":
+            result = _maybe_toon_encode_response(result)
+        return result
 
     except (TimeoutError, socket.timeout) as e:
         # IDA is reachable but not responding — main thread is almost certainly blocked.
@@ -630,6 +774,64 @@ def select_instance(
         return {"success": False, "error": f"Instance at {host}:{port} is not reachable"}
     _set_active_ida_target(host, port)
     return {"success": True, "host": host, "port": port}
+
+
+@mcp.tool
+def invoke_on_instance(
+    instance: Annotated[
+        str,
+        "Target instance: a binary name like 'Engine.dll' (case-insensitive, "
+        "stable across restarts) or a port number. Use list_instances to see options.",
+    ],
+    tool: Annotated[str, "Name of the analysis tool to run on that instance (e.g. 'lief_exports', 'decompile')."],
+    args: Annotated[
+        dict | None,
+        "Tool arguments as a flat dict, exactly as you would pass to the tool directly. "
+        "CORRECT: invoke_on_instance(instance='Engine.dll', tool='decompile', args={'address': 'main'}).",
+    ] = None,
+) -> dict:
+    """Run a single tool against one specific IDA instance without changing the active session target.
+
+    Unlike select_instance (which redirects ALL later calls), this is a stateless one-off:
+    it targets the named instance for this call only. Ideal for pulling the same datum from
+    a second binary to verify a finding, without losing your current instance context.
+
+    Returns {ok, instance, host, port, result} on success, or a structured error with
+    error_type ('no_instances' | 'binary_not_found' | 'port_not_found' | 'ambiguous' |
+    'unreachable' | 'tool_error' | 'proxy_error') and the list of available instances.
+    """
+    return run_invoke_on_instance(_proxy_to_instance, instance, tool, args)
+
+
+@mcp.tool
+def compare_instances(
+    tool: Annotated[str, "Name of the analysis tool to run on every targeted instance (e.g. 'lief_info', 'get_function_hash')."],
+    args: Annotated[
+        dict | None,
+        "Tool arguments as a flat dict, applied identically to each instance.",
+    ] = None,
+    instances: Annotated[
+        list[str] | None,
+        "Instances to target, each a binary name or port. Omit to fan out to ALL "
+        "currently registered instances.",
+    ] = None,
+) -> dict:
+    """Run the same tool across two or more IDA instances and return labeled, side-by-side results.
+
+    IMPORTANT — ok semantics: the top-level 'ok: true' means AT LEAST ONE instance succeeded,
+    NOT that all did. Always check each entry's individual 'ok' field in the 'results' list
+    before acting on any entry's data. Partial success (some ok, some failed) is normal and
+    expected when instances have different binary layouts or different analysis state.
+
+    This is the primary cross-reference primitive: compare or verify the same query across
+    multiple open binaries in one call (e.g. diff exports between Engine.dll and a patched
+    variant, confirm function hashes match across builds, or cross-check vtable layouts).
+
+    Returns {ok, tool, count, success_count, fail_count, results}, where each entry in
+    'results' is {instance, host, port, ok, result|error, error_type}. Per-instance failures
+    do not abort the others. Omit 'instances' to fan out to ALL registered instances.
+    """
+    return run_compare_instances(_proxy_to_instance, tool, args, instances)
 
 
 # ============================================================================
@@ -1017,6 +1219,18 @@ def main():
     elif args.no_lazy:
         LAZY_MODE = False
         print("[MCP] Normal mode forced — exposing all tools upfront", file=sys.stderr)
+
+    if _TOON_AVAILABLE:
+        print(
+            f"[MCP] TOON encoding active — uniform arrays ≥{_TOON_MIN_ROWS} rows "
+            "auto-compressed in tool responses",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[MCP] TOON encoding inactive (pip install toon_format to enable ~40% token savings)",
+            file=sys.stderr,
+        )
 
     # Resolve IDA RPC target (explicit or auto-discovery)
     _resolve_ida_rpc(args)

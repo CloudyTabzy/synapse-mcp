@@ -63,6 +63,51 @@ Lazy mode is the default we recommend for Claude, Roo, Cursor, and any client wh
 
 ---
 
+## ⚡ TOON Encoding — 40% Fewer Tokens on Large Responses
+
+Lazy mode controls how many tool *schemas* reach the agent at session start. But when a tool actually fires, the *data it returns* is the next bottleneck. The export table of a mid-sized PE binary — 500 entries, six fields each — arrives as a wall of repeated JSON keys, braces, and quotation marks. That is 60,000–120,000 tokens of syntax noise handed to the agent before it has processed a single finding.
+
+**Synapse MCP auto-compresses qualifying tool responses using [TOON](https://github.com/toon-format/spec)** (Token-Oriented Object Notation), a compact encoding designed specifically for LLM input. Uniform arrays of objects collapse into CSV-style tabular rows: keys declared once in a header, pure data in every row thereafter. No repetition, no structural overhead.
+
+```
+# JSON — ~2,000 tokens for 50 exports
+{"ok": true, "exports": [{"name": "Init", "ordinal": 1, "address": "0x1000", "is_forwarded": false, "forwarded_to": null}, {"name": "Render", ...}, ...]}
+
+# TOON — ~1,200 tokens for the same data (−40%)
+_format: TOON_TABULAR
+ok: true
+exports[50]{name,ordinal,address,is_forwarded,forwarded_to}:
+  Init,1,0x1000,false,null
+  Render,2,0x2000,false,null
+  ...
+total_exports: 50
+```
+
+The `_format: TOON_TABULAR` marker is always the first line — agents know the encoding immediately and can parse accordingly. The `[50]` length count and `{fields}` header give models an explicit schema to validate against, which [benchmarks across four LLMs](https://github.com/toon-format/toon) show reduces hallucinated aggregation errors while cutting token usage by ~40%.
+
+**Zero configuration.** No flags, no per-tool parameters, no schema changes. Install `toon_format` in the MCP server's Python environment and the proxy post-processor engages automatically. The eligibility check is structural: any `ok: true` tool response containing a uniform flat array of ≥ 20 objects triggers TOON encoding. Everything else — nested structures, small lists, error responses — passes through as plain JSON unchanged.
+
+**Tools that benefit most:**
+
+| Tool | Typical array size | Token saving |
+|------|--------------------|-------------|
+| `list_functions_enhanced` | 100 – 50,000 | ~50% |
+| `get_bulk_function_hashes` | 100 – 5,000 | ~50% |
+| `find_function_prologues` | 50 – 5,000 | ~50% |
+| `lief_exports` | 50 – 2,000 | ~40% |
+| `find_indirect_calls` | 10 – 500 | ~35% |
+| `find_global_writers` | 10 – 200 | ~35% |
+
+```bash
+pip install toon_format
+```
+
+On startup the server logs `[MCP] TOON encoding active — uniform arrays ≥20 rows auto-compressed` when the package is present, and quietly tells you what to run if it is not.
+
+> **Note:** TOON encoding runs in the proxy layer (`ida-pro-mcp`). It requires no changes to the IDA plugin and no changes to any tool. It is a server-side concern only.
+
+---
+
 ## 🚀 Quick Start
 
 ### Windows

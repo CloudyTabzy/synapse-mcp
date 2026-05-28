@@ -37,6 +37,10 @@ angr     = ["angr>=9.2"]
 # NetworkX: small (~1.5 MB), pure-Python, ubiquitously useful for graph analysis.
 # Included in 'all'.
 networkx = ["networkx>=3.0"]
+# TOON: server-side token-efficient encoding for large list tool responses.
+# Installed into the MCP server's Python (not IDA's Python).
+# Install: pip install toon_format  OR  uv add toon_format
+toon     = ["toon_format>=0.9.0"]
 all      = [
     "triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0",
     "construct>=2.10.68",

@@ -1388,7 +1388,7 @@ def _all_segments() -> list[tuple[int, int]]:
 def search_text(
     pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
     limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
-    start: Annotated[str, "Cursor: address to resume from (hex or symbol). Empty = first segment."] = "",
+    cursor: Annotated[str, "Resume address: hex or symbol returned by the previous call's cursor field. Empty = start from first segment."] = "",
     regex: Annotated[bool, "Treat pattern as a regex (uses IDA's SEARCH_REGEX)"] = False,
     case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
@@ -1440,11 +1440,11 @@ def search_text(
     if not segments:
         return {"n": 0, "hits": [], "cursor": {"done": True}}
 
-    if start:
+    if cursor:
         try:
-            cursor_ea = parse_address(start)
+            cursor_ea = parse_address(cursor)
         except Exception as e:
-            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid start: {e}"}
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid cursor: {e}"}
     else:
         cursor_ea = segments[0][0]
 

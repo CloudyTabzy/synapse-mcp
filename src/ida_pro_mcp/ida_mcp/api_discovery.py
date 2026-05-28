@@ -14,6 +14,7 @@ from typing import Annotated, NotRequired, TypedDict
 from .rpc import tool, MCP_SERVER
 from .zeromcp import EXTERNAL_BASE_HEADER, get_current_request_external_base_url
 from .discovery import discover_instances, probe_instance
+from .cross_ref import run_compare_instances, run_invoke_on_instance
 
 
 class InstanceSelectionResult(TypedDict, total=False):
@@ -59,7 +60,13 @@ _redirect_targets: dict[str, tuple[str, int]] = {}
 _redirect_lock = threading.Lock()
 
 # Tools that are always handled locally, never proxied
-_LOCAL_TOOL_NAMES = {"list_instances", "select_instance", "get_active_instance"}
+_LOCAL_TOOL_NAMES = {
+    "list_instances",
+    "select_instance",
+    "get_active_instance",
+    "invoke_on_instance",
+    "compare_instances",
+}
 
 
 def set_local_instance(host: str, port: int):
@@ -422,5 +429,63 @@ def get_active_instance() -> ActiveInstanceResult:
         "is_local": is_local,
         "reachable": probe_instance(host, port),
     }
+
+
+@tool
+def invoke_on_instance(
+    instance: Annotated[
+        str,
+        "Target instance: a binary name like 'Engine.dll' (case-insensitive, "
+        "stable across restarts) or a port number. Use list_instances to see options.",
+    ],
+    tool: Annotated[str, "Name of the analysis tool to run on that instance (e.g. 'lief_exports', 'decompile')."],
+    args: Annotated[
+        dict | None,
+        "Tool arguments as a flat dict, exactly as you would pass to the tool directly. "
+        "CORRECT: invoke_on_instance(instance='Engine.dll', tool='decompile', args={'address': 'main'}).",
+    ] = None,
+) -> dict:
+    """Run a single tool against one specific IDA instance without changing the active session target.
+
+    Unlike select_instance (which redirects ALL later calls), this is a stateless one-off:
+    it targets the named instance for this call only. Ideal for pulling the same datum from
+    a second binary to verify a finding, without losing your current instance context.
+
+    Returns {ok, instance, host, port, result} on success, or a structured error with
+    error_type ('no_instances' | 'binary_not_found' | 'port_not_found' | 'ambiguous' |
+    'unreachable' | 'tool_error' | 'proxy_error') and the list of available instances.
+    """
+    return run_invoke_on_instance(proxy_to_instance, instance, tool, args)
+
+
+@tool
+def compare_instances(
+    tool: Annotated[str, "Name of the analysis tool to run on every targeted instance (e.g. 'lief_info', 'get_function_hash')."],
+    args: Annotated[
+        dict | None,
+        "Tool arguments as a flat dict, applied identically to each instance.",
+    ] = None,
+    instances: Annotated[
+        list[str] | None,
+        "Instances to target, each a binary name or port. Omit to fan out to ALL "
+        "currently registered instances.",
+    ] = None,
+) -> dict:
+    """Run the same tool across two or more IDA instances and return labeled, side-by-side results.
+
+    IMPORTANT — ok semantics: the top-level 'ok: true' means AT LEAST ONE instance succeeded,
+    NOT that all did. Always check each entry's individual 'ok' field in the 'results' list
+    before acting on any entry's data. Partial success (some ok, some failed) is normal and
+    expected when instances have different binary layouts or different analysis state.
+
+    This is the primary cross-reference primitive: compare or verify the same query across
+    multiple open binaries in one call (e.g. diff exports between Engine.dll and a patched
+    variant, confirm function hashes match across builds, or cross-check vtable layouts).
+
+    Returns {ok, tool, count, success_count, fail_count, results}, where each entry in
+    'results' is {instance, host, port, ok, result|error, error_type}. Per-instance failures
+    do not abort the others. Omit 'instances' to fan out to ALL registered instances.
+    """
+    return run_compare_instances(proxy_to_instance, tool, args, instances)
 
 

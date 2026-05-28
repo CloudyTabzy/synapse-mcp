@@ -131,6 +131,27 @@ def my_api(addrs: Annotated[str, "Addresses (0x401000, main) or list"]) -> list[
     ...
 ```
 
+### Canonical parameter names
+
+Use these names consistently. The server proxy normalizes common aliases (e.g. `address`→`addr`, `max_results`→`limit`) for backward compat, but new tools must use the canonical name.
+
+| Concept | Canonical name | Notes |
+|---------|---------------|-------|
+| Single address (hex or symbol) | `addr` | Not `address`, not `ea`, not `func_addr` unless the param is exclusively a function address |
+| List of addresses | `addrs` | Accepts comma-separated string or Python list via `normalize_list_input()` |
+| Address range start | `start` | Pair with `end`; these are address params, not pagination |
+| Address range end | `end` | Exclusive upper bound |
+| Hard cap on results returned | `limit` | Not `max_results`, `max_entries`, or `count` |
+| Paginated list size | `count` | Used in list_*/query tools alongside `offset` |
+| Page start position | `offset` | Not `start` (which is an address), not `skip` |
+| Pagination resume token | `cursor` | Opaque value from previous response; used in `search_text` and streaming tools |
+| Name/glob filter | `filter` | For glob patterns against entity names in core list/query tools |
+| Text/pattern search | `pattern` | For regex, glob, or substring search across content |
+| Binary file path | `file_path` | Not `path`, not `binary_path` |
+| Output file path | `output_path` | Not `out_path`, not `output` |
+
+Aliases accepted by the proxy (old → canonical): `address`→`addr`, `addresses`→`addrs`, `max_results`→`limit`, `max_entries`→`limit`, `search_text.start`→`search_text.cursor`.
+
 ### Common helpers
 - Parse addresses with `parse_address()`
 - Normalize batch input with `normalize_list_input()` / `normalize_dict_list()`
@@ -233,6 +254,8 @@ uv run ida-pro-mcp --install-deps networkx
 pip install angr
 # All at once (excludes angr)
 uv run ida-pro-mcp --install-deps all
+# TOON token-efficient encoding (server-side; install into the MCP server's Python, NOT IDA's)
+pip install toon_format
 ```
 
 ### Verify installation
@@ -338,6 +361,7 @@ Lower priority:
 - `filetype>=1.2.0`: Pure-Python. Magic-byte detection (79+ formats).
 - `yara-python>=4.3.0`: C-extension YARA binding. Built-in crypto and threat rules are embedded as Python string constants — no external `.yar` files needed. The `yara_idb_annotate` killer feature maps matches back to IDA virtual addresses and cannot be replicated by standalone YARA.
 - `networkx>=3.0`: Pure-Python graph algorithms. Powers call-graph centrality (PageRank, betweenness), community detection (Louvain), SCC analysis, shortest paths, dominators, graph diff. The `workflow_reveng_overview` killer feature combines all of these into a one-call structural binary analysis with prioritized recommendations.
+- `toon_format>=0.9.0`: **Server-side only** (install into the MCP server's Python, not IDA's). When present, the proxy post-processor automatically TOON-encodes tool responses that contain a uniform flat array of ≥20 rows, yielding ~40% fewer context tokens. Qualifying tools: `lief_exports`, `list_functions_enhanced`, `get_bulk_function_hashes`, `find_global_writers`, `find_function_prologues`, `find_indirect_calls`, and others returning large flat lists. Encoded responses start with `_format: TOON_TABULAR` so agents immediately know the encoding. Falls back to JSON silently when the response doesn't qualify or when an error occurs.
 - All engines are optional. The plugin loads cleanly without them; only the `*_status` probe tools report `"available": false`.
 
 ### Return-type design principle
