@@ -2636,6 +2636,20 @@ def find_bytes(
     """
     patterns = normalize_list_input(patterns)
 
+    # Coerce dict items — agents sometimes pass {'pattern': '48 8B ...'} instead of
+    # the bare string. Extract from known keys; fall back to the first string value.
+    def _coerce_pattern(p: object) -> str:
+        if isinstance(p, dict):
+            for key in ("pattern", "bytes", "hex", "value", "data"):
+                if key in p and isinstance(p[key], str):
+                    return p[key]
+            for v in p.values():
+                if isinstance(v, str):
+                    return v
+        return p if isinstance(p, str) else str(p)
+
+    patterns = [_coerce_pattern(p) for p in patterns]
+
     # Enforce max limit
     if limit <= 0 or limit > 10000:
         limit = 10000
@@ -3196,7 +3210,7 @@ def insn_query(
         max_scan_insns = _clamp_int(
             pattern.get("max_scan_insns", 200000), 200000, 1, 2_000_000
         )
-        allow_broad = bool(pattern.get("allow_broad", False))
+        allow_broad = bool(pattern.get("allow_broad", True))
         include_fn = bool(pattern.get("include_fn", False))
         include_disasm = bool(pattern.get("include_disasm", False))
 

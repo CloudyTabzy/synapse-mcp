@@ -335,7 +335,7 @@ class InsnPattern(TypedDict, total=False):
     max_scan_insns: Annotated[int, "Max instructions to scan"]
     include_fn: Annotated[bool, "Include function metadata"]
     include_disasm: Annotated[bool, "Include disassembly text"]
-    allow_broad: Annotated[bool, "Allow scopeless scan"]
+    allow_broad: Annotated[bool, "Scan all executable sections when no func/segment/start/end scope is set (default: true)"]
 
 
 class NumberConversion(TypedDict, total=False):
