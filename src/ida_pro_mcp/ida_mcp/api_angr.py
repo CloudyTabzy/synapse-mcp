@@ -97,7 +97,55 @@ except ImportError:
         "Install with: pip install angr"
     )
 
-# Reduce noise from angr's chatty default loggers
+def _patch_claripy_sigint() -> None:
+    """Neutralize claripy's z3 SIGINT handler install/uninstall.
+
+    angr runs inside a daemon thread here, never the main thread. Modern
+    claripy (>=9.2.x, late 2022) already guards ``signal.signal()`` behind a
+    ``threading.main_thread()`` check, so the classic ``ValueError: signal only
+    works in main thread`` does not fire on import or while solving. The
+    residual problem is ``uninstall_sigint_handler()``, which claripy calls
+    unconditionally in its per-call ``condom``/finally block and which can raise
+    an ``AssertionError`` when the matching install was skipped off the main
+    thread (claripy issue #723, observed in embedded hosts like angr-management).
+
+    We replace only the install/uninstall entry points with no-ops and never
+    touch claripy's internal counters. Ctrl+C interruption is handled at the MCP
+    server layer, not inside z3, so dropping the handler costs us nothing here.
+    """
+    try:
+        import claripy.backends.backend_z3 as _bz3
+    except Exception:
+        return
+
+    def _noop(*_a, **_kw):
+        return None
+
+    # Module-level entry points (current names plus legacy underscored ones).
+    for _fname in ("install_sigint_handler", "uninstall_sigint_handler",
+                   "_install_sigint_handler", "_uninstall_sigint_handler"):
+        if callable(getattr(_bz3, _fname, None)):
+            try:
+                setattr(_bz3, _fname, _noop)
+            except Exception:
+                pass
+
+    # Class-level methods, in case a claripy version moved the logic onto the
+    # backend class instead of module functions.
+    for _cls_name in ("BackendZ3", "Backend"):
+        _cls = getattr(_bz3, _cls_name, None)
+        if _cls is None:
+            continue
+        for _mname in ("install_sigint_handler", "uninstall_sigint_handler"):
+            if callable(getattr(_cls, _mname, None)):
+                try:
+                    setattr(_cls, _mname, _noop)
+                except Exception:
+                    pass
+
+
+# Reduce noise from angr's chatty default loggers and neutralize claripy's
+# SIGINT handler so it cannot fault while solving inside our daemon thread.
 if ANGR_AVAILABLE:
     for _noisy in ("angr", "cle", "claripy", "pyvex", "archinfo"):
         try:
@@ -105,60 +153,12 @@ if ANGR_AVAILABLE:
         except Exception:
             pass
 
-    # Work around claripy's fragile SIGINT handler which asserts on uninstall
-    # even when install was skipped (e.g., when SIGINT is SIG_DFL or when
-    # running inside IDA's signal-handling context). angr runs inside a daemon
-    # thread via _run_with_deadline; Ctrl+C interruption is handled at the
-    # MCP server layer, not inside z3.
-    #
-    # Three-layer approach because claripy changed internals across versions:
-    #   1. Replace module-level install/uninstall functions with no-ops.
-    #   2. Reset any integer counter tracking install depth (claripy 9.2+
-    #      uses _handler_depth/_z3_uses; older versions use _installed bool).
-    #   3. Patch BackendZ3 class methods if the logic moved to instance level.
-    _patch_claripy_sigint()
-
-
-def _patch_claripy_sigint() -> None:
-    """Suppress claripy's SIGINT handler install/uninstall in the IDA context."""
+    # A failure here must never take down the whole module. Without this guard
+    # a single patch error makes every angr_* tool silently unavailable.
     try:
-        import claripy.backends.backend_z3 as _bz3
+        _patch_claripy_sigint()
     except Exception:
-        return
-
-    _noop = lambda *a, **kw: None  # noqa: E731
-
-    # Layer 1: patch module-level function names
-    for _fname in ("install_sigint_handler", "uninstall_sigint_handler",
-                   "_install_sigint_handler", "_uninstall_sigint_handler"):
-        if hasattr(_bz3, _fname) and callable(getattr(_bz3, _fname)):
-            try:
-                setattr(_bz3, _fname, _noop)
-            except Exception:
-                pass
-
-    # Layer 2: reset any integer/bool depth counters so a stale counter
-    # (e.g. depth=-1 from a previous crash) can't trigger the assertion.
-    for _cname in ("_handler_depth", "_z3_uses", "_installed",
-                   "_sigint_installed", "_sigint_count"):
-        if hasattr(_bz3, _cname):
-            try:
-                _sentinel = getattr(_bz3, _cname)
-                setattr(_bz3, _cname, 0 if isinstance(_sentinel, int) else False)
-            except Exception:
-                pass
-
-    # Layer 3: patch instance methods on the BackendZ3 class if it exists
-    for _cls_name in ("BackendZ3", "Backend"):
-        _cls = getattr(_bz3, _cls_name, None)
-        if _cls is None:
-            continue
-        for _mname in ("install_sigint_handler", "uninstall_sigint_handler"):
-            if hasattr(_cls, _mname) and callable(getattr(_cls, _mname)):
-                try:
-                    setattr(_cls, _mname, _noop)
-                except Exception:
-                    pass
+        logger.debug("claripy SIGINT patch skipped", exc_info=True)
 
 
 # ============================================================================
@@ -1257,8 +1257,8 @@ if ANGR_AVAILABLE:
                 try:
                     _attempt()
                 except (KeyboardInterrupt, AssertionError) as _sigint_err:
-                    # claripy SIGINT handler assertion fired despite startup patch —
-                    # re-apply three-layer patch and retry once.
+                    # claripy SIGINT handler assertion (#723) fired despite the
+                    # startup patch — re-apply the no-op patch and retry once.
                     logger.warning(
                         "angr_find_paths: %s during explore, re-patching claripy and retrying",
                         type(_sigint_err).__name__,
