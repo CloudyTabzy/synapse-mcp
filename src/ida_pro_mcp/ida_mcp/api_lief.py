@@ -38,11 +38,9 @@ except ImportError:
 
 LIEF_EXTENDED_AVAILABLE = False
 if LIEF_AVAILABLE:
-    try:
-        import lief.dwarf  # noqa: F401 — only in Extended builds
-        LIEF_EXTENDED_AVAILABLE = True
-    except ImportError:
-        pass
+    # lief.dwarf is importable even on the free build (stub module), so
+    # import success is not a reliable indicator. Use the official attribute.
+    LIEF_EXTENDED_AVAILABLE = bool(getattr(_lief, "__extended__", False))
 
 YARA_AVAILABLE = False
 _yara = None  # type: ignore[assignment]
@@ -1218,6 +1216,24 @@ if LIEF_AVAILABLE:
                 result["filter_pattern"] = pattern
             if library_filter:
                 result["library_filter"] = library_filter
+            # Guide agents when a compound filter silently empties the result.
+            if matched == 0 and total > 0:
+                if pattern and library_filter:
+                    result["hint"] = (
+                        f"Pattern '{pattern}' matched 0 functions in library '{library_filter}'. "
+                        f"Try pattern='' to see all {total} imports from that library, "
+                        f"or library_filter='' to search across all {total} imports."
+                    )
+                elif pattern:
+                    result["hint"] = (
+                        f"Pattern '{pattern}' matched 0 of {total} imports. "
+                        "Try a broader pattern or check spelling — matching is case-insensitive substring/glob."
+                    )
+                elif library_filter:
+                    result["hint"] = (
+                        f"library_filter='{library_filter}' matched no libraries. "
+                        "Check the exact library name with library_filter='' to see all imported libraries."
+                    )
             return result
         except Exception as e:
             return {**tool_error(e), "ok": False}
