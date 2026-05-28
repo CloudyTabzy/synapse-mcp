@@ -514,7 +514,9 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         if tool_name in LOCAL_TOOLS:
             return dispatch_original(request)
         if LAZY_MODE and tool_name in LAZY_TOOLS:
-            return dispatch_original(request)
+            # invoke_tool forwards to IDA and returns the inner tool result directly —
+            # run TOON post-processing here so lazy-mode callers also get compression.
+            return _maybe_toon_encode_response(dispatch_original(request))
 
     # Handle tools/list: in lazy mode expose only 4 meta-tools; otherwise merge local + IDA
     if request_obj["method"] == "tools/list":
