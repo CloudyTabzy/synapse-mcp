@@ -981,17 +981,20 @@ def _invoke_tool_async(tool: str, args: dict | None, host: str, port: int) -> ob
 def invoke_tool(
     tool: Annotated[str, "Tool name to invoke (from list_tools or list_modules directory)"],
     args: Annotated[dict | None, "Tool arguments as a flat dict. ALL tool inputs go here — never at the top level alongside 'tool'. CORRECT: invoke_tool(tool='decompile', args={'address': 'main'}). WRONG: invoke_tool(tool='decompile', address='main')."] = None,
-    async_mode: Annotated[bool, "Submit as a background task and poll until done. Use for heavy operations marked with 'Heavy:' in their description (callgraph, analyze_batch, triton_process_function, workflow_*, nx_central_functions, angr_find_paths, yara_idb_annotate, scan_and_define_funcs). Avoids MCP client timeouts. Returns same result shape as a direct call."] = False,
+    async_mode: Annotated[bool, "Submit as a background task and poll until done. ALWAYS use async_mode=True for: angr_find_paths, angr_cfg_fast, angr_backward_slice, angr_cfg_emulated, angr_enumerate_reachable, angr_diff_cfg, hybrid_angr_*. Heavy angr tools WILL timeout the proxy at 180s without this. Safe for any tool — the proxy handles submit+poll automatically.",] = False,
 ) -> object:
     """[lazy-mode] Invoke any IDA tool by name.
 
     Put all tool arguments inside args={...}. Do NOT place tool inputs beside 'tool' at the top level.
       CORRECT:   invoke_tool(tool='decompile', args={'address': 'main'})
-      INCORRECT: invoke_tool(tool='decompile', address='main')  ← args silently empty, call fails
+      INCORRECT: invoke_tool(tool='decompile', address='main')
 
-    For heavy tools (those with 'Heavy:' in their description), pass async_mode=True to avoid
-    MCP client timeouts. The call submits a background task, polls every 2 s, and returns the
-    same result shape when done. Max wait: 300 s.
+    **CRITICAL for angr/heavy tools:** always pass async_mode=True.
+    Heavy tools (angr_find_paths, angr_cfg_fast, angr_backward_slice, etc.) take
+    60-300+ seconds and WILL timeout the synchronous proxy. async_mode submits a
+    background task, polls every 2 s, and returns the identical result when done
+    (max 300 s wait). If you forget async_mode and get a proxy timeout error, the
+    error message will remind you to retry with async_mode=True.
 
     If you know the tool name, call directly without discovery."""
     global _lazy_tools_cache, _lazy_module_cache
@@ -1007,16 +1010,63 @@ def invoke_tool(
 
     host, port = _get_active_ida_target()
 
-    if async_mode:
-        return _invoke_tool_async(tool, args, host, port)
+    # ── Auto-async for known-heavy tools ──────────────────────────────────
+    # Heavy angr operations routinely exceed 60 s on real binaries.
+    # Auto-enabling async_mode prevents the agent from hitting the proxy
+    # timeout, then having to re-read the error, understand async_mode,
+    # and retry — which wastes ~200 s per tool. The agent sees an
+    # `auto_async: true` note in the response so it learns the pattern.
+    _HEAVY_TOOL_PREFIXES = (
+        "angr_find_paths", "angr_cfg_fast", "angr_cfg_emulated",
+        "angr_backward_slice", "angr_enumerate_reachable",
+        "angr_diff_cfg", "angr_stdin_fuzz",
+        "hybrid_angr_", "hybrid_nx_angr_",
+        "angr_snapshot_save", "angr_snapshot_restore",
+    )
+    _auto_async = not async_mode and any(tool.startswith(p) for p in _HEAVY_TOOL_PREFIXES)
 
+    if _auto_async or async_mode:
+        result = _invoke_tool_async(tool, args, host, port)
+        if isinstance(result, dict):
+            if not result.get("ok") and result.get("error"):
+                return result
+            if _auto_async:
+                result["auto_async"] = True
+                result.setdefault("_note", "async_mode was auto-enabled for this heavy angr tool to avoid proxy timeout. For all angr_* / hybrid_angr_* tools, always pass async_mode=True explicitly.")
+            return result
+        if _auto_async:
+            return {"ok": True, "auto_async": True, "result": result}
+        return result
+
+    # ── Synchronous path (lightweight tools only) ─────────────────────────
     for attempt in range(2):
-        resp = _proxy_to_instance(host, port, {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": args or {}},
-        })
+        try:
+            resp = _proxy_to_instance(host, port, {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": args or {}},
+            })
+        except (socket.timeout, TimeoutError, ConnectionError,
+                ConnectionRefusedError, ConnectionResetError, OSError,
+                http.client.HTTPException) as e:
+            # Socket/HTTP-layer timeout — almost certainly a heavy tool
+            # that exceeded the proxy timeout (180 s). Return a structured
+            # error with the exact fix the agent needs to retry immediately.
+            return {
+                "ok": False,
+                "error": f"Proxy connection to IDA lost ({type(e).__name__}: {e})",
+                "hint": (
+                    f"This tool ({tool}) likely exceeded the {_proxy_timeout_seconds():.0f}s proxy timeout. "
+                    "RETRY IMMEDIATELY with async_mode=True: "
+                    f"invoke_tool(tool='{tool}', args=<same_args>, async_mode=True). "
+                    "async_mode submits a background task via task_submit, then polls "
+                    "every 2 s until completion (max 300 s). The proxy never drops "
+                    "because each poll completes in < 1 s."
+                ),
+                "tool": tool,
+                "retry_with_async": True,
+            }
         if resp is None:
             return {
                 "ok": False,
