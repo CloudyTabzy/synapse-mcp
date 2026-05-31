@@ -954,14 +954,9 @@ if ANGR_AVAILABLE:
         from .angr_ipc import get_worker
         return get_worker().request(op, payload, timeout)
 
-    @idasync
-    def _gather_load_hints(binary_path: str | None = None, arch: str | None = None,
-                           base_address: str | None = None) -> dict:
-        """Collect the IDA-derived inputs the worker needs (it has no IDA access).
-
-        Runs briefly on the IDA main thread; the heavy angr work then happens in
-        the worker process while IDA stays responsive.
-        """
+    def _gather_load_hints_internal(binary_path: str | None = None, arch: str | None = None,
+                                    base_address: str | None = None) -> dict:
+        """Collect IDA inputs for the worker (no @idasync — for internal callers)."""
         path = binary_path or idaapi.get_input_file_path() or ""
         a = arch or _detect_arch()[0]
         base = None
@@ -974,6 +969,12 @@ if ANGR_AVAILABLE:
             base = _ida_imagebase()
         return {"binary_path": path, "arch": a, "base_addr": base,
                 "entry_point": _ida_entry_point()}
+
+    @idasync
+    def _gather_load_hints(binary_path: str | None = None, arch: str | None = None,
+                           base_address: str | None = None) -> dict:
+        """Collect the IDA-derived inputs the worker needs (it has no IDA access)."""
+        return _gather_load_hints_internal(binary_path, arch, base_address)
 
     @idasync
     def _enrich_slice_addresses(addrs: list, target_reg: str | None) -> list[dict]:
@@ -1749,7 +1750,7 @@ if ANGR_AVAILABLE:
         Heavy: for non-trivial targets use invoke_tool(..., async_mode='task') or task_submit + task_poll.
         """
         if _use_worker():
-            hints = _gather_load_hints()
+            hints = _gather_load_hints_internal()
             avoid_list: list[str] = []
             if avoid_addresses:
                 avoid_list = [hex(parse_address(a)) for a in normalize_list_input(avoid_addresses) if a]
@@ -2635,7 +2636,7 @@ if ANGR_AVAILABLE:
         no-worker case use the in-process path.
         """
         if use_cfg_only and _use_worker():
-            hints = _gather_load_hints()
+            hints = _gather_load_hints_internal()
             res = _worker_request(
                 "backward_slice",
                 {"load": hints, "project_id": project_id,
