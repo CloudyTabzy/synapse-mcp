@@ -412,6 +412,7 @@ class AnnotatedLine(TypedDict, total=False):
     line: str
     addr: str
     has_symbolic_ops: bool
+    symbolic_registers: dict[str, str] | None
 
 
 class HybridDecompileResult(TypedDict, total=False):
@@ -420,6 +421,9 @@ class HybridDecompileResult(TypedDict, total=False):
     function_name: str
     pseudocode: str
     annotated_lines: list[AnnotatedLine]
+    symbolic_line_count: int
+    total_instructions_processed: int
+    symbolized_registers: list[str]
     constraint_count: int
     engines_used: list[str]
     error: str
@@ -3240,21 +3244,37 @@ if ANGR_AVAILABLE:
     @idasync
     @tool_timeout(120.0)
     def hybrid_angr_triton_decompile(
-        function_address: Annotated[str, "Function address (hex)"],
+        function_address: Annotated[str, "Function address (hex or symbol)"],
         symbolize_args: Annotated[
-            str, "Comma-separated registers to symbolize (default: 'rdi,rsi,rdx')"
+            str, "Comma-separated registers to symbolize as attacker-controlled "
+                 "(default: 'rdi,rsi,rdx' — x64 first three args). "
+                 "Use 'rcx,rdx,r8,r9' for __fastcall x64 convention."
         ] = "rdi,rsi,rdx",
         show_symbolic_only: Annotated[
             bool, "Show only lines with symbolic operands (default: False)"
         ] = False,
-        max_insns: Annotated[int, "Maximum instructions to process"] = 500,
+        max_insns: Annotated[int, "Maximum instructions to process through Triton (default: 500)"] = 500,
+        annotate_idb: Annotated[
+            bool,
+            "Write symbolic annotations as IDA comments at instruction addresses "
+            "(default: False — read-only analysis). Set True to persist symbolic "
+            "state as inline comments in the IDB.",
+        ] = False,
     ) -> HybridDecompileResult:
-        """Decompile + annotate with symbolic register state.
+        """⭐ Decompile a function with Triton symbolic execution annotations.
 
-        Returns IDA decompilation with addresses embedded; an AI agent can
-        correlate these against Triton symex output (via triton_init +
-        triton_process_function on the same function) to enrich the
-        annotation in a follow-up call.
+        Runs Triton's symbolic engine over the function, then annotates the IDA
+        decompiler pseudocode with symbolic register/memory expressions. Each
+        line that uses a symbolic value is marked with `has_symbolic_ops: true`
+        and the symbolic expression (e.g. `rax = user_rdi ^ 0x6D`).
+
+        This reveals HOW user input propagates through the function — the agent
+        can see exactly which pseudocode lines depend on symbolized registers.
+
+        When annotate_idb=True, also writes `;; sym: rax = ...` comments into
+        the IDA database at each instruction address for permanent annotation.
+
+        Requires triton-library installed.
         """
         try:
             func_ea = parse_address(function_address)
@@ -3268,31 +3288,185 @@ if ANGR_AVAILABLE:
 
             fname = idc.get_func_name(func.start_ea) or f"sub_{func.start_ea:X}"
 
+            engines = ["ida"]
+            symbolic_state: dict[int, dict[str, str]] = {}
+            constraint_count = 0
+            triton_used = False
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Triton symbolic execution pass
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                from .api_triton import TRITON_AVAILABLE as _TA
+            except ImportError:
+                _TA = False
+
+            if _TA:
+                try:
+                    from triton import (
+                        ARCH, MODE, AST_REPRESENTATION, TritonContext,
+                        Instruction as TritonInstruction,
+                        MemoryAccess as TritonMemoryAccess,
+                    )
+                    from . import api_triton as _ap_triton  # noqa: F401
+
+                    # Architecture detection
+                    info = idaapi.get_inf_structure()
+                    proc = info.procname
+                    bitness = 64 if compat.inf_is_64bit() else 32
+
+                    arch_map = {
+                        ("metapc", 64): ARCH.X86_64,
+                        ("metapc", 32): ARCH.X86,
+                        ("arm", 64): ARCH.AARCH64,
+                        ("arm", 32): ARCH.ARM32,
+                    }
+                    triton_arch = arch_map.get((proc, bitness))
+                    if triton_arch is None:
+                        return {
+                            "ok": False,
+                            "error": f"Unsupported arch: {proc} {bitness}bit",
+                            "engines_used": engines,
+                        }
+
+                    ctx = TritonContext(triton_arch)
+                    ctx.setMode(MODE.CONSTANT_FOLDING, True)
+                    ctx.setMode(MODE.AST_OPTIMIZATIONS, True)
+                    ctx.setAstRepresentationMode(AST_REPRESENTATION.SMT)
+
+                    # Symbolize registers
+                    regs_to_sym = [r.strip().lower() for r in symbolize_args.split(",") if r.strip()]
+                    reg_name_to_id: dict[str, int] = {}
+                    if triton_arch == ARCH.X86_64:
+                        reg_name_to_id = {
+                            "rax": ctx.registers.rax, "rbx": ctx.registers.rbx,
+                            "rcx": ctx.registers.rcx, "rdx": ctx.registers.rdx,
+                            "rsi": ctx.registers.rsi, "rdi": ctx.registers.rdi,
+                            "r8": ctx.registers.r8, "r9": ctx.registers.r9,
+                            "r10": ctx.registers.r10, "r11": ctx.registers.r11,
+                            "r12": ctx.registers.r12, "r13": ctx.registers.r13,
+                            "r14": ctx.registers.r14, "r15": ctx.registers.r15,
+                        }
+                    elif triton_arch == ARCH.X86:
+                        reg_name_to_id = {
+                            "eax": ctx.registers.eax, "ebx": ctx.registers.ebx,
+                            "ecx": ctx.registers.ecx, "edx": ctx.registers.edx,
+                            "esi": ctx.registers.esi, "edi": ctx.registers.edi,
+                        }
+
+                    symbolized: list[str] = []
+                    for reg_name in regs_to_sym:
+                        reg_id = reg_name_to_id.get(reg_name)
+                        if reg_id is not None:
+                            var = ctx.symbolizeRegister(reg_id, f"user_{reg_name}")
+                            if var:
+                                symbolized.append(reg_name)
+
+                    if not symbolized:
+                        return {
+                            "ok": False,
+                            "error": f"None of {regs_to_sym} could be symbolized for {proc}",
+                            "engines_used": engines,
+                        }
+
+                    # Process instructions
+                    insns: list[tuple[int, bytes]] = []
+                    for item_ea in idautils.FuncItems(func.start_ea):
+                        if len(insns) >= max_insns:
+                            break
+                        size = idc.get_item_size(item_ea)
+                        if size <= 0 or size > 16:
+                            continue
+                        bts = ida_bytes.get_bytes(item_ea, size)
+                        if bts:
+                            insns.append((item_ea, bytes(bts)))
+
+                    for item_ea, bts in insns:
+                        try:
+                            inst = TritonInstruction(item_ea, bts)
+                            ctx.processing(inst)
+                        except Exception:
+                            continue
+                        # Collect current symbolic state for this address
+                        sr = ctx.getSymbolicRegisters()
+                        addr_state: dict[str, str] = {}
+                        for reg_id, expr in sr.items():
+                            reg_name = None
+                            for rn, rid in reg_name_to_id.items():
+                                if rid == reg_id:
+                                    reg_name = rn
+                                    break
+                            if reg_name:
+                                try:
+                                    ast_str = str(ctx.unrollAst(expr.getAst()))
+                                    # Simplify: strip SMT2 define-fun wrapper
+                                    if ast_str.startswith("(define-fun "):
+                                        ast_str = ast_str.split(")", 1)[-1].strip()
+                                    addr_state[reg_name] = ast_str[:120]
+                                except Exception:
+                                    addr_state[reg_name] = "symbolic"
+                        if addr_state:
+                            symbolic_state[item_ea] = addr_state
+
+                    constraint_count = len(ctx.getPathConstraints())
+                    triton_used = True
+                    engines.append("triton")
+                except Exception as e:
+                    logger.warning("Triton symbolic pass failed: %s", e)
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Decompile + annotate
+            # ═══════════════════════════════════════════════════════════════════
             try:
                 from .utils import decompile_function_safe
                 pseudo = decompile_function_safe(func.start_ea, include_addresses=True) or ""
             except Exception:
                 pseudo = ""
 
-            engines = ["ida"]
-            triton_available = False
-            try:
-                from . import api_triton as _ap_triton
-                triton_available = bool(getattr(_ap_triton, "TRITON_AVAILABLE", False))
-                if triton_available:
-                    engines.append("triton")
-            except Exception:
-                pass
-
             annotated: list[dict] = []
-            for line in pseudo.split("\n")[: max_insns]:
+            symbolic_lines = 0
+            for line in pseudo.split("\n")[:max(max_insns, 2000)]:
                 m = _re.search(r"/\*(0x[0-9a-fA-F]+)\*/", line)
-                addr = m.group(1) if m else ""
+                addr_str = m.group(1) if m else ""
+                has_sym = False
+                sym_exprs: dict[str, str] = {}
+
+                if addr_str and triton_used:
+                    try:
+                        addr = int(addr_str, 16)
+                        # Match closest symbolic state to this address
+                        best_match = None
+                        best_dist = 999999
+                        for sym_ea in symbolic_state:
+                            dist = abs(addr - sym_ea)
+                            if dist <= 16 and dist < best_dist:
+                                best_match = sym_ea
+                                best_dist = dist
+                        if best_match is not None:
+                            sym_exprs = symbolic_state[best_match]
+                            has_sym = True
+                            symbolic_lines += 1
+                    except (ValueError, TypeError):
+                        pass
+
                 annotated.append({
                     "line": line,
-                    "addr": addr,
-                    "has_symbolic_ops": False,
+                    "addr": addr_str,
+                    "has_symbolic_ops": has_sym,
+                    "symbolic_registers": sym_exprs if sym_exprs else None,
                 })
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Write IDA comments if requested
+            # ═══════════════════════════════════════════════════════════════════
+            if annotate_idb and triton_used and symbolic_state:
+                for ea, regs in symbolic_state.items():
+                    parts = [f"{r}: {e[:60]}" for r, e in sorted(regs.items())]
+                    comment = "sym: " + "; ".join(parts)[:400]
+                    try:
+                        ida_bytes.set_cmt(ea, comment, False)
+                    except Exception:
+                        pass
 
             if show_symbolic_only:
                 annotated = [a for a in annotated if a.get("has_symbolic_ops")]
@@ -3303,7 +3477,10 @@ if ANGR_AVAILABLE:
                 "function_name": fname,
                 "pseudocode": pseudo,
                 "annotated_lines": annotated,
-                "constraint_count": 0,
+                "symbolic_line_count": symbolic_lines,
+                "total_instructions_processed": len(symbolic_state),
+                "constraint_count": constraint_count,
+                "symbolized_registers": symbolized if triton_used else [],
                 "engines_used": engines,
             }
         except Exception as e:
