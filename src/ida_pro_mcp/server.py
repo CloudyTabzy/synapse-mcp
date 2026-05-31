@@ -981,7 +981,7 @@ def _invoke_tool_async(tool: str, args: dict | None, host: str, port: int) -> ob
 def invoke_tool(
     tool: Annotated[str, "Tool name to invoke (from list_tools or list_modules directory)"],
     args: Annotated[dict | None, "Tool arguments as a flat dict. ALL tool inputs go here — never at the top level alongside 'tool'. CORRECT: invoke_tool(tool='decompile', args={'address': 'main'}). WRONG: invoke_tool(tool='decompile', address='main')."] = None,
-    async_mode: Annotated[bool, "Submit as a background task and poll until done. ALWAYS use async_mode=True for: angr_find_paths, angr_cfg_fast, angr_backward_slice, angr_cfg_emulated, angr_enumerate_reachable, angr_diff_cfg, hybrid_angr_*. Heavy angr tools WILL timeout the proxy at 180s without this. Safe for any tool — the proxy handles submit+poll automatically.",] = False,
+    async_mode: Annotated[bool | str, "Submit as a background task to avoid proxy timeout. Values: False (sync, default), True (submit + poll up to 300s, BLOCKS — VSCode's 60s client limit still applies!), 'task' (submit immediately, return task_id — agent polls separately). 'task' is RECOMMENDED for all heavy tools. ALWAYS use async_mode=True or 'task' for: angr_find_paths, angr_cfg_fast, angr_backward_slice, angr_cfg_emulated, angr_enumerate_reachable, angr_diff_cfg, hybrid_angr_*.",] = False,
 ) -> object:
     """[lazy-mode] Invoke any IDA tool by name.
 
@@ -989,12 +989,16 @@ def invoke_tool(
       CORRECT:   invoke_tool(tool='decompile', args={'address': 'main'})
       INCORRECT: invoke_tool(tool='decompile', address='main')
 
-    **CRITICAL for angr/heavy tools:** always pass async_mode=True.
+    **CRITICAL for angr/heavy tools:** use async_mode='task'.
     Heavy tools (angr_find_paths, angr_cfg_fast, angr_backward_slice, etc.) take
-    60-300+ seconds and WILL timeout the synchronous proxy. async_mode submits a
-    background task, polls every 2 s, and returns the identical result when done
-    (max 300 s wait). If you forget async_mode and get a proxy timeout error, the
-    error message will remind you to retry with async_mode=True.
+    60-300+ seconds. async_mode='task' returns a task_id IMMEDIATELY (1 s),
+    avoiding any client timeout. Then poll with:
+        invoke_tool(tool='task_poll', args={'task_id': task_id})
+    Each poll completes in <1 s — VSCode's 60s client timeout is never hit.
+    When the task finishes, task_poll returns the tool's actual result.
+
+    async_mode=True (blocking poll) also works but may hit VSCode's 60s client
+    limit for very long operations. Prefer async_mode='task' for angr tools.
 
     If you know the tool name, call directly without discovery."""
     global _lazy_tools_cache, _lazy_module_cache
@@ -1011,11 +1015,6 @@ def invoke_tool(
     host, port = _get_active_ida_target()
 
     # ── Auto-async for known-heavy tools ──────────────────────────────────
-    # Heavy angr operations routinely exceed 60 s on real binaries.
-    # Auto-enabling async_mode prevents the agent from hitting the proxy
-    # timeout, then having to re-read the error, understand async_mode,
-    # and retry — which wastes ~200 s per tool. The agent sees an
-    # `auto_async: true` note in the response so it learns the pattern.
     _HEAVY_TOOL_PREFIXES = (
         "angr_find_paths", "angr_cfg_fast", "angr_cfg_emulated",
         "angr_backward_slice", "angr_enumerate_reachable",
@@ -1024,19 +1023,46 @@ def invoke_tool(
         "angr_snapshot_save", "angr_snapshot_restore",
     )
     _auto_async = not async_mode and any(tool.startswith(p) for p in _HEAVY_TOOL_PREFIXES)
+    _use_task_mode = async_mode == "task" or _auto_async
 
-    if _auto_async or async_mode:
+    # ── Task mode: submit immediately, return task_id — no blocking ──────
+    if _use_task_mode:
+        submit_resp = _proxy_to_instance(host, port, {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "task_submit", "arguments": {"tool_name": tool, "arguments": args or {}}},
+        })
+        if submit_resp is None or "error" in submit_resp:
+            err = (submit_resp or {}).get("error", {}).get("message", "no response")
+            return {"ok": False, "error": f"task_submit failed: {err}"}
+        submit_result = _unpack_call_result(submit_resp.get("result", {}))
+        if not isinstance(submit_result, dict) or not submit_result.get("ok"):
+            err = submit_result.get("error", "submit failed") if isinstance(submit_result, dict) else "submit failed"
+            return {"ok": False, "error": f"task_submit error: {err}"}
+        task_id = submit_result.get("task_id")
+        if not task_id:
+            return {"ok": False, "error": "task_submit returned no task_id"}
+        return {
+            "ok": True,
+            "stage": "submitted",
+            "task_id": task_id,
+            "tool": tool,
+            "auto_async": _auto_async,
+            "hint": (
+                f"Task submitted as '{task_id}'. Poll with: "
+                f"invoke_tool(tool='task_poll', args={{'task_id': '{task_id}'}}). "
+                "The task runs in IDA's background task queue — you can check progress "
+                "by passing the task_id to task_poll at any time."
+            ),
+        }
+
+    # ── Blocking async mode (True): submit + poll in a loop ──────────────
+    if async_mode is True:
         result = _invoke_tool_async(tool, args, host, port)
         if isinstance(result, dict):
             if not result.get("ok") and result.get("error"):
                 return result
-            if _auto_async:
-                result["auto_async"] = True
-                result.setdefault("_note", "async_mode was auto-enabled for this heavy angr tool to avoid proxy timeout. For all angr_* / hybrid_angr_* tools, always pass async_mode=True explicitly.")
             return result
-        if _auto_async:
-            return {"ok": True, "auto_async": True, "result": result}
-        return result
+        return {"ok": True, "result": result}
 
     # ── Synchronous path (lightweight tools only) ─────────────────────────
     for attempt in range(2):
@@ -1100,6 +1126,80 @@ def invoke_tool(
                 "hint": "Call list_modules() to see available groups, then list_tools(module=...) to find the right tool name.",
             }
         return _unpack_call_result(call_result)
+
+
+@mcp.tool
+def task_wait(
+    tool: Annotated[str, "Tool name to run (e.g. 'angr_find_paths')"],
+    args: Annotated[dict | None, "Tool arguments dict"] = None,
+    task_id: Annotated[str | None, "Existing task_id from a previous task_wait call. Omit on first call (submits new task); pass on subsequent calls (polls for completion)."] = None,
+    max_wait: Annotated[int, "Max seconds to wait on THIS poll call before returning 'running' (default: 5). Pass 0 for immediate status check. Does NOT limit total task time — the task runs until done on IDA."] = 5,
+) -> object:
+    """Submit a heavy tool as a background task and poll for completion.
+
+    **Calling pattern (never hits VSCode 60s client timeout):**
+    Call 1: task_wait(tool='angr_find_paths', args={...})       → {stage:'submitted', task_id:'abc'}
+    Call 2: task_wait(task_id='abc')                             → {stage:'running', elapsed: 4s}
+    Call 3: task_wait(task_id='abc')                             → {stage:'running', elapsed: 12s}
+    ...
+    Call N: task_wait(task_id='abc')                             → {stage:'done', result:{...}}
+
+    Each call completes in < 1 s. The task runs independently on IDA.
+    """
+    host, port = _get_active_ida_target()
+
+    # ── Submit new task (first call) ─────────────────────────────────────
+    if not task_id:
+        submit_resp = _proxy_to_instance(host, port, {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "task_submit", "arguments": {"tool_name": tool, "arguments": args or {}}},
+        })
+        if submit_resp is None or "error" in submit_resp:
+            err = (submit_resp or {}).get("error", {}).get("message", "no response")
+            return {"ok": False, "error": f"task_submit failed: {err}"}
+        submit_result = _unpack_call_result(submit_resp.get("result", {}))
+        if not isinstance(submit_result, dict) or not submit_result.get("ok"):
+            err = submit_result.get("error", "submit failed") if isinstance(submit_result, dict) else "submit failed"
+            return {"ok": False, "error": f"task_submit error: {err}"}
+        new_task_id = submit_result.get("task_id")
+        if not new_task_id:
+            return {"ok": False, "error": "task_submit returned no task_id"}
+        return {
+            "ok": True,
+            "stage": "submitted",
+            "task_id": new_task_id,
+            "tool": tool,
+            "hint": f"Poll: task_wait(task_id='{new_task_id}'). Each call completes in <1 s.",
+        }
+
+    # ── Poll existing task ────────────────────────────────────────────────
+    deadline = time.monotonic() + max(max_wait, 0.1)
+    while time.monotonic() < deadline:
+        poll_resp = _proxy_to_instance(host, port, {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "task_poll", "arguments": {"task_id": task_id}},
+        })
+        if poll_resp is None or "error" in poll_resp:
+            time.sleep(0.5)
+            continue
+        poll_data = _unpack_call_result(poll_resp.get("result", {}))
+        if not isinstance(poll_data, dict):
+            continue
+        status = poll_data.get("status")
+        if status == "done":
+            inner = poll_data.get("result")
+            result = _unpack_call_result(inner) if isinstance(inner, dict) else inner
+            return {"ok": True, "stage": "done", "task_id": task_id, "result": result}
+        if status == "error":
+            return {"ok": False, "stage": "error", "task_id": task_id, "error": poll_data.get("error", "task failed")}
+        if status == "cancelled":
+            return {"ok": False, "stage": "cancelled", "task_id": task_id, "error": "Task was cancelled"}
+        if status == "running":
+            elapsed = poll_data.get("elapsed_seconds", 0)
+            return {"ok": True, "stage": "running", "task_id": task_id, "elapsed_seconds": round(elapsed, 1)}
+        time.sleep(0.5)
+
+    return {"ok": True, "stage": "running", "task_id": task_id, "hint": "Task still running. Poll again."}
 
 
 # ============================================================================

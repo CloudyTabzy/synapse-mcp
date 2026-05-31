@@ -1746,8 +1746,31 @@ if ANGR_AVAILABLE:
             input_size      = known serial length (e.g. 59 bytes)
             char_constraint = "printable" or "FRZ{,A-Z,0-9}" if the format is known
 
-        Heavy: for non-trivial targets use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+        Heavy: for non-trivial targets use invoke_tool(..., async_mode='task') or task_submit + task_poll.
         """
+        if _use_worker():
+            hints = _gather_load_hints()
+            avoid_list: list[str] = []
+            if avoid_addresses:
+                avoid_list = [hex(parse_address(a)) for a in normalize_list_input(avoid_addresses) if a]
+            return _worker_request(
+                "find_paths",
+                {
+                    "load": hints,
+                    "project_id": project_id,
+                    "target_address": target_address,
+                    "source_address": source_address,
+                    "input_mode": input_mode,
+                    "input_size": input_size,
+                    "char_constraint": char_constraint,
+                    "max_paths": max_paths,
+                    "use_dfs": use_dfs,
+                    "use_veritesting": use_veritesting,
+                    "loop_bound": loop_bound,
+                    "avoid_addresses": avoid_list,
+                },
+                timeout=float(timeout_seconds) + 30.0,
+            )
         return _find_paths_impl(
             target_address=target_address,
             source_address=source_address,
