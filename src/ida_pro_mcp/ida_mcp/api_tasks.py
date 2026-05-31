@@ -99,7 +99,7 @@ def _detect_category(tool_name: str) -> str:
 
 
 def _execute_task(task_id: str) -> None:
-    """Run a single task on the worker thread."""
+    """Run a single task on the worker thread with progress estimation."""
     task = _backend.get_task(task_id)
     if task is None or task.get("status") == "cancelled":
         return
@@ -115,8 +115,63 @@ def _execute_task(task_id: str) -> None:
     if caller_session_id is not None:
         MCP_SERVER._transport_session_id.data = caller_session_id
 
-    _backend.update_state(task_id, "running", started_at=time.monotonic())
+    def _estimate_duration(name: str) -> float:
+        """Return expected seconds for this tool type (0 = unknown)."""
+        for prefix, typical_s in _TYPICAL_DURATIONS.items():
+            if name.startswith(prefix):
+                return typical_s
+        return 0.0
+
+    _TYPICAL_DURATIONS: dict[str, float] = {
+        "angr_cfg_fast": 100.0,
+        "angr_cfg_emulated": 180.0,
+        "angr_find_paths": 90.0,
+        "angr_backward_slice": 120.0,
+        "angr_enumerate_reachable": 60.0,
+        "angr_diff_cfg": 30.0,
+        "hybrid_angr_stdin_fuzz": 120.0,
+        "hybrid_angr_triton_solve": 90.0,
+        "hybrid_angr_miasm_path": 90.0,
+        "hybrid_angr_z3_formula": 60.0,
+        "hybrid_nx_angr_target_ranking": 45.0,
+        "triton_analyze_function": 45.0,
+        "triton_process_function": 30.0,
+        "miasm_lift_function": 30.0,
+        "miasm_deobfuscate_cfg": 60.0,
+        "yara_idb_annotate": 90.0,
+        "scan_and_define_funcs": 60.0,
+        "analyze_batch": 60.0,
+    }
+
+    _expected = _estimate_duration(tool_name)
+    _start_time = time.monotonic()
+
+    _stop_progress = threading.Event()
+
+    def _progress_updater():
+        while not _stop_progress.wait(timeout=3.0):
+            elapsed = time.monotonic() - _start_time
+            pct = None
+            if _expected > 0:
+                pct = min(99, round(elapsed / _expected * 100, 1))
+            _backend.update_state(
+                task_id,
+                "running",
+                progress={
+                    "elapsed_s": round(elapsed, 1),
+                    "progress_pct": pct,
+                    "typical_s": _expected if _expected > 0 else None,
+                    "stage": ("estimated" if _expected > 0 else "running"),
+                },
+            )
+
+    _progress_thread = threading.Thread(
+        target=_progress_updater, name=f"progress-{task_id[:8]}", daemon=True
+    )
+    _progress_thread.start()
+
     try:
+        _backend.update_state(task_id, "running", started_at=_start_time)
         envelope = {
             "jsonrpc": "2.0",
             "method": "tools/call",
@@ -150,6 +205,7 @@ def _execute_task(task_id: str) -> None:
             task_id, "error", error=str(exc), completed_at=time.monotonic()
         )
     finally:
+        _stop_progress.set()
         _cleanup_expired()
 
 
@@ -251,6 +307,25 @@ def task_submit(
     }
 
 
+def _suggested_poll_interval(progress_pct: float | None, typical_s: float) -> int:
+    """Return suggested seconds between task_poll calls based on progress/typical duration.
+
+    Early stages: poll more often (agent is waiting). Late stages: less often
+    (close to completion). Unknown progress: poll based on typical duration.
+    """
+    if progress_pct is not None:
+        if progress_pct < 25:
+            return 5
+        if progress_pct < 75:
+            return 8
+        return 3  # close to done — poll faster to catch result quickly
+    if typical_s >= 120:
+        return 15
+    if typical_s >= 60:
+        return 8
+    return 5
+
+
 @tool
 def task_poll(
     task_id: Annotated[str, "Task ID returned by task_submit"],
@@ -284,7 +359,25 @@ def task_poll(
     elif status == "cancelled":
         resp["error"] = "Task was cancelled before execution started"
     else:
-        resp["_hint"] = "Still running — poll again in 2-3 seconds"
+        progress = task.get("progress")
+        if isinstance(progress, dict):
+            pct = progress.get("progress_pct")
+            typical = progress.get("typical_s")
+            stage_elapsed = progress.get("elapsed_s", elapsed)
+            if pct is not None and typical:
+                resp["_hint"] = (
+                    f"Running — {pct}% complete (est. {round(stage_elapsed)}s / "
+                    f"~{int(typical)}s). Poll again in {_suggested_poll_interval(pct, typical)}s."
+                )
+            elif typical:
+                resp["_hint"] = (
+                    f"Running — {round(stage_elapsed)}s elapsed (typical: ~{int(typical)}s). "
+                    f"Poll again in {_suggested_poll_interval(None, typical)}s."
+                )
+            else:
+                resp["_hint"] = f"Still running — {round(stage_elapsed)}s elapsed. Poll again in 3-5s."
+        else:
+            resp["_hint"] = f"Still running — {elapsed}s elapsed. Poll again in 3-5s."
 
     if "progress" in task and task["progress"] is not None:
         resp["progress"] = task["progress"]
