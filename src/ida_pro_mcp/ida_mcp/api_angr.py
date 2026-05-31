@@ -85,11 +85,13 @@ logger = logging.getLogger(__name__)
 try:
     import angr as _angr
     import claripy as _claripy
+    import cle as _cle  # angr's loader; always present when angr is
     ANGR_AVAILABLE = True
     _ANGR_VERSION = getattr(_angr, "__version__", "unknown")
 except ImportError:
     _angr = None  # type: ignore[assignment]
     _claripy = None  # type: ignore[assignment]
+    _cle = None  # type: ignore[assignment]
     ANGR_AVAILABLE = False
     _ANGR_VERSION = ""
     logger.warning(
@@ -174,6 +176,10 @@ class AngrStatusResult(TypedDict, total=False):
     arches_supported: list[str]
     engines: dict
     projects_cached: int
+    input_file: str
+    input_format: str
+    detected_arch: str
+    blob_fallback_likely: bool
     hint: str
     error: str
 
@@ -194,6 +200,8 @@ class AngrLoadResult(TypedDict, total=False):
     image_base: str
     memory_regions: list[AngrMemoryRegion]
     symbol_count: int
+    loader_backend: str
+    fallback_used: bool
     note: str
     error: str
     error_type: str
@@ -618,6 +626,74 @@ def _detect_arch() -> tuple[str, int]:
     return ("AMD64" if is_64 else "X86", bits)
 
 
+def _ida_imagebase() -> int | None:
+    """IDA's image base, for rebasing a blob to match the IDB's addresses."""
+    try:
+        base = int(idaapi.get_imagebase())
+        return base if base not in (0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF) else None
+    except Exception:
+        return None
+
+
+def _ida_entry_point() -> int | None:
+    """IDA's program entry point: first defined entry, else INF_START_EA."""
+    try:
+        for _idx, _ord, ea, _name in idautils.Entries():
+            return int(ea)
+    except Exception:
+        pass
+    try:
+        ea = idc.get_inf_attr(idc.INF_START_EA)
+        if ea not in (idaapi.BADADDR, 0):
+            return int(ea)
+    except Exception:
+        pass
+    return None
+
+
+def _peek_file_format(path: str) -> str:
+    """Cheap magic-byte sniff of the input file: 'PE' / 'ELF' / 'MachO' / 'blob'.
+
+    Lets angr_status tell an agent up front whether angr_load_segment will need
+    the blob fallback, instead of the agent discovering it via a load failure.
+    """
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+    except Exception:
+        return "unknown"
+    if magic[:2] == b"MZ":
+        return "PE"
+    if magic[:4] == b"\x7fELF":
+        return "ELF"
+    if magic[:4] in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+                     b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",
+                     b"\xca\xfe\xba\xbe"):
+        return "MachO"
+    return "blob"
+
+
+def _is_cle_backend_error(e: BaseException) -> bool:
+    """True when angr.Project failed because CLE couldn't auto-detect a backend.
+
+    This is the exact signal to retry with the explicit ``blob`` backend — the
+    binary is a raw dump / decrypted section / custom format with no PE/ELF/MachO
+    header. Matches both the typed CLE exceptions and the message text, since the
+    concrete class has moved across cle versions.
+    """
+    if _cle is not None:
+        backend_errs = tuple(
+            cls for cls in (
+                getattr(_cle.errors, "CLECompatibilityError", None),
+                getattr(_cle.errors, "CLEUnknownFormatError", None),
+            ) if isinstance(cls, type)
+        )
+        if backend_errs and isinstance(e, backend_errs):
+            return True
+    msg = str(e).lower()
+    return "loader backend" in msg or "unable to find a loader" in msg
+
+
 # ============================================================================
 # Threading-based deadline for long-running angr calls
 # ============================================================================
@@ -750,10 +826,12 @@ def _apply_byte_constraints(state, sym_bv, size_bytes: int, allowed: bytes) -> N
 @tool
 @idasync
 def angr_status() -> AngrStatusResult:
-    """Probe angr library availability and version.
+    """Probe angr availability and the current binary's loadability.
 
-    Always registered regardless of whether angr is installed. Returns engine
-    capability flags and the count of currently cached projects.
+    Always registered regardless of whether angr is installed. Beyond engine
+    capability flags, it sniffs the input file so an agent knows up front
+    whether angr_load_segment will auto-fall-back to the 'blob' backend
+    (raw dump / decrypted section / custom format with no PE/ELF/MachO header).
     """
     if not ANGR_AVAILABLE:
         return {
@@ -768,7 +846,21 @@ def angr_status() -> AngrStatusResult:
     except Exception:
         claripy_version = "unknown"
 
-    return {
+    # Lightweight capability probe of the current input binary.
+    input_file = ""
+    input_format = "unknown"
+    detected_arch = ""
+    blob_likely = False
+    try:
+        input_file = idaapi.get_input_file_path() or ""
+        if input_file and os.path.exists(input_file):
+            input_format = _peek_file_format(input_file)
+            blob_likely = input_format == "blob"
+        detected_arch = _detect_arch()[0]
+    except Exception:
+        pass
+
+    result: AngrStatusResult = {
         "ok": True,
         "available": True,
         "version": _ANGR_VERSION,
@@ -788,7 +880,18 @@ def angr_status() -> AngrStatusResult:
             "ddg": True,
         },
         "projects_cached": _project_count(),
+        "input_file": input_file,
+        "input_format": input_format,
+        "detected_arch": detected_arch,
+        "blob_fallback_likely": blob_likely,
     }
+    if blob_likely:
+        result["hint"] = (
+            "Input has no PE/ELF/MachO header — angr_load_segment will load it via "
+            "the 'blob' backend (rebased to IDA's imagebase). For CFG/function data "
+            "prefer angr_cfg_from_ida; use angr for symbolic execution."
+        )
+    return result
 
 
 # ============================================================================
@@ -796,6 +899,103 @@ def angr_status() -> AngrStatusResult:
 # ============================================================================
 
 if ANGR_AVAILABLE:
+
+    # =====================================================================
+    # State option policy
+    # =====================================================================
+    #
+    # angr auto-enables its unicorn engine when the `unicorn` package is present
+    # (it is — unicorn 2.x). The unicorn SimState plugin holds a *native* cffi
+    # handle (``_cffi_backend._CDataBase``) that is not pickle/deepcopy-safe.
+    # angr/claripy copy states constantly during exploration and IDA's tooling
+    # boundary can attempt to serialize them, which surfaces as
+    # ``TypeError: cannot pickle '_cffi_backend._CDataBase' object`` — exactly
+    # the V2 stress-test failure. We never need unicorn for pure-symbolic
+    # exploration, so strip its options from every state we build; the handle is
+    # then never created. ZERO_FILL_UNCONSTRAINED_REGISTERS happens to live in
+    # angr.options.unicorn too but we want it, so it is excluded from the strip
+    # and added back explicitly.
+    _STATE_ADD_OPTIONS = {
+        _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+        _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+    }
+    _STATE_REMOVE_OPTIONS = set(_angr.options.unicorn) - _STATE_ADD_OPTIONS
+
+    # =====================================================================
+    # Out-of-process worker integration (angr_worker.py / angr_ipc.py)
+    # =====================================================================
+    # Heavy / serialization-sensitive ops can run in a separate process: it is
+    # killable on timeout (a thread in native angr code is not), and only plain
+    # dicts cross the boundary so the cffi pickle bug is impossible. Worker mode
+    # is decided ONCE per session (a cheap ping) so a tool never runs half
+    # in-process / half in-worker, and it transparently falls back to the
+    # in-process path when the worker can't start — behaviour is never worse.
+    import threading as _threading_mod
+    _worker_mode: bool | None = None
+    _worker_mode_lock = _threading_mod.Lock()
+
+    def _use_worker() -> bool:
+        global _worker_mode
+        if os.environ.get("IDA_MCP_ANGR_NO_WORKER"):
+            return False
+        with _worker_mode_lock:
+            if _worker_mode is None:
+                try:
+                    from .angr_ipc import get_worker
+                    pong = get_worker().ping(timeout=20.0)
+                    _worker_mode = bool(isinstance(pong, dict) and pong.get("ok"))
+                except Exception:
+                    _worker_mode = False
+                logger.info("angr out-of-process worker: %s",
+                            "ENABLED" if _worker_mode else "disabled (in-process)")
+            return _worker_mode
+
+    def _worker_request(op: str, payload: dict, timeout: float) -> dict:
+        from .angr_ipc import get_worker
+        return get_worker().request(op, payload, timeout)
+
+    @idasync
+    def _gather_load_hints(binary_path: str | None = None, arch: str | None = None,
+                           base_address: str | None = None) -> dict:
+        """Collect the IDA-derived inputs the worker needs (it has no IDA access).
+
+        Runs briefly on the IDA main thread; the heavy angr work then happens in
+        the worker process while IDA stays responsive.
+        """
+        path = binary_path or idaapi.get_input_file_path() or ""
+        a = arch or _detect_arch()[0]
+        base = None
+        if base_address:
+            try:
+                base = parse_address(base_address)
+            except Exception:
+                base = None
+        if base is None:
+            base = _ida_imagebase()
+        return {"binary_path": path, "arch": a, "base_addr": base,
+                "entry_point": _ida_entry_point()}
+
+    @idasync
+    def _enrich_slice_addresses(addrs: list, target_reg: str | None) -> list[dict]:
+        """Turn the worker's bare slice addresses into rich rows using the IDB."""
+        items: list[dict] = []
+        for addr_str in addrs:
+            try:
+                a = parse_address(addr_str)
+            except Exception:
+                a = None
+            mnem = fname = ""
+            if a is not None:
+                try:
+                    mnem = idc.print_insn_mnem(a) or ""
+                except Exception:
+                    pass
+                f = idaapi.get_func(a)
+                if f is not None:
+                    fname = idc.get_func_name(f.start_ea) or ""
+            items.append({"addr": addr_str, "mnemonic": mnem,
+                          "function_name": fname, "reason": "control_flow_predecessor"})
+        return items
 
     # =====================================================================
     # Shared resolution helpers
@@ -859,6 +1059,7 @@ if ANGR_AVAILABLE:
                     if ent.get("binary_path") == path:
                         _angr_projects.move_to_end(pid)
                         proj = ent["project"]
+                        lb = ent.get("loader_backend", "")
                         return {
                             "ok": True,
                             "project_id": pid,
@@ -869,6 +1070,8 @@ if ANGR_AVAILABLE:
                             "image_base": hex(proj.loader.main_object.mapped_base),
                             "memory_regions": _summarize_memory_regions(proj),
                             "symbol_count": len(list(proj.loader.main_object.symbols)),
+                            "loader_backend": lb,
+                            "fallback_used": lb == "blob",
                             "note": "Project already cached for this binary.",
                         }
 
@@ -887,19 +1090,69 @@ if ANGR_AVAILABLE:
             if main_opts:
                 load_options["main_opts"] = main_opts
 
+            # First attempt: let CLE auto-detect the backend (PE/ELF/MachO/...).
+            proj = None
+            loader_backend = ""
+            fallback_used = False
             try:
                 proj = _angr.Project(path, load_options=load_options)
-            except Exception as e:
-                return tool_error(
-                    e,
-                    context="angr.Project",
-                    hint="Verify binary path exists and is a supported format (PE/ELF/MachO).",
-                )
+                loader_backend = type(proj.loader.main_object).__name__
+            except Exception as e_auto:
+                if not _is_cle_backend_error(e_auto):
+                    return tool_error(
+                        e_auto,
+                        context="angr.Project",
+                        hint=(
+                            "angr failed to load this binary, and not because the "
+                            "format was unrecognized (raw blobs are handled "
+                            "automatically). Likely a corrupt file or an arch angr "
+                            "cannot model. angr_cfg_from_ida and workflow_find_gadgets "
+                            "still work — they run on IDA's analysis, no angr project."
+                        ),
+                    )
+                # Auto-fallback: raw blob (decrypted section, shellcode dump, custom
+                # format). Map it flat at IDA's imagebase so angr addresses line up
+                # with the IDB, and seed the entry point from IDA.
+                blob_opts: dict = dict(main_opts)
+                blob_opts["backend"] = "blob"
+                blob_opts.setdefault("arch", _detect_arch()[0])
+                if "base_addr" not in blob_opts:
+                    ida_base = _ida_imagebase()
+                    if ida_base is not None:
+                        blob_opts["base_addr"] = ida_base
+                ida_entry = _ida_entry_point()
+                if ida_entry is not None:
+                    blob_opts["entry_point"] = ida_entry
+                blob_load_options: dict = dict(_FORCED_LOAD_OPTIONS)
+                blob_load_options["main_opts"] = blob_opts
+                try:
+                    proj = _angr.Project(path, load_options=blob_load_options)
+                    loader_backend = "blob"
+                    fallback_used = True
+                    logger.info(
+                        "angr_load_segment: blob fallback for %s (arch=%s base=%s entry=%s)",
+                        path,
+                        blob_opts.get("arch"),
+                        hex(blob_opts["base_addr"]) if "base_addr" in blob_opts else "default",
+                        hex(blob_opts["entry_point"]) if "entry_point" in blob_opts else "default",
+                    )
+                except Exception as e_blob:
+                    return tool_error(
+                        e_blob,
+                        context="angr.Project/blob",
+                        hint=(
+                            "Blob fallback also failed. Pass an explicit arch "
+                            "('X86'/'AMD64'/'ARMEL'/'AARCH64'/'MIPS32'/'PPC32') and/or "
+                            "base_address, or use angr_cfg_from_ida / "
+                            "workflow_find_gadgets, which need no angr project."
+                        ),
+                    )
 
             pid = project_id or _next_project_id()
             entry = {
                 "project":     proj,
                 "binary_path": path,
+                "loader_backend": loader_backend,
                 "cfg":         None,
                 "snapshots":   {},
                 "hooks":       {},
@@ -908,6 +1161,18 @@ if ANGR_AVAILABLE:
                 "last_found_states": [],
             }
             _store_project(pid, entry)
+
+            if fallback_used:
+                note = (
+                    "Loaded via angr 'blob' backend (raw binary, no symbols), rebased "
+                    "to IDA's imagebase so addresses match the IDB. For CFG/function "
+                    "data prefer angr_cfg_from_ida — IDA's analysis is ground truth on "
+                    "a blob; use angr for symbolic execution (angr_find_paths, "
+                    "workflow_solve_crackme). CFGFast on a blob needs "
+                    "force_complete_scan=True and is still weaker than IDA."
+                )
+            else:
+                note = "Project cached. Call angr_cfg_fast to build a CFG."
 
             return {
                 "ok": True,
@@ -919,7 +1184,9 @@ if ANGR_AVAILABLE:
                 "image_base": hex(proj.loader.main_object.mapped_base),
                 "memory_regions": _summarize_memory_regions(proj),
                 "symbol_count": len(list(proj.loader.main_object.symbols)),
-                "note": "Project cached. Call angr_cfg_fast to build a CFG.",
+                "loader_backend": loader_backend,
+                "fallback_used": fallback_used,
+                "note": note,
             }
         except Exception as e:
             return tool_error(e, context="angr_load_segment")
@@ -960,6 +1227,14 @@ if ANGR_AVAILABLE:
         for IDA plugin safety. The Project is cached with LRU eviction
         (max 3 projects); subsequent calls with the same binary return the
         same project_id.
+
+        Raw binaries with no PE/ELF/MachO header (decrypted sections, shellcode
+        dumps, custom formats) are handled automatically: if CLE can't detect a
+        backend, the loader retries with angr's 'blob' backend, rebasing to IDA's
+        imagebase and seeding the entry point from IDA so addresses match the IDB.
+        The result reports ``loader_backend`` and ``fallback_used``. On a blob,
+        prefer angr_cfg_from_ida for CFG/function data (IDA is ground truth) and
+        reserve angr for symbolic execution.
         """
         return _load_segment_impl(
             segment_names=segment_names,
@@ -996,15 +1271,55 @@ if ANGR_AVAILABLE:
     # A.2 — angr_cfg_fast
     # =====================================================================
 
+    # A blob this size or larger triggers pathological CFGFast complete-scan
+    # times (the V2 stress test saw 15+ min on a 1.5 MB blob). Above it we
+    # refuse force_complete_scan unless the caller explicitly overrides.
+    _BLOB_COMPLETE_SCAN_LIMIT = 512 * 1024
+
     def _cfg_fast_impl(
         project_id: str | None = None,
         resolve_indirect_jumps: bool = True,
         force_complete_scan: bool = False,
         max_functions: int = 200,
         timeout_seconds: int = 60,
+        allow_blob_complete_scan: bool = False,
     ) -> AngrCfgResult:
         try:
             entry, proj = _ensure_project(project_id)
+
+            # Guard against the V2 thread-starvation trap: force_complete_scan on
+            # a large symbolless blob can run for many minutes, and because the
+            # worker holds the GIL in native code it starves every other tool
+            # (even angr_status). On a blob, IDA's own analysis is ground truth
+            # anyway, so steer the agent there instead of melting the main thread.
+            if (
+                force_complete_scan
+                and not allow_blob_complete_scan
+                and entry.get("loader_backend") == "blob"
+            ):
+                try:
+                    obj = proj.loader.main_object
+                    blob_size = int(obj.max_addr - obj.min_addr)
+                except Exception:
+                    blob_size = 0
+                if blob_size >= _BLOB_COMPLETE_SCAN_LIMIT:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Refusing force_complete_scan on a {blob_size // 1024} KB "
+                            "blob — CFGFast complete-scan on a symbolless blob this "
+                            "size can block for many minutes and starve all other "
+                            "tools (it holds the GIL in native code)."
+                        ),
+                        "error_type": "invalid_input",
+                        "hint": (
+                            "Use angr_cfg_from_ida (IDA already analyzed this blob — "
+                            "ground truth), or call angr_cfg_fast again with "
+                            "force_complete_scan=False, or pass "
+                            "allow_blob_complete_scan=True to override if you really "
+                            "want the full scan and can wait."
+                        ),
+                    }
 
             def _build():
                 return proj.analyses.CFGFast(
@@ -1079,6 +1394,21 @@ if ANGR_AVAILABLE:
             except Exception:
                 pass
 
+            note = "CFGFast is static — indirect jumps resolved heuristically."
+            is_blob = entry.get("loader_backend") == "blob"
+            if is_blob and not force_complete_scan and len(funcs) == 0:
+                note = (
+                    "CFGFast found no functions on this blob. A blob has no symbols, "
+                    "so prefer angr_cfg_from_ida (IDA already analyzed this binary), "
+                    "or retry with force_complete_scan=True to scan the whole region "
+                    "as code (slower, noisier)."
+                )
+            elif is_blob:
+                note = (
+                    "CFGFast on a blob is heuristic and weaker than IDA — "
+                    "cross-check with angr_cfg_from_ida for ground-truth function data."
+                )
+
             return {
                 "ok": True,
                 "project_id": _project_id_for_entry(entry) or "",
@@ -1089,7 +1419,7 @@ if ANGR_AVAILABLE:
                 "unresolved_indirect_jumps": unresolved_ij,
                 "functions": funcs_sorted[:max_functions],
                 "top_by_complexity": funcs_sorted[:10],
-                "note": "CFGFast is static — indirect jumps resolved heuristically.",
+                "note": note,
             }
         except Exception as e:
             return tool_error(e, context="angr_cfg_fast")
@@ -1111,11 +1441,21 @@ if ANGR_AVAILABLE:
             int, "Cap functions list at this many entries (default: 200)"
         ] = 200,
         timeout_seconds: Annotated[int, "Timeout in seconds (default: 60)"] = 60,
+        allow_blob_complete_scan: Annotated[
+            bool,
+            "Permit force_complete_scan on a large blob despite the multi-minute / "
+            "thread-starvation risk (default: False — refused on big blobs).",
+        ] = False,
     ) -> AngrCfgResult:
         """Build a static CFG via angr's CFGFast.
 
         Read-only — does not modify IDA. CFG is cached in the project entry
         so downstream tools (backward_slice, value_set) can reuse it.
+
+        On a blob loaded via the 'blob' backend, prefer angr_cfg_from_ida —
+        IDA's analysis is ground truth and CFGFast complete-scan on a large blob
+        can block for minutes. This tool refuses force_complete_scan on big blobs
+        unless allow_blob_complete_scan=True.
 
         Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
         """
@@ -1125,6 +1465,7 @@ if ANGR_AVAILABLE:
             force_complete_scan=force_complete_scan,
             max_functions=max_functions,
             timeout_seconds=timeout_seconds,
+            allow_blob_complete_scan=allow_blob_complete_scan,
         )
 
 
@@ -1172,36 +1513,28 @@ if ANGR_AVAILABLE:
                     if source_address == "entry":
                         state = proj.factory.entry_state(
                             stdin=stdin_file,
-                            add_options={
-                                _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-                                _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-                            },
+                            add_options=_STATE_ADD_OPTIONS,
+                            remove_options=_STATE_REMOVE_OPTIONS,
                         )
                     else:
                         state = proj.factory.blank_state(
                             addr=source_ea,
                             stdin=stdin_file,
-                            add_options={
-                                _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-                                _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-                            },
+                            add_options=_STATE_ADD_OPTIONS,
+                            remove_options=_STATE_REMOVE_OPTIONS,
                         )
                 elif input_mode == "argv":
                     sym_input = _claripy.BVS("argv1", max(8, input_size) * 8)
                     state = proj.factory.entry_state(
                         args=[proj.filename, sym_input],
-                        add_options={
-                            _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-                            _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-                        },
+                        add_options=_STATE_ADD_OPTIONS,
+                        remove_options=_STATE_REMOVE_OPTIONS,
                     )
                 elif input_mode == "register":
                     state = proj.factory.blank_state(
                         addr=source_ea,
-                        add_options={
-                            _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-                            _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-                        },
+                        add_options=_STATE_ADD_OPTIONS,
+                        remove_options=_STATE_REMOVE_OPTIONS,
                     )
                     bits = proj.arch.bits
                     for reg in ("rdi", "rsi", "rdx", "rcx", "r8", "r9"):
@@ -1911,10 +2244,8 @@ if ANGR_AVAILABLE:
             at_ea = parse_address(at_address)
             state = proj.factory.blank_state(
                 addr=at_ea,
-                add_options={
-                    _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-                    _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-                },
+                add_options=_STATE_ADD_OPTIONS,
+                remove_options=_STATE_REMOVE_OPTIONS,
             )
 
             if initial_registers:
@@ -2249,9 +2580,10 @@ if ANGR_AVAILABLE:
             return tool_error(e, context="angr_backward_slice")
 
 
+    # In-process fallback, marshalled to the IDA main thread on demand.
+    _backward_slice_in_process = idasync(_backward_slice_impl)
+
     @tool
-    @idasync
-    @tool_timeout(180.0)
     def angr_backward_slice(
         target_address: Annotated[str, "Address to slice from (hex)"],
         target_reg: Annotated[
@@ -2272,8 +2604,36 @@ if ANGR_AVAILABLE:
           • CFG-only (default, fast): uses CFGFast + control_flow_slice=True.
           • DDG-backed (use_cfg_only=False): uses CFGEmulated + CDG + DDG.
             Precise but minutes-long on real binaries.
+
+        CFG-only runs in the out-of-process angr worker when available: this is
+        what finally fixes the ``cannot pickle '_cffi_backend._CDataBase'`` error
+        (the slice never leaves the worker — only a plain address list crosses,
+        which the parent enriches with IDA mnemonics/names). DDG mode and the
+        no-worker case use the in-process path.
         """
-        return _backward_slice_impl(
+        if use_cfg_only and _use_worker():
+            hints = _gather_load_hints()
+            res = _worker_request(
+                "backward_slice",
+                {"load": hints, "project_id": project_id,
+                 "target_address": target_address, "target_reg": target_reg,
+                 "max_results": max_results},
+                timeout=float(timeout_seconds) + 30.0,
+            )
+            if res.get("ok"):
+                items = _enrich_slice_addresses(res.get("slice_addresses", []), target_reg)
+                return {
+                    "ok": True,
+                    "target_address": res.get("target_address", target_address),
+                    "target_reg": target_reg or "",
+                    "slice_size": len(items),
+                    "contributing_instructions": items,
+                    "timed_out": False,
+                    "note": "CFG-only slice (control flow only) — computed out-of-process.",
+                }
+            return res  # structured worker error (timeout/not_found/etc.)
+
+        return _backward_slice_in_process(
             target_address=target_address,
             target_reg=target_reg,
             use_cfg_only=use_cfg_only,
@@ -2311,10 +2671,8 @@ if ANGR_AVAILABLE:
 
             state = proj.factory.blank_state(
                 addr=func_ea,
-                add_options={
-                    _angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-                    _angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-                },
+                add_options=_STATE_ADD_OPTIONS,
+                remove_options=_STATE_REMOVE_OPTIONS,
             )
             simgr = proj.factory.simgr(state)
 

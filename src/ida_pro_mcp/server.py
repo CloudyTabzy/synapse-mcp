@@ -125,6 +125,19 @@ DEFAULT_IDA_PORT = 13337
 IDA_HOST = DEFAULT_IDA_HOST
 IDA_PORT = DEFAULT_IDA_PORT
 
+# How long the stdio proxy waits on a single synchronous tool call to IDA before
+# giving up. The old hardcoded 30 s was the V3 "proxy timeout" that dropped heavy
+# angr/CFG operations mid-flight. Heavy tools should still prefer async_mode
+# (submit + poll, each call fast), but this raises the synchronous ceiling so
+# moderately-long ops complete and their output is actually returned. Override
+# with IDA_MCP_PROXY_TIMEOUT_SEC; the fast submit/poll calls are unaffected since
+# the value is a ceiling, not a fixed wait.
+def _proxy_timeout_seconds() -> float:
+    try:
+        return max(5.0, float(os.environ.get("IDA_MCP_PROXY_TIMEOUT_SEC", "180")))
+    except (TypeError, ValueError):
+        return 180.0
+
 mcp = McpServer(MCP_SERVER_NAME)
 dispatch_original = mcp.registry.dispatch
 
@@ -337,7 +350,7 @@ def _proxy_to_instance(host: str, port: int, payload: bytes | str | dict) -> dic
     elif isinstance(payload, str):
         payload = payload.encode("utf-8")
 
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+    conn = http.client.HTTPConnection(host, port, timeout=_proxy_timeout_seconds())
     try:
         conn.request(
             "POST",
@@ -360,7 +373,7 @@ def _proxy_to_instance(host: str, port: int, payload: bytes | str | dict) -> dic
 
 def _proxy_output_download(host: str, port: int, path: str) -> tuple[int, str, list[tuple[str, str]], bytes]:
     """Proxy a raw output download from a specific IDA instance."""
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+    conn = http.client.HTTPConnection(host, port, timeout=_proxy_timeout_seconds())
     try:
         conn.request("GET", path)
         response = conn.getresponse()

@@ -14,15 +14,20 @@ MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
 MCP_SERVER = McpServer(MCP_SERVER_NAME, extensions=MCP_EXTENSIONS)
 
-# Auto-compress large uniform-array responses into TOON tabular form when
+# Auto-compress uniform-array responses into TOON tabular form when
 # toon_format is installed in IDA's Python. Runs for the direct-HTTP transport
 # (client → IDA plugin), which is the path server.py's proxy never sees.
 try:
+    from .toon_encode import TOON_AVAILABLE as _TOON_AVAILABLE
     from .toon_encode import maybe_toon_encode_result as _maybe_toon
 
     MCP_SERVER.result_post_processor = lambda _name, result: _maybe_toon(result)
-except Exception:
-    pass
+    if _TOON_AVAILABLE:
+        print("[synapse-mcp] TOON response compression active (threshold: 10 rows)")
+    else:
+        print("[synapse-mcp] TOON inactive — install toon_format in IDA's Python to enable")
+except Exception as _toon_init_err:
+    print(f"[synapse-mcp] TOON init error: {_toon_init_err}")
 
 # ============================================================================
 # Tool Grouping and Profiles
