@@ -1284,6 +1284,8 @@ if ANGR_AVAILABLE:
         max_functions: int = 200,
         timeout_seconds: int = 60,
         allow_blob_complete_scan: bool = False,
+        start_address: str | None = None,
+        max_depth: int = 0,
     ) -> AngrCfgResult:
         try:
             entry, proj = _ensure_project(project_id)
@@ -1410,17 +1412,79 @@ if ANGR_AVAILABLE:
                     "cross-check with angr_cfg_from_ida for ground-truth function data."
                 )
 
+            # ── max_depth filtering via call-graph BFS ────────────────────
+            filtered_note = ""
+            depth_filtered = False
+            if max_depth > 0:
+                # Resolve start_address to an angr function address
+                start_addr: int | None = None
+                if start_address:
+                    try:
+                        start_addr = parse_address(start_address)
+                    except Exception:
+                        pass
+                if start_addr is None:
+                    try:
+                        start_addr = proj.entry
+                    except Exception:
+                        start_addr = None
+
+                if start_addr is not None and len(funcs) > 0:
+                    # Build adjacency: addr -> set of call target addrs
+                    adj: dict[str, set[str]] = {}
+                    all_addrs: set[str] = {f["addr"] for f in funcs}
+                    for f in funcs:
+                        src = f["addr"]
+                        adj.setdefault(src, set())
+                        for tgt_str in f.get("call_targets", []) or []:
+                            # Normalize: target may be hex string with/without 0x prefix
+                            try:
+                                tgt_hex = hex(int(tgt_str, 16))
+                            except (ValueError, TypeError):
+                                continue
+                            if tgt_hex in all_addrs:
+                                adj[src].add(tgt_hex)
+                            # also try adding reverse edges (callees → callers)
+                            adj.setdefault(tgt_hex, set())
+                            if tgt_hex in all_addrs:
+                                adj[tgt_hex].add(src)
+
+                    start_key = hex(start_addr)
+                    # BFS depth computation
+                    depth: dict[str, int] = {}
+                    queue = [start_key]
+                    depth[start_key] = 0
+                    while queue:
+                        node = queue.pop(0)
+                        next_depth = depth[node] + 1
+                        if next_depth > max_depth:
+                            continue
+                        for neighbor in adj.get(node, set()):
+                            if neighbor not in depth:
+                                depth[neighbor] = next_depth
+                                queue.append(neighbor)
+
+                    # Filter functions list
+                    funcs_filtered = [f for f in funcs if f["addr"] in depth]
+                    funcs_sorted = sorted(funcs_filtered, key=lambda f: depth.get(f["addr"], 99))
+                    filtered_note = (
+                        f" Depth-filtered from {len(funcs)} → {len(funcs_sorted)} functions "
+                        f"(max_depth={max_depth} from {start_key}). "
+                    )
+                    depth_filtered = True
+
             return {
                 "ok": True,
                 "project_id": _project_id_for_entry(entry) or "",
-                "function_count": len(funcs),
+                "function_count": len(funcs_sorted),
                 "block_count": block_count,
                 "edge_count": edge_count,
                 "indirect_jumps_resolved": resolved_ij,
                 "unresolved_indirect_jumps": unresolved_ij,
                 "functions": funcs_sorted[:max_functions],
                 "top_by_complexity": funcs_sorted[:10],
-                "note": note,
+                "note": note + filtered_note,
+                "depth_filtered": depth_filtered,
             }
         except Exception as e:
             return tool_error(e, context="angr_cfg_fast")
@@ -1441,6 +1505,19 @@ if ANGR_AVAILABLE:
         max_functions: Annotated[
             int, "Cap functions list at this many entries (default: 200)"
         ] = 200,
+        start_address: Annotated[
+            str | None,
+            "⭐ Focus CFG on a specific function. When set with max_depth, only "
+            "returns functions within N call-graph hops of this address. "
+            "Omit to get full binary CFG.",
+        ] = None,
+        max_depth: Annotated[
+            int,
+            "⭐ Maximum call-graph depth from start_address (default: 0 = unlimited). "
+            "Use with start_address for targeted analysis: max_depth=1 gives the "
+            "function's direct callers/callees, max_depth=2 adds their neighbors, etc. "
+            "Setting max_depth > 0 without start_address uses the binary entry point.",
+        ] = 0,
         timeout_seconds: Annotated[int, "Timeout in seconds (default: 60)"] = 60,
         allow_blob_complete_scan: Annotated[
             bool,
@@ -1453,21 +1530,28 @@ if ANGR_AVAILABLE:
         Read-only — does not modify IDA. CFG is cached in the project entry
         so downstream tools (backward_slice, value_set) can reuse it.
 
+        Use start_address + max_depth for targeted analysis — avoids building
+        a full binary-wide CFG when you only care about one function's neighborhood.
+
         On a blob loaded via the 'blob' backend, prefer angr_cfg_from_ida —
         IDA's analysis is ground truth and CFGFast complete-scan on a large blob
-        can block for minutes. This tool refuses force_complete_scan on big blobs
-        unless allow_blob_complete_scan=True.
+        can block for minutes.
 
-        Heavy: for large binaries use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+        Heavy: always use invoke_tool(async_mode='task') or task_wait.
         """
-        return _cfg_fast_impl(
+        result = _cfg_fast_impl(
             project_id=project_id,
             resolve_indirect_jumps=resolve_indirect_jumps,
             force_complete_scan=force_complete_scan,
             max_functions=max_functions,
             timeout_seconds=timeout_seconds,
             allow_blob_complete_scan=allow_blob_complete_scan,
+            start_address=start_address,
+            max_depth=max_depth,
         )
+        if isinstance(result, dict) and not result.get("ok"):
+            return result
+        return result
 
 
     # =====================================================================
@@ -1692,62 +1776,18 @@ if ANGR_AVAILABLE:
             return tool_error(e, context="angr_find_paths")
 
 
-    @tool
-    @idasync
-    @tool_timeout(240.0)
-    def angr_find_paths(
-        target_address: Annotated[str, "Address to reach (hex or symbol)"],
-        source_address: Annotated[
-            str, "Start address (hex or 'entry'). Default: binary entry point"
-        ] = "entry",
-        avoid_addresses: Annotated[
-            list[str] | str | None,
-            "Address(es) to avoid — failure paths, wrong-password branches. "
-            "Comma-separated string or list of hex addresses.",
-        ] = None,
-        input_mode: Annotated[
-            str,
-            "'stdin' (model stdin as symbolic bytes — default), "
-            "'argv' (model argv[1] as symbolic), "
-            "'register' (symbolize rdi/rsi/rdx at source).",
-        ] = "stdin",
-        input_size: Annotated[
-            int,
-            "Size of symbolic input in bytes. For serial keys: the expected key length. "
-            "Default: 64.",
-        ] = 64,
-        char_constraint: Annotated[
-            str | None,
-            "Constrain input bytes to a character class (e.g. 'printable', 'alphanumeric', "
-            "'A-Z,0-9', '2-9,A-H,J-N,{,}'). Reduces search space for known serial formats.",
-        ] = None,
-        max_paths: Annotated[int, "Maximum solutions to return (default: 5)"] = 5,
-        use_dfs: Annotated[
-            bool, "Use depth-first search instead of BFS (default: False)"
-        ] = False,
-        use_veritesting: Annotated[
-            bool, "Enable Veritesting for static symex at loops (default: False)"
-        ] = False,
-        loop_bound: Annotated[int, "LoopSeer iteration bound (default: 10)"] = 10,
-        project_id: Annotated[str | None, "Project ID from angr_load_segment"] = None,
-        timeout_seconds: Annotated[
-            int, "Total timeout in seconds (default: 120)"
-        ] = 120,
+    def _find_paths_with_worker(
+        target_address: str, source_address: str = "entry",
+        avoid_addresses=None, input_mode: str = "stdin", input_size: int = 64,
+        char_constraint: str | None = None, max_paths: int = 5,
+        use_dfs: bool = False, use_veritesting: bool = False,
+        loop_bound: int = 10, project_id: str | None = None,
+        timeout_seconds: int = 120,
     ) -> AngrFindPathsResult:
-        """⭐ Solve for concrete inputs that drive execution from source to target.
+        """Shared find_paths dispatch: worker if available, else in-process.
 
-        **The tool that solves crackmes.** Models stdin/argv/registers as
-        symbolic and uses angr's SimulationManager to find paths that reach
-        the target while avoiding failure paths.
-
-        For a typical crackme:
-            target_address  = address of the "win" string xref / success path
-            avoid_addresses = address(es) of "wrong password" / failure paths
-            input_mode      = "stdin"
-            input_size      = known serial length (e.g. 59 bytes)
-            char_constraint = "printable" or "FRZ{,A-Z,0-9}" if the format is known
-
-        Heavy: for non-trivial targets use invoke_tool(..., async_mode='task') or task_submit + task_poll.
+        Used by both the @tool angr_find_paths (so it supports worker + auto_async)
+        and workflow_solve_crackme (which composes find_paths into a one-call solver).
         """
         if _use_worker():
             hints = _gather_load_hints_internal()
@@ -1756,22 +1796,82 @@ if ANGR_AVAILABLE:
                 avoid_list = [hex(parse_address(a)) for a in normalize_list_input(avoid_addresses) if a]
             return _worker_request(
                 "find_paths",
-                {
-                    "load": hints,
-                    "project_id": project_id,
-                    "target_address": target_address,
-                    "source_address": source_address,
-                    "input_mode": input_mode,
-                    "input_size": input_size,
-                    "char_constraint": char_constraint,
-                    "max_paths": max_paths,
-                    "use_dfs": use_dfs,
-                    "use_veritesting": use_veritesting,
-                    "loop_bound": loop_bound,
-                    "avoid_addresses": avoid_list,
-                },
+                {"load": hints, "project_id": project_id,
+                 "target_address": target_address, "source_address": source_address,
+                 "input_mode": input_mode, "input_size": input_size,
+                 "char_constraint": char_constraint, "max_paths": max_paths,
+                 "use_dfs": use_dfs, "use_veritesting": use_veritesting,
+                 "loop_bound": loop_bound, "avoid_addresses": avoid_list},
                 timeout=float(timeout_seconds) + 30.0,
             )
+        return _find_paths_impl(
+            target_address=target_address, source_address=source_address,
+            avoid_addresses=avoid_addresses, input_mode=input_mode,
+            input_size=input_size, char_constraint=char_constraint,
+            max_paths=max_paths, use_dfs=use_dfs, use_veritesting=use_veritesting,
+            loop_bound=loop_bound, project_id=project_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @tool
+    @idasync
+    @tool_timeout(120.0)
+    def angr_find_paths(
+        target_address: Annotated[str, "Address to reach — typically the 'win'/'success' branch (hex or symbol)"],
+        source_address: Annotated[str, "Start address (hex or 'entry'). Default: binary entry point"] = "entry",
+        avoid_addresses: Annotated[
+            list[str] | str | None,
+            "⭐ CRITICAL: Address(es) to AVOID — failure/wrong-password branches. "
+            "Without this, angr may find trivial paths that don't represent a real solve. "
+            "Comma-separated string or list of hex addresses (e.g. '0x401050,0x401080').",
+        ] = None,
+        input_mode: Annotated[
+            str, "'stdin' (model stdin as symbolic bytes — default), "
+                 "'argv' (model argv[1] as symbolic), "
+                 "'register' (symbolize rdi/rsi/rdx at source)."
+        ] = "stdin",
+        input_size: Annotated[int, "Size of symbolic input in bytes. For serial keys: the expected key length. Default: 64."] = 64,
+        char_constraint: Annotated[
+            str | None,
+            "Constrain input bytes to a character class (e.g. 'printable', 'alphanumeric', "
+            "'A-Z,0-9', 'FRZ{,A-Z,0-9}'). Reduces search space. If you know the flag format "
+            "(e.g. 'TESS{'), pass it as known_format to the include_characters field.",
+        ] = None,
+        max_paths: Annotated[int, "⭐ Maximum distinct solutions to return (default: 5). Set higher "
+                                   "to enumerate all valid inputs — useful when the crackme accepts "
+                                   "multiple passwords."] = 5,
+        use_dfs: Annotated[bool, "Use depth-first search instead of BFS (default: False)"] = False,
+        use_veritesting: Annotated[bool, "Enable Veritesting for static symex at loops (default: False)"] = False,
+        loop_bound: Annotated[int, "LoopSeer iteration bound (default: 10)"] = 10,
+        project_id: Annotated[str | None, "Project ID from angr_load_segment"] = None,
+        timeout_seconds: Annotated[int, "Total timeout in seconds (default: 120)"] = 120,
+    ) -> AngrFindPathsResult:
+        """⭐ Solve for concrete inputs that drive execution from source to target.
+
+        **The tool that solves crackmes.** Models stdin/argv/registers as
+        symbolic and uses angr's SimulationManager to find paths that reach
+        the target while avoiding failure paths.
+
+        Usage for a typical crackme:
+            angr_load_segment()                     # load the binary into angr
+            angr_find_paths(
+                target_address  = address of "Correct!" / "Success!" xref
+                avoid_addresses = ["0x40F050", ...]  # wrong-password branches ⭐ IMPORTANT
+                input_size      = 59                 # known serial length
+                char_constraint = "printable"        # or "FRZ{,A-Z,0-9}" for known format
+                max_paths       = 3                  # enumerate multiple solutions
+            )
+
+        Heavy: always use invoke_tool(async_mode='task') or task_wait.
+        """
+        return _find_paths_with_worker(
+            target_address=target_address, source_address=source_address,
+            avoid_addresses=avoid_addresses, input_mode=input_mode,
+            input_size=input_size, char_constraint=char_constraint,
+            max_paths=max_paths, use_dfs=use_dfs, use_veritesting=use_veritesting,
+            loop_bound=loop_bound, project_id=project_id,
+            timeout_seconds=timeout_seconds,
+        )
         return _find_paths_impl(
             target_address=target_address,
             source_address=source_address,
@@ -1935,9 +2035,9 @@ if ANGR_AVAILABLE:
                 else:
                     cc = "printable"
 
-            # 3) Solve
+            # 3) Solve — uses shared worker dispatch path
             start = time.time()
-            res = _find_paths_impl(
+            res = _find_paths_with_worker(
                 target_address=hex(target_ea),
                 source_address=source_address,
                 avoid_addresses=avoid_str if avoid_str else None,
