@@ -575,6 +575,12 @@ class McpServer:
         self.require_streamable_http_session = False
         self._tools_list_cache: dict[str, list[dict]] = {}
 
+        # Optional hook: (tool_name, result) -> alternate content text | None.
+        # When it returns a string, that string becomes the tool's text content
+        # and structuredContent is omitted. Used for response transforms such as
+        # TOON encoding. Defaults to None (no transform).
+        self.result_post_processor: Callable[[str, Any], str | None] | None = None
+
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
         self.registry.methods["ping"] = self._mcp_ping
@@ -859,6 +865,22 @@ class McpServer:
                 }
 
             result = tool_response.get("result") if tool_response else None
+
+            # Optional response transform (e.g. TOON encoding). When it returns a
+            # string, use it as the sole text content and omit structuredContent —
+            # otherwise the full JSON would still ship via structuredContent and
+            # negate the token savings.
+            if self.result_post_processor is not None:
+                try:
+                    alt_text = self.result_post_processor(name, result)
+                except Exception:
+                    alt_text = None
+                if isinstance(alt_text, str):
+                    return {
+                        "content": [{"type": "text", "text": alt_text}],
+                        "isError": False,
+                    }
+
             return {
                 "content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}],
                 "structuredContent": result if isinstance(result, dict) else {"result": result},

@@ -14,10 +14,23 @@ from typing import Annotated, TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, urlparse
 
 try:
-    from toon_format import encode as _toon_encode
-    _TOON_AVAILABLE = True
+    from .ida_mcp.toon_encode import (
+        TOON_AVAILABLE as _TOON_AVAILABLE,
+        TOON_MIN_ROWS as _TOON_MIN_ROWS,
+        maybe_toon_encode_result as _maybe_toon_encode_result,
+    )
 except ImportError:
-    _TOON_AVAILABLE = False
+    try:
+        from ida_mcp.toon_encode import (
+            TOON_AVAILABLE as _TOON_AVAILABLE,
+            TOON_MIN_ROWS as _TOON_MIN_ROWS,
+            maybe_toon_encode_result as _maybe_toon_encode_result,
+        )
+    except ImportError:
+        _TOON_AVAILABLE = False
+        _TOON_MIN_ROWS = 20
+        def _maybe_toon_encode_result(_data):
+            return None
 
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import (
@@ -428,68 +441,44 @@ def _proxy_to_ida(payload: bytes | str | dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# TOON response post-processor
+# TOON response post-processor (stdio-proxy path)
 # Auto-encodes tool results that contain large uniform flat arrays into the
 # compact TOON tabular format, reducing agent context usage by ~40%.
+#
+# This is the fallback for the stdio proxy. The IDA plugin applies the same
+# encoding directly (see ida_mcp/rpc.py); when it already did, the text here is
+# TOON (not JSON), json.loads fails, and we return the response unchanged.
+# Qualification + encoding logic lives in ida_mcp/toon_encode.py (single source).
 # Requires: pip install toon_format  (optional — falls back silently)
 # ---------------------------------------------------------------------------
-
-_TOON_MIN_ROWS = 20  # minimum array length to trigger tabular encoding
-
-
-def _is_uniform_flat_array(lst: list) -> bool:
-    """True when every item is a dict with the same keys and all-primitive values."""
-    if not lst or not isinstance(lst[0], dict):
-        return False
-    first_keys = set(lst[0].keys())
-    if not first_keys:
-        return False
-    _primitive = (str, int, float, bool, type(None))
-    for item in lst:
-        if not isinstance(item, dict):
-            return False
-        if set(item.keys()) != first_keys:
-            return False
-        if not all(isinstance(v, _primitive) for v in item.values()):
-            return False
-    return True
-
-
-def _response_qualifies_for_toon(data: dict) -> bool:
-    """True when the response dict contains at least one large uniform flat array."""
-    for v in data.values():
-        if isinstance(v, list) and len(v) >= _TOON_MIN_ROWS and _is_uniform_flat_array(v):
-            return True
-    return False
 
 
 def _maybe_toon_encode_response(response: dict | None) -> dict | None:
     """TOON-encode the text content of a tools/call JSON-RPC response.
 
-    Only fires when:
-    - toon_format is installed
-    - Response carries a successful (ok: true) tool result
-    - That result contains at least one array of >=20 uniform flat objects
-
-    Falls back to the original response on any error, including import errors.
+    Fires only when toon_format is installed, the result is a successful
+    (ok: true) dict, and it contains an array of >=20 uniform flat objects.
+    On success the text content becomes TOON and structuredContent is dropped
+    so the full JSON does not still ship and negate the savings. Falls back to
+    the original response on any error.
     """
     if not _TOON_AVAILABLE or response is None:
         return response
     try:
-        content_list = response.get("result", {}).get("content", [])
+        result_obj = response.get("result", {})
+        content_list = result_obj.get("content", [])
         if not content_list or content_list[0].get("type") != "text":
             return response
         text = content_list[0].get("text", "")
         data = json.loads(text)
         if not isinstance(data, dict) or not data.get("ok"):
             return response
-        if not _response_qualifies_for_toon(data):
+        toon_text = _maybe_toon_encode_result(data)
+        if toon_text is None:
             return response
-        # Prepend _format hint so agents immediately know the encoding.
-        annotated = {"_format": "TOON_TABULAR", **data}
-        toon_text = _toon_encode(annotated)
         encoded = copy.deepcopy(response)
         encoded["result"]["content"][0]["text"] = toon_text
+        encoded["result"].pop("structuredContent", None)
         return encoded
     except Exception:
         return response

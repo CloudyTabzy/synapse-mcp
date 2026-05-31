@@ -277,14 +277,20 @@ if "!ANY_INSTALLED!"=="N" (
     )
 )
 
-:: --- TOON server-side encoding (separate from IDA-side engines) ---------------
+:: --- TOON token compression -------------------------------------------------
 echo.
-echo [4b/5] Server-side token compression
+echo [4b/5] Token-efficient response compression
 echo -------------------------------------------------------
 echo toon_format auto-compresses large list responses from tools like
 echo lief_exports, list_functions_enhanced, find_function_prologues, and
 echo get_bulk_function_hashes — ~40%% fewer tokens on qualifying calls.
-echo This installs into the MCP server's Python (NOT IDA's Python).
+echo.
+echo Install it into the Python that serializes responses:
+echo   - Direct HTTP transport (client talks to IDA on :13337): IDA's Python
+echo   - stdio proxy (client talks to synapse-mcp): this server's Python
+echo This installs into the CURRENT pip (the server's Python). If your MCP
+echo client connects directly to IDA, also install it into IDA's Python:
+echo   "<IDA-python>\python.exe" -m pip install toon_format
 echo.
 set /p TOON_CHOICE="Install toon_format (TOON response compression)?  [Y/N] (default N): "
 if /i "!TOON_CHOICE!"=="" set TOON_CHOICE=N

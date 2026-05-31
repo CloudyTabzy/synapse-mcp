@@ -254,7 +254,10 @@ uv run ida-pro-mcp --install-deps networkx
 pip install angr
 # All at once (excludes angr)
 uv run ida-pro-mcp --install-deps all
-# TOON token-efficient encoding (server-side; install into the MCP server's Python, NOT IDA's)
+# TOON token-efficient encoding. Install into the Python that serializes responses:
+#   direct HTTP transport  -> IDA's Python (the one idapyswitch points at)
+#   stdio proxy            -> the MCP server's Python
+# Installing in both is safe.
 pip install toon_format
 ```
 
@@ -361,7 +364,12 @@ Lower priority:
 - `filetype>=1.2.0`: Pure-Python. Magic-byte detection (79+ formats).
 - `yara-python>=4.3.0`: C-extension YARA binding. Built-in crypto and threat rules are embedded as Python string constants — no external `.yar` files needed. The `yara_idb_annotate` killer feature maps matches back to IDA virtual addresses and cannot be replicated by standalone YARA.
 - `networkx>=3.0`: Pure-Python graph algorithms. Powers call-graph centrality (PageRank, betweenness), community detection (Louvain), SCC analysis, shortest paths, dominators, graph diff. The `workflow_reveng_overview` killer feature combines all of these into a one-call structural binary analysis with prioritized recommendations.
-- `toon_format>=0.9.0`: **Server-side only** (install into the MCP server's Python, not IDA's). When present, the proxy post-processor automatically TOON-encodes tool responses that contain a uniform flat array of ≥20 rows, yielding ~40% fewer context tokens. Qualifying tools: `lief_exports`, `list_functions_enhanced`, `get_bulk_function_hashes`, `find_global_writers`, `find_function_prologues`, `find_indirect_calls`, and others returning large flat lists. Encoded responses start with `_format: TOON_TABULAR` so agents immediately know the encoding. Falls back to JSON silently when the response doesn't qualify or when an error occurs.
+- `toon_format>=0.9.0`: token-efficient response encoding. Install it into **whichever Python serializes tool responses**:
+  - **Direct HTTP transport** (MCP client → IDA plugin on :13337, the common setup): install into **IDA's Python**. The encoding runs in the plugin (`ida_mcp/toon_encode.py`, wired via `MCP_SERVER.result_post_processor` in `ida_mcp/rpc.py`).
+  - **stdio proxy** (MCP client → `synapse-mcp` → IDA): install into the **server's Python**. `server.py`'s proxy post-processor handles it as a fallback.
+  - Installing it in both Pythons is safe — the second pass sees TOON text (not JSON) and no-ops.
+
+  When present, responses containing a uniform flat array of ≥20 rows are auto-encoded into TOON tabular form, yielding ~40% fewer context tokens. On encode, the result's text content becomes TOON and `structuredContent` is omitted so the full JSON doesn't still ship. Qualifying tools: `lief_exports`, `list_functions_enhanced`, `get_bulk_function_hashes`, `find_global_writers`, `find_function_prologues`, `find_indirect_calls`, and others returning large flat lists. Encoded responses start with `_format: TOON_TABULAR` so agents immediately know the encoding. Falls back to JSON silently when the response doesn't qualify or when an error occurs. **Single source of truth:** qualification + encoding logic lives in `ida_mcp/toon_encode.py`; both transports import it.
 - All engines are optional. The plugin loads cleanly without them; only the `*_status` probe tools report `"available": false`.
 
 ### Return-type design principle

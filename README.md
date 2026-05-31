@@ -85,7 +85,7 @@ total_exports: 50
 
 The `_format: TOON_TABULAR` marker is always the first line — agents know the encoding immediately and can parse accordingly. The `[50]` length count and `{fields}` header give models an explicit schema to validate against, which [benchmarks across four LLMs](https://github.com/toon-format/toon) show reduces hallucinated aggregation errors while cutting token usage by ~40%.
 
-**Zero configuration.** No flags, no per-tool parameters, no schema changes. Install `toon_format` in the MCP server's Python environment and the proxy post-processor engages automatically. The eligibility check is structural: any `ok: true` tool response containing a uniform flat array of ≥ 20 objects triggers TOON encoding. Everything else — nested structures, small lists, error responses — passes through as plain JSON unchanged.
+**Zero configuration.** No flags, no per-tool parameters, no schema changes. Install `toon_format` in the Python that serializes responses and encoding engages automatically. The eligibility check is structural: any `ok: true` tool response containing a uniform flat array of ≥ 20 objects triggers TOON encoding. Everything else — nested structures, small lists, error responses — passes through as plain JSON unchanged. On encode, the result's text content becomes TOON and `structuredContent` is omitted so the full JSON doesn't ship alongside it.
 
 **Tools that benefit most:**
 
