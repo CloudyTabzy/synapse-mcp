@@ -1296,19 +1296,23 @@ def _parse_filter_range(
 
 if UNICORN_AVAILABLE:
 
-    def _prepare_internal() -> tuple[list[dict], int, int, int]:
-        """Gather all IDA data needed for emulation. Must run on main thread."""
+    def _prepare() -> tuple[list[dict], int, int, int]:
+        """Gather all IDA data needed for emulation.
+
+        Called directly from tool bodies — no idasync wrapping because the tool
+        entry points are all decorated with @idasync, so we are already on the
+        IDA main thread when this runs.
+        """
         segs = _gather_ida_segments_internal()
         arch, mode, bits = _detect_uc_arch()
         return segs, arch, mode, bits
-
-    _prepare = idasync(_prepare_internal)
 
     # =====================================================================
     # U.1 — unicorn_emulate
     # =====================================================================
 
     @tool
+    @idasync
     def unicorn_emulate(
         start: Annotated[str, "Start address (hex). Must be in the IDB."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -1382,6 +1386,7 @@ if UNICORN_AVAILABLE:
     # =====================================================================
 
     @tool
+    @idasync
     def unicorn_trace(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -1483,7 +1488,7 @@ if UNICORN_AVAILABLE:
         except Exception:
             return False
 
-    _ida_is_pe = idasync(_is_pe_internal)
+    _ida_is_pe = _is_pe_internal  # called from @idasync context — no extra wrapping needed
 
     def _resolve_cc(cc: str, bits: int) -> str:
         cc = (cc or "auto").lower()
@@ -1632,6 +1637,7 @@ if UNICORN_AVAILABLE:
         }
 
     @tool
+    @idasync
     def unicorn_call_function(
         func_addr: Annotated[str, "Function address to call (hex)."],
         args: Annotated[
@@ -1674,13 +1680,11 @@ if UNICORN_AVAILABLE:
     # IDB patch / analyze helpers (the only post-emulation IDA writes)
     # =====================================================================
 
-    @idasync
     def _patch_idb(addr: int, data: bytes) -> int:
         import ida_bytes
         ida_bytes.patch_bytes(addr, bytes(data))
         return len(data)
 
-    @idasync
     def _analyze_and_count(start: int, end: int) -> int:
         """plan_and_wait over a range, then report functions now defined in it."""
         import ida_auto
@@ -1710,6 +1714,7 @@ if UNICORN_AVAILABLE:
 
     @unsafe
     @tool
+    @idasync
     def unicorn_emulate_and_patch(
         start: Annotated[str, "Decrypt-stub start address (hex)."],
         end: Annotated[str, "Decrypt-stub end address (exclusive, hex)."],
@@ -1799,6 +1804,7 @@ if UNICORN_AVAILABLE:
     # =====================================================================
 
     @tool
+    @idasync
     def unicorn_diff_memory(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -1901,6 +1907,7 @@ if UNICORN_AVAILABLE:
     # =====================================================================
 
     @tool
+    @idasync
     def unicorn_recover_stackstrings(
         func_addr: Annotated[str, "Function to execute (hex)."],
         min_length: Annotated[int, "Minimum string length to report (default 4)."] = 4,
@@ -2013,6 +2020,7 @@ if UNICORN_AVAILABLE:
     # =====================================================================
 
     @tool
+    @idasync
     def unicorn_find_memory_accesses(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -2118,6 +2126,7 @@ if UNICORN_AVAILABLE:
     # =====================================================================
 
     @tool
+    @idasync
     def unicorn_resolve_api_hash(
         hash_func_addr: Annotated[str, "Address of the hash function (hex)."],
         api_names: Annotated[
@@ -2255,6 +2264,7 @@ if UNICORN_AVAILABLE:
         return raw.decode("latin-1", "replace")
 
     @tool
+    @idasync
     def unicorn_emulate_shellcode(
         hex_bytes: Annotated[str, "Raw shellcode as hex (spaces optional)."],
         os_type: Annotated[
@@ -2455,6 +2465,7 @@ if UNICORN_AVAILABLE:
 
     @unsafe
     @tool
+    @idasync
     def workflow_unicorn_decrypt_analyze(
         decrypt_stub: Annotated[str, "Decrypt-stub start address (hex)."],
         encrypted_start: Annotated[str, "Encrypted region start (hex)."],
@@ -2554,9 +2565,8 @@ if UNICORN_AVAILABLE:
             pass
         return None
 
-    _gather_entry = idasync(_entry_point_internal)
+    _gather_entry = _entry_point_internal  # called from @idasync context
 
-    @idasync
     def _triton_handoff(
         concrete_regs: dict, mem_writes: list[dict],
         symbolic_start: int, symbolic_end: int,
@@ -2623,6 +2633,7 @@ if UNICORN_AVAILABLE:
         }
 
     @tool
+    @idasync
     def hybrid_unicorn_triton_analyze(
         concrete_end: Annotated[str, "Unicorn stops here; Triton begins here (hex)."],
         symbolic_start: Annotated[str, "Triton starts symbolic processing here (hex)."],
@@ -2699,7 +2710,6 @@ if UNICORN_AVAILABLE:
     # H.2 — hybrid_unicorn_miasm_hot_blocks
     # =====================================================================
 
-    @idasync
     def _miasm_lift_blocks(block_addrs: list[int]) -> dict:
         """Lift + symbolically simplify a set of blocks (main-thread phase)."""
         from . import api_miasm as M
@@ -2740,6 +2750,7 @@ if UNICORN_AVAILABLE:
         return {"ok": True, "blocks": out}
 
     @tool
+    @idasync
     def hybrid_unicorn_miasm_hot_blocks(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -2814,6 +2825,7 @@ if UNICORN_AVAILABLE:
     # =====================================================================
 
     @tool
+    @idasync
     def hybrid_unicorn_networkx_exec_graph(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
