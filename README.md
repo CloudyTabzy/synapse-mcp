@@ -1,10 +1,10 @@
 # Synapse MCP
 
-> **One MCP server. Nine analysis engines. 250+ tools. Zero configuration overhead.**
+> **One MCP server. Ten analysis engines. 260+ tools. Zero configuration overhead.**
 
-A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: nine distinct engines and over two hundred and fifty tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
+A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: ten distinct engines and over two hundred and sixty tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
 
-Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all nine engines at once.
+Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Unicorn emulates the decryption stub concretely and patches the cleartext back into the IDB, Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all ten engines at once.
 
 This is not a monolithic "powerhouse" that blasts every capability into memory regardless of need. It is a digital nervous system: situational, adaptive, and ruthlessly efficient. Lazy profiles route each signal to the right synapse, so the context window stays clean for thinking — not cataloging.
 
@@ -12,7 +12,8 @@ This is not a monolithic "powerhouse" that blasts every capability into memory r
 |--------|--------|-------|
 | 🧠 Triton Symbolic Execution | `pip install triton-library` | 51 |
 | 🔬 Miasm IR Analysis | `pip install miasm` | 21 |
-| 🐍 Angr Symbolic Execution | `pip install angr` | 22 |
+| 🐍 Angr Symbolic Execution | `pip install angr` | 23 |
+| 🦄 Unicorn Concrete Emulation | `pip install unicorn` | 14 |
 | 📦 Construct Format Parsing | `pip install construct` | 10 |
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
@@ -169,7 +170,7 @@ flowchart TB
         G[IDB Database]
     end
 
-    subgraph Engines["Optional Analysis Engines"]
+    subgraph Engines["Optional Analysis Engines (in-process)"]
         H[Triton<br/>Symbolic Execution]
         I[Miasm<br/>IR Lifting]
         J[Construct<br/>Format Parsing]
@@ -178,6 +179,7 @@ flowchart TB
         M[LIEF<br/>Binary Analysis]
         N[YARA<br/>Signature Scanning]
         N2[NetworkX<br/>Graph Metrics]
+        N3[Unicorn<br/>Concrete Emulation]
     end
 
     subgraph AngrWorker["Angr Worker Process"]
@@ -199,6 +201,7 @@ flowchart TB
     F -.-> M
     F -.-> N
     F -.-> N2
+    F -.-> N3
     F -- "socket IPC\n(plain dicts)" --> I2
 ```
 
@@ -211,37 +214,43 @@ flowchart TB
 
 ## 🎯 Capability Matrix
 
-| Capability | Triton | Miasm | Angr | Construct | cstruct | filetype | LIEF | Native |
-|-----------|:------:|:-----:|:----:|:---------:|:-------:|:--------:|:----:|:------:|
-| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ |
-| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
-| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Call-graph analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| CFG metrics / dominators | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Community detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Graph diff / ROP gadget graph | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Capability | Triton | Miasm | Angr | Unicorn | Construct | cstruct | filetype | LIEF | Native |
+|-----------|:------:|:-----:|:----:|:-------:|:---------:|:-------:|:--------:|:----:|:------:|
+| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Concrete CPU emulation** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Decrypt stub execution (no debugger)** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Stackstring recovery** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **API-hash import resolution** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Shellcode syscall sandbox** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dynamic execution trace / loop detect | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ |
+| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Call-graph analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| CFG metrics / dominators | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Community detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Graph diff / ROP gadget graph | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
 
 ---
 
@@ -488,6 +497,44 @@ Requires: `pip install networkx>=3.0`
 | `workflow_binary_diff_summary` | High-level diff report between two binaries |
 | `workflow_find_critical_paths` | Find bottleneck edges whose removal disconnects subgraphs |
 | `workflow_reveng_overview` | One-call RE overview: centrality + communities + top functions |
+
+### 🦄 Unicorn — Concrete CPU Emulation (`unicorn_*`)
+Requires: `pip install unicorn`
+
+> **Architecture:** In-process — `Uc()` is IDA-safe (no signal handlers, no fork). A `@idasync` call gathers IDA segments once; Unicorn then runs off the main thread under a wall-clock deadline timer. Fresh `Uc()` per call — no session cache needed (contrast with angr Projects). Supports x86/x64/ARM/ARM64/MIPS.
+
+| Tool | What it does |
+|------|-------------|
+| `unicorn_status` | Probe availability, version, detected arch, and cross-engine status |
+| `unicorn_emulate` | Map IDA segments → emulate address range → return register state + memory writes |
+| `unicorn_trace` | Instruction/block trace with automatic loop detection (VM dispatcher identification) |
+| `unicorn_emulate_and_patch` ⚠️ | **Killer tool** — emulate a decrypt stub, read decrypted bytes from Unicorn memory, patch into IDB, auto-analyze |
+| `unicorn_diff_memory` | Dry-run emulation — compare before/after memory state without patching (entropy shift + string extraction) |
+| `unicorn_call_function` | Concrete function call with calling-convention setup (SysV x64 / MSVC x64 / cdecl); returns value at RET |
+| `unicorn_emulate_shellcode` | Sandbox raw hex bytes with Linux/Windows syscall interception → structured API call log |
+| `unicorn_recover_stackstrings` | Execute a function, intercept stack writes, extract ASCII/UTF-16LE strings (the #1 malware obfuscation) |
+| `unicorn_find_memory_accesses` | Record all reads/writes during emulation with hot-region detection (key material, dispatch tables) |
+| `unicorn_resolve_api_hash` | Brute-map a custom hash function against ~200 known WinAPI names — de-obfuscates hash-based import resolution |
+| `workflow_unicorn_decrypt_analyze` ⚠️ | One-call pipeline: emulate → patch → `analyze_range` → `scan_and_define_funcs` |
+
+**Hybrid cross-engine tools:**
+
+| Tool | What it does |
+|------|-------------|
+| `hybrid_unicorn_triton_analyze` | Unicorn runs the concrete preamble (key setup, anti-debug) → hands warm register+memory state to Triton for symbolic suffix — eliminates symbolic state explosion on long setups |
+| `hybrid_unicorn_miasm_hot_blocks` | Unicorn traces which basic blocks actually execute → Miasm lifts only those — skips dead obfuscation stubs that choke static lifting |
+| `hybrid_unicorn_networkx_exec_graph` | Multi-trace execution graph → NetworkX betweenness/SCC analysis → surfaces VM dispatchers and crypto loop structures |
+| `hybrid_angr_unicorn_concrete` ⚠️ | (in `api_angr.py`) Unicorn decrypts a packed section → angr loads the now-visible binary and builds a CFG — bridges concrete decryption with symbolic path exploration |
+
+**Example: decrypt a runtime-encrypted section without a debugger:**
+```
+unicorn_diff_memory(start=decrypt_stub, end=encrypted_start, regs={"ecx":"0x1493000","edx":"0x8000"})
+  → "entropy dropped 2.73 pts at 0x1493000 — likely decrypted"
+
+workflow_unicorn_decrypt_analyze(decrypt_stub=0x148C000, encrypted_start=0x1493000,
+                                  encrypted_size=0x8000, regs={"ecx":"0x1493000","edx":"0x8000"})
+  → 12 functions defined, entropy delta −2.73
+```
 
 ### 🔧 Enhanced Native Tools — Core & Analysis (`api_core.py`, `api_analysis.py`)
 No extra dependencies.

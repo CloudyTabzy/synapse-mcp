@@ -37,6 +37,9 @@ angr     = ["angr>=9.2"]
 # NetworkX: small (~1.5 MB), pure-Python, ubiquitously useful for graph analysis.
 # Included in 'all'.
 networkx = ["networkx>=3.0"]
+# Unicorn: ~6 MB prebuilt wheel, QEMU-backed concrete CPU emulator. IDA-safe
+# (no signal handlers / no fork). Included in 'all'.
+unicorn  = ["unicorn>=2.1.0"]
 # TOON: server-side token-efficient encoding for large list tool responses.
 # Installed into the MCP server's Python (not IDA's Python).
 # Install: pip install toon_format  OR  uv add toon_format
@@ -48,6 +51,7 @@ all      = [
     "lief>=0.15.0",
     "yara-python>=4.3.0",
     "networkx>=3.0",
+    "unicorn>=2.1.0",
 ]
 
 [dependency-groups]

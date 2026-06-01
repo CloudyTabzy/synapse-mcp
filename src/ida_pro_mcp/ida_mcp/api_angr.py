@@ -38,15 +38,14 @@ Tool roster (22 tools + 1 always-registered probe):
     H.3  hybrid_angr_miasm_path     — Miasm deobfuscate + angr solve combined
     H.4  hybrid_angr_triton_decompile  — annotated decompilation w/ Triton sym state
     H.5  hybrid_angr_z3_formula     — export path constraints as SMT-LIB2
+    H.6  hybrid_angr_unicorn_concrete — Unicorn decrypts a region → angr loads
+                                        & analyzes the revealed code (Phase 6.4)
 
   Workflows
     W.1  workflow_solve_crackme     ⭐ one-call end-to-end serial solving
     W.2  workflow_trace_data_flow   — cross-function data flow trace
     W.3  workflow_find_gadgets      — ROP/JOP gadget enumeration
     W.4  workflow_enum_code_hints   — path constraint hints to a target
-
-Pending (Phase 6.3, blocked on api_unicorn.py):
-    hybrid_angr_unicorn_concrete    — Unicorn concrete prefix + angr symbolic suffix
 
 Implementation pattern: each tool function is a thin wrapper around a
 private ``_xxx_impl`` helper. Composite/workflow tools call the impl
@@ -3836,3 +3835,118 @@ if ANGR_AVAILABLE:
             }
         except Exception as e:
             return tool_error(e, context="workflow_enum_code_hints")
+
+
+    # =====================================================================
+    # H.6 — hybrid_angr_unicorn_concrete  (Phase 6.4 — Unicorn coupling)  ⚠️ unsafe
+    # =====================================================================
+
+    @unsafe
+    @tool
+    @idasync
+    @tool_timeout(180.0)
+    def hybrid_angr_unicorn_concrete(
+        decrypt_stub: Annotated[str, "Decrypt-stub start address (hex)."],
+        encrypted_start: Annotated[str, "Encrypted region start (hex)."],
+        encrypted_size: Annotated[int, "Encrypted region size in bytes."],
+        stub_end: Annotated[
+            str | None, "Decrypt-stub end (hex). Default: encrypted_start."
+        ] = None,
+        regs: Annotated[dict | None, "Decryption args as registers."] = None,
+        run_cfg: Annotated[bool, "Build a CFGFast after loading (default True)."] = True,
+        uc_max_insns: Annotated[int, "Unicorn instruction cap (default 500000)."] = 500000,
+        uc_timeout_ms: Annotated[int, "Unicorn timeout in ms (default 15000)."] = 15000,
+    ) -> dict:
+        """Unicorn decrypts a region → angr loads & analyzes the revealed code.
+
+        Closes the loop between concrete and symbolic engines:
+          1. Unicorn maps the IDB, runs the decrypt stub, and patches the
+             decrypted bytes into the database (the part angr cannot do —
+             angr can't execute a runtime-only decryptor).
+          2. angr (re)loads the now-decrypted binary into a Project.
+          3. Optional CFGFast over the freshly-visible functions.
+
+        After this, the full angr toolset (find_paths, backward_slice, …)
+        works on code that did not exist statically. Requires both engines.
+        """
+        try:
+            try:
+                from . import api_unicorn as _U
+            except Exception:
+                _U = None
+            if _U is None or not getattr(_U, "UNICORN_AVAILABLE", False):
+                return {"ok": False, "error": "unicorn not installed",
+                        "error_type": "missing_dependency",
+                        "note": "Install with: pip install unicorn"}
+
+            import ida_bytes
+            import ida_auto
+
+            stub_ea = parse_address(decrypt_stub)
+            enc_start = parse_address(encrypted_start)
+            end_ea = parse_address(stub_end) if stub_end else enc_start
+
+            # We are already on the IDA main thread (@idasync), so call the
+            # raw segment gather directly. Unicorn releases the GIL during
+            # emu_start and _emulate_impl owns a Timer that force-stops it, so
+            # the decrypt stub cannot freeze the UI past uc_timeout_ms.
+            segments = _U._gather_ida_segments_internal()
+            uc_arch, uc_mode, bits = _U._detect_uc_arch()
+            emu_res = _U._emulate_impl(
+                segments, uc_arch, uc_mode, bits,
+                stub_ea, end_ea, regs, _U._DEFAULT_STACK_SIZE,
+                uc_max_insns, uc_timeout_ms,
+            )
+            ctl = emu_res.pop("_controller")
+            try:
+                decrypted = bytes(ctl.emu.mem_read(enc_start, encrypted_size))
+            except Exception as e:
+                return {"ok": False,
+                        "error": f"could not read decrypted region: {e}",
+                        "error_type": "unmapped_memory",
+                        "unicorn_stop_reason": emu_res.get("stop_reason")}
+
+            before = _U._original_bytes(segments, enc_start, encrypted_size)
+            ent_before = _U._shannon_entropy(before)
+            ent_after = _U._shannon_entropy(decrypted)
+            ida_bytes.patch_bytes(enc_start, decrypted)
+            ida_auto.plan_and_wait(enc_start, enc_start + encrypted_size)
+
+            # Reload into angr so the Project sees the patched bytes. Evict any
+            # stale cached project for this binary first so we don't reuse a
+            # pre-decryption load.
+            path = idaapi.get_input_file_path() or ""
+            with _PROJECT_LOCK:
+                stale = [pid for pid, ent in _angr_projects.items()
+                         if ent.get("binary_path") == path]
+                for pid in stale:
+                    _angr_projects.pop(pid, None)
+
+            load_res = _load_segment_impl()
+            cfg_res = None
+            if run_cfg and load_res.get("ok"):
+                cfg_res = _cfg_fast_impl(project_id=load_res.get("project_id"))
+
+            delta = round(ent_after - ent_before, 3)
+            return {
+                "ok": bool(load_res.get("ok")),
+                "engines_used": ["unicorn", "angr"],
+                "unicorn_phase": {
+                    "insns_executed": emu_res.get("insns_executed", 0),
+                    "stop_reason": emu_res.get("stop_reason"),
+                    "bytes_patched": len(decrypted),
+                    "entropy_before": ent_before,
+                    "entropy_after": ent_after,
+                    "entropy_delta": delta,
+                },
+                "angr_load": load_res,
+                "angr_cfg": cfg_res,
+                "note": (
+                    f"Decrypted {len(decrypted)} bytes (entropy delta {delta}) and "
+                    "reloaded into angr. "
+                    + ("CFG built — run angr_find_paths/angr_backward_slice on the "
+                       "recovered functions." if cfg_res and cfg_res.get("ok")
+                       else "Run angr_cfg_fast next to map the recovered code.")),
+            }
+        except Exception as e:
+            return tool_error(e, context="hybrid_angr_unicorn_concrete")

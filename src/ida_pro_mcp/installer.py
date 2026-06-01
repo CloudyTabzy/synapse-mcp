@@ -561,6 +561,43 @@ OPTIONAL_PACKAGES = {
         "min_version": "0.1.5",
         "extras": ["future>=0.18.0"],
     },
+    "construct": {
+        "pip_name": "construct",
+        "import_name": "construct",
+        "display": "Construct — declarative binary format parsing",
+        "min_version": "2.10.68",
+    },
+    "cstruct": {
+        "pip_name": "dissect.cstruct",
+        "import_name": "dissect.cstruct",
+        "display": "cstruct  — C-syntax struct parsing + filetype detection",
+        "min_version": "4.0",
+        "extras": ["filetype>=1.2.0"],
+    },
+    "lief": {
+        "pip_name": "lief",
+        "import_name": "lief",
+        "display": "LIEF    — PE/ELF/Mach-O parse, rebuild, signature verify",
+        "min_version": "0.15.0",
+    },
+    "yara": {
+        "pip_name": "yara-python",
+        "import_name": "yara",
+        "display": "YARA    — signature scanning, crypto/threat detection",
+        "min_version": "4.3.0",
+    },
+    "networkx": {
+        "pip_name": "networkx",
+        "import_name": "networkx",
+        "display": "NetworkX — call/CFG graph analysis, centrality, communities",
+        "min_version": "3.0",
+    },
+    "unicorn": {
+        "pip_name": "unicorn",
+        "import_name": "unicorn",
+        "display": "Unicorn — concrete CPU emulation (decrypt stubs, shellcode, hashes)",
+        "min_version": "2.1.0",
+    },
 }
 
 
@@ -638,7 +675,8 @@ def install_optional_deps(
     packages = [p for p in packages if p in OPTIONAL_PACKAGES]
 
     if not packages:
-        print("No recognised packages requested. Valid names: triton, miasm, all")
+        valid = ", ".join(list(OPTIONAL_PACKAGES.keys()) + ["all"])
+        print(f"No recognised packages requested. Valid names: {valid}")
         return {}
 
     # Resolve Python executable

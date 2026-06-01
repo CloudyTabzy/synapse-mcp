@@ -110,6 +110,15 @@ class FindFunctionsByStringResult(TypedDict, total=False):
     error: str | None
 
 
+class FindCallersOfImportResult(TypedDict, total=False):
+    ok: bool
+    import_name: str
+    import_addr: str | None
+    functions: list[dict[str, Any]]
+    total: int
+    error: str | None
+
+
 class TraceDataFlowNode(TypedDict):
     addr: str
     func: str | None
@@ -666,6 +675,91 @@ def find_functions_by_string(
         }
     except Exception as e:
         return {"ok": False, "pattern": pattern, "functions": [], "total": 0, **item_error(e, "find_functions_by_string")}
+
+
+@tool
+@idasync
+@tool_timeout(60.0)
+def find_callers_of_import(
+    name: Annotated[str, "Import name to search for (e.g. 'CreateFileW', 'recv', 'memcpy')"],
+    limit: Annotated[int, "Max caller functions to return (default: 100, max: 1000)"] = 100,
+) -> FindCallersOfImportResult:
+    """Find all functions that call a given imported API.
+
+    Resolves the import name to its IAT slot, then traces all code references
+    back to their containing functions. Returns a deduplicated list of callers.
+
+    Workflow: Use this when you see a suspicious API (e.g. CreateRemoteThread,
+    VirtualProtect) and want to find every function that invokes it.
+
+    See also: trace_data_chain (multi-hop data flow from the import),
+    xrefs_to (raw xrefs to the IAT slot), analyze_function (deep caller analysis).
+    """
+    try:
+        from .api_core import _collect_imports
+        import idaapi
+        import ida_funcs
+        import idautils
+
+        all_imports = _collect_imports()
+        matched = []
+        for imp in all_imports:
+            if imp.get("imported_name") == name:
+                matched.append(imp)
+
+        if not matched:
+            return {
+                "ok": True,
+                "import_name": name,
+                "import_addr": None,
+                "functions": [],
+                "total": 0,
+                "error": None,
+            }
+
+        # Use the first match (most binaries have one slot per import)
+        target_imp = matched[0]
+        target_addr = int(target_imp["addr"], 16)
+
+        func_map: dict[int, dict] = {}
+        for call_ea in idautils.CodeRefsTo(target_addr, 0):
+            caller_func = idaapi.get_func(call_ea)
+            if not caller_func:
+                continue
+            fstart = caller_func.start_ea
+            if fstart not in func_map:
+                fname = ida_funcs.get_func_name(fstart) or f"sub_{fstart:X}"
+                func_map[fstart] = {
+                    "addr": hex(fstart),
+                    "name": fname,
+                    "call_sites": [],
+                }
+            site = hex(call_ea)
+            if site not in func_map[fstart]["call_sites"]:
+                func_map[fstart]["call_sites"].append(site)
+
+        func_list = list(func_map.values())
+        total = len(func_list)
+        if limit > 0 and len(func_list) > limit:
+            func_list = func_list[:limit]
+
+        return {
+            "ok": True,
+            "import_name": name,
+            "import_addr": target_imp["addr"],
+            "functions": func_list,
+            "total": total,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "import_name": name,
+            "import_addr": None,
+            "functions": [],
+            "total": 0,
+            **item_error(e, "find_callers_of_import"),
+        }
 
 
 # ---------------------------------------------------------------------------

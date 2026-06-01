@@ -143,6 +143,16 @@ except Exception as _e:
     )
     api_networkx = None  # type: ignore[assignment]
 
+try:
+    from . import api_unicorn
+except Exception as _e:
+    _log.warning(
+        "api_unicorn failed to load (%s: %s) — all unicorn_* tools unavailable. "
+        "Install with: pip install unicorn\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_unicorn = None  # type: ignore[assignment]
+
 # Build tool profiles after all api_*.py modules have loaded and registered tools.
 # Profiles group tools into logical domains used by server_health and lazy mode.
 from .rpc import MCP_SERVER, register_profile, get_tool_group  # noqa: E402
@@ -207,6 +217,7 @@ __all__ = [
     "api_yara",
     "api_angr",
     "api_networkx",
+    "api_unicorn",
     # Re-exported components
     "idasync",
     "IDAError",
