@@ -623,6 +623,14 @@ def _classify_exc(exc: Exception) -> str:
     msg = str(exc).lower()
     if any(w in msg for w in ("not found", "no function", "badaddr", "not mapped")):
         return "not_found"
+    if any(w in msg for w in ("timed out", "timeout", "deadline", "took too long")):
+        return "timeout"
+    if any(w in msg for w in ("decompilation failed", "hex-rays unavailable", "no decompiler", "decompil")):
+        return "decompile_unavailable"
+    if "not available" in msg and "install" in msg:
+        return "dependency_missing"
+    if any(w in msg for w in ("permission denied", "access denied", "unauthorized")):
+        return "permission_denied"
     return "internal_error"
 
 

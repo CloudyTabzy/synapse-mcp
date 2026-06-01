@@ -420,12 +420,40 @@ def _get_lazy_module_cache() -> dict[str, list[dict]]:
 # Representative tools shown per group in the embedded list_modules directory.
 # These are hardcoded so the description is useful even before IDA connects.
 _GROUP_REPRESENTATIVE_TOOLS: dict[str, list[str]] = {
-    "analysis": ["decompile", "disasm", "xrefs_to", "basic_blocks", "func_profile", "callgraph", "find_bytes"],
-    "core":     ["server_health", "list_funcs", "find_regex", "imports", "entity_query", "search_text"],
+    "analysis": [
+        "survey_binary",
+        "decompile",
+        "decompile_batch",
+        "disasm",
+        "xrefs_to",
+        "trace_data_chain",
+        "find_similar_functions",
+        "func_profile",
+        "callgraph",
+        "analyze_function",
+        "find_bytes",
+    ],
+    "core":     [
+        "survey_binary",
+        "server_health",
+        "list_funcs",
+        "find_regex",
+        "imports",
+        "entity_query",
+        "search_text",
+        "read_mcp_output",
+    ],
     "formats":  ["lief_info", "yara_scan", "lief_checksec", "yara_generate_rule", "construct_parse"],
     "modify":   ["rename", "set_comments", "patch_asm", "declare_type", "define_func", "analyze_range"],
     "recon":    ["nx_central_functions", "workflow_reveng_overview", "apply_flirt_sig", "list_sections"],
-    "symbolic": ["triton_init", "miasm_lift", "angr_find_paths", "workflow_solve_crackme", "triton_taint"],
+    "symbolic": [
+        "hybrid_analyze_function",
+        "triton_init",
+        "miasm_lift",
+        "angr_find_paths",
+        "workflow_solve_crackme",
+        "triton_taint",
+    ],
 }
 
 # Prefix-based module mapping for _tool_module().
@@ -1099,6 +1127,30 @@ def invoke_tool(
                 "error": "No response from IDA",
                 "hint": "Ensure the IDA Pro MCP plugin is running and the target instance is reachable.",
             }
+        def _contextual_hint(error_msg: str) -> str:
+            em = error_msg.lower()
+            if any(w in em for w in ("timed out", "timeout", "deadline", "took too long")):
+                return (
+                    "IDA main thread may be blocked. "
+                    "For heavy tools use async_mode='task' or reduce scope (limit, max_depth). "
+                    "If the tool is genuinely slow, increase the timeout or run via task_submit + task_poll."
+                )
+            if any(w in em for w in ("decompilation failed", "hex-rays unavailable", "no decompiler", "decompile")):
+                return (
+                    "Decompiler error. Use disasm(addr='...') for assembly fallback, "
+                    "or analyze_function(addr='...') for a compact overview without full decompilation."
+                )
+            if any(w in em for w in ("not found", "no function", "badaddr", "not mapped")):
+                return (
+                    "Address or name not resolved. Use find_regex(pattern='...') "
+                    "or entity_query(kind='functions', filter='...') to locate the correct address."
+                )
+            if "not available" in em and "install" in em:
+                return "Optional dependency missing. Install it with pip as described in the error."
+            if "not found" in em or "method" in em:
+                return "Call list_modules() to see available groups, then list_tools(module=...) to find the right tool name."
+            return "Call list_modules() to see available groups, then list_tools(module=...) to find the right tool name."
+
         if "error" in resp:
             msg = resp["error"].get("message", "IDA error")
             if attempt == 0 and ("not found" in msg.lower() or "method" in msg.lower()):
@@ -1109,7 +1161,7 @@ def invoke_tool(
             return {
                 "ok": False,
                 "error": msg,
-                "hint": "Call list_modules() to see available groups, then list_tools(module=...) to find the right tool name.",
+                "hint": _contextual_hint(msg),
             }
         call_result = resp.get("result", {})
         if call_result.get("isError"):
@@ -1123,7 +1175,7 @@ def invoke_tool(
             return {
                 "ok": False,
                 "error": msg,
-                "hint": "Call list_modules() to see available groups, then list_tools(module=...) to find the right tool name.",
+                "hint": _contextual_hint(msg),
             }
         return _unpack_call_result(call_result)
 

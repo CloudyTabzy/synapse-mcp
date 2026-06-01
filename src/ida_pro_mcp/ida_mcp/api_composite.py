@@ -323,7 +323,20 @@ def analyze_function(
     addr: Annotated[str, "Function address or name"],
     include_asm: Annotated[bool, "Include full disassembly (default: false, saves tokens)"] = False,
 ) -> AnalyzeFunctionResult:
-    """Compact single-function analysis: pseudocode, strings, constants, callers, callees, xrefs, blocks."""
+    """Compact single-function analysis: pseudocode, strings, constants, callers, callees, xrefs, blocks.
+
+    This is the best "one-stop shop" for understanding a single function.
+    It returns decompiled pseudocode (capped at 100 lines), cross-references,
+    string/constants references, caller/callee lists, and basic-block counts.
+
+    For metrics-only profiling without decompilation, use ``func_profile``.
+    For configurable section selection, use ``analyze_batch``.
+    For the most powerful cross-engine analysis (Miasm IR + Triton symbolic),
+    use ``hybrid_analyze_function``.
+
+    See also: analyze_batch (configurable sections), func_profile (metrics-only),
+    hybrid_analyze_function (cross-engine deep dive), trace_data_chain (multi-hop data flow).
+    """
 
     try:
         ea = _resolve_addr(addr)
@@ -600,7 +613,11 @@ def trace_data_flow(
     data. Use this when you find an interesting string, constant, or global and
     want to understand every code path that touches it without manually chaining
     xrefs_to calls. Do not use for call graph traversal — use callgraph for that.
-    max_depth controls how many hops to follow (default 5, max 20)."""
+    max_depth controls how many hops to follow (default 5, max 20).
+
+    See also: trace_data_chain (more powerful multi-hop BFS with cross-function
+    expansion and detailed xref type classification), xrefs_to (single-hop references).
+    """
 
     import idaapi
     import idautils
@@ -744,6 +761,9 @@ def hybrid_analyze_function(
     Triton then symbolically executes the result and asks Z3 for concrete
     inputs that drive each branch. Returns a unified report with both IR-level
     and symbolic-level findings.
+
+    See also: analyze_function (IDA-only compact analysis),
+    miasm_lift_function (IR lifting only), triton_init (symbolic execution only).
     """
     import idaapi
     import ida_funcs

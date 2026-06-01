@@ -153,6 +153,13 @@ class FindRegexResult(TypedDict, total=False):
     hint: str
 
 
+class ListStringsResult(TypedDict, total=False):
+    strings: list[dict[str, Any]]
+    total: int
+    next_offset: int | None
+    error: str | None
+
+
 class SearchTextLine(TypedDict, total=False):
     kind: str  # "disasm" | "comment"
     text: str
@@ -1038,7 +1045,23 @@ def entity_query(
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[EntityQueryPage]:
-    """Query IDB entities with typed filters, projection, and pagination."""
+    """Universal query tool for functions, globals, imports, strings, and names.
+
+    This is the swiss-army-knife discovery tool. Use it when you need a catalog
+    of any entity type in the IDB.
+
+    Common queries:
+      - All strings: {"kind": "strings", "count": 0}
+      - All functions: {"kind": "functions", "count": 0}
+      - Functions matching a name pattern: {"kind": "functions", "filter": "sub_41*", "count": 100}
+      - Imports from a specific DLL: {"kind": "imports", "filter": "kernel32*", "count": 0}
+      - All named globals: {"kind": "globals", "count": 0}
+
+    Supports projection (fields), sorting (sort_by), and pagination (offset/count).
+
+    See also: list_funcs (function catalog), list_globals (global catalog),
+    imports_query (import catalog), find_regex (pattern search across strings/names).
+    """
     queries = normalize_dict_list(queries)
     results: list[dict] = []
 
@@ -1199,6 +1222,48 @@ def idb_save(
 
 @tool
 @idasync
+def list_strings(
+    limit: Annotated[int, "Max strings to return (default: 1000, 0 = all)"] = 1000,
+    offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    min_length: Annotated[int, "Minimum string length (default: 4)"] = 4,
+    filter_pattern: Annotated[str, "Optional glob/regex filter on string text (empty = all)"] = "",
+) -> ListStringsResult:
+    """List all strings in the binary with optional length filtering.
+
+    This is a convenience wrapper around the internal string cache.
+    For advanced filtering, projection, and sorting, use entity_query(kind='strings')
+    directly.
+
+    See also: entity_query (advanced string queries), find_regex (pattern search),
+    search_text (disassembly/comment search).
+    """
+    try:
+        candidates = []
+        for ea, text in _get_strings_cache():
+            if len(text) < min_length:
+                continue
+            if filter_pattern and not pattern_filter([{"text": text}], filter_pattern, "text"):
+                continue
+            candidates.append({"addr": hex(ea), "text": text})
+
+        page = paginate(candidates, offset, limit if limit > 0 else len(candidates))
+        return {
+            "strings": page["data"],
+            "total": page["total"],
+            "next_offset": page["next_offset"],
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "strings": [],
+            "total": 0,
+            "next_offset": None,
+            **item_error(e, "list_strings"),
+        }
+
+
+@tool
+@idasync
 def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
     limit: Annotated[int, "Max matches (default: 50, max: 500)"] = 50,
@@ -1221,6 +1286,12 @@ def find_regex(
     For searching the **disassembly listing or comments**, use ``search_text`` instead.
     For searching **raw bytes in data segments** (e.g. decrypted regions where IDA has
     not created string items), set ``scan_raw=true``.
+
+    For a simple list of all strings without a regex, use ``list_strings`` or
+    ``entity_query(kind='strings')``.
+
+    See also: search_text (disassembly/comment search), entity_query (full catalog),
+    list_strings (simple string dump).
     """
     if limit <= 0:
         limit = 50
@@ -1399,6 +1470,12 @@ def search_text(
     Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
     once via `ida_lines.generate_disassembly()` to extract matching lines and
     classify them as disasm or comment. Returns one hit per EA.
+
+    The ``cursor`` field contains a hex address string (e.g. ``\"0x401234\"``) to
+    resume from on the next page — pass it back as the ``cursor`` argument.
+
+    See also: find_regex (regex search across strings/symbol names),
+    insn_query (instruction pattern search).
     """
     if limit <= 0:
         limit = 30
@@ -1531,10 +1608,13 @@ def read_mcp_output(
     and a has_more flag so you can page through large outputs.
 
     Typical workflow:
-      1. Call any tool that may return large output (e.g. get_cfg_dot).
+      1. Call any tool that may return large output (e.g. decompile, disasm, callgraph).
       2. If the response mentions truncation and gives an output_id,
          call read_mcp_output(output_id=..., offset=0).
       3. If has_more is true, call again with offset = previous_offset + len(chunk).
+
+    See also: decompile, decompile_batch, disasm, callgraph, export_funcs,
+    trace_data_chain, find_similar_functions — all tools that may trigger truncation.
     """
     data = get_cached_output(output_id)
     if data is None:

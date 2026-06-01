@@ -912,6 +912,12 @@ def decompile(
     rather than the generic "Decompilation failed" string.
 
     Use ``max_pseudocode_lines`` to limit output size for very large functions.
+    Large outputs may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: decompile_batch (multiple functions), disasm (assembly fallback),
+    analyze_function (decompile + xrefs + strings + constants).
 
     Profile: analysis
     """
@@ -934,7 +940,12 @@ def decompile(
                             decompile_error = desc
             except Exception:
                 pass
-            return {"addr": addr, "code": None, "error": decompile_error}
+            return {
+                "addr": addr,
+                "code": None,
+                "error": decompile_error,
+                "hint": "Decompilation failed. Use disasm(addr='...') for assembly fallback, or analyze_function(addr='...') for a compact overview.",
+            }
 
         result: DecompileResult = {"addr": addr, "code": code}
         if max_pseudocode_lines > 0 and "// ... (" in code and " more line" in code:
@@ -1004,6 +1015,13 @@ def decompile_batch(
     to get signatures + opening logic for 20+ functions without flooding context.
 
     Heavy: for large batches use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+
+    Large outputs may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: decompile (single function), disasm (assembly fallback),
+    analyze_batch (configurable per-function analysis).
     """
     try:
         import ida_hexrays as _hr
@@ -1047,6 +1065,7 @@ def decompile_batch(
                         "name": func_name,
                         "code": None,
                         "error": decompile_error,
+                        "hint": "Decompilation failed. Use disasm(addr='...') for assembly fallback, or analyze_function(addr='...') for a compact overview.",
                     }
                     failed += 1
                     if not skip_errors:
@@ -1098,7 +1117,25 @@ def disasm(
         bool, "Compute total instruction count (default: false)"
     ] = False,
 ) -> DisasmResult:
-    """Disassemble function with offset/max_instructions pagination and optional total count.
+    """Disassemble a function or address range with pagination.
+
+    If ``addr`` resolves to a function, disassembly starts at that address and
+    continues through the function end. If ``addr`` is not in a function,
+    sequential disassembly is performed until an undecodeable instruction or
+    segment end.
+
+    When called inside a function, ``total_instructions`` is automatically
+    computed without needing ``include_total=true``.
+
+    Use ``offset`` + ``max_instructions`` to page through large functions.
+    The ``cursor.next`` field contains the next offset to resume from.
+
+    Large outputs may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: decompile (pseudocode), basic_blocks (CFG structure),
+    analyze_function (combined analysis).
 
     Profile: analysis
     """
@@ -1258,7 +1295,19 @@ def func_profile(
         "Function profiling query (supports name/address filters + pagination)",
     ],
 ) -> list[FuncProfileResult]:
-    """Profile functions with summary metrics and optional sampled details."""
+    """Profile functions with summary metrics and optional sampled details.
+
+    Returns metrics and metadata for functions — size, cyclomatic complexity,
+    caller/callee counts, string/constants references, and optionally sampled
+    instruction mnemonics.
+
+    **This tool does NOT decompile.** For decompilation + code analysis, use
+    ``analyze_function`` or ``analyze_batch`` instead. For metrics-only bulk
+    profiling, this is the right tool.
+
+    See also: analyze_function (decompilation + code analysis),
+    analyze_batch (configurable buffet analysis), func_query (function catalog).
+    """
     queries = normalize_dict_list(queries)
 
     results: list[dict] = []
@@ -1361,7 +1410,16 @@ def analyze_batch(
 ) -> list[AnalyzeBatchResult]:
     """Run comprehensive analysis over one or more target functions.
 
-    Heavy: for large batches use invoke_tool(..., async_mode=True) or task_submit + task_poll."""
+    This is the most configurable per-function analysis — pick exactly which
+    sections you want (decompilation, disassembly, xrefs, callers, callees,
+    strings, constants, comments, basic blocks). Use when you need specific
+    sections only and want to save tokens.
+
+    Heavy: for large batches use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+
+    See also: analyze_function (opinionated compact analysis),
+    func_profile (metrics-only, no decompilation), decompile_batch.
+    """
     queries = normalize_dict_list(queries)
 
     results: list[dict] = []
@@ -1550,12 +1608,18 @@ def xrefs_to(
 ) -> list[XrefsToResult]:
     """Return xrefs to address(es) or named symbols, capped per target with truncation flag.
 
+    Accepts a single address/name or a list. Returns per-address results.
+
     Empty results are expected for addresses in regions IDA has not analysed
     (e.g. encrypted sections). In that case:
     1. If the bytes are already decrypted in the IDB, call ``analyze_range``
        to force IDA to build the xref database for the region, then retry.
     2. If callers live in undefined code, use ``add_xref`` to register
        user-defined xrefs that persist across reanalysis.
+
+    See also: xref_query (direction/type filters + pagination),
+    trace_data_chain (multi-hop traversal), callees / get_function_callers
+    (call graph neighbors).
 
     Profile: analysis
     """
@@ -1614,7 +1678,13 @@ def xref_query(
         "Generic xref query with direction/type filters and pagination",
     ],
 ) -> list[XrefQueryResult]:
-    """Query xrefs with direction/type filters and pagination."""
+    """Query xrefs with direction/type filters and pagination.
+
+    More flexible than xrefs_to: filter by direction (to/from/both),
+    xref type (code/data/any), and paginate with offset/count.
+
+    See also: xrefs_to (simple per-address xrefs), trace_data_chain (multi-hop traversal).
+    """
     queries = normalize_dict_list(queries)
 
     results: list[dict] = []
@@ -1826,7 +1896,11 @@ def callees(
     addrs: Annotated[list[str] | str, "Function addresses or names to get callees for (e.g. '0x123e', 'main')"],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
 ) -> list[CalleesResult]:
-    """Return unique callees per function, capped by limit."""
+    """Return unique callees per function, capped by limit.
+
+    See also: get_function_callers (incoming calls), xrefs_to (all xrefs),
+    callgraph (multi-level call graph).
+    """
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 500:
@@ -2043,7 +2117,11 @@ def get_function_callers(
     """Return unique callers for each function, capped by limit.
 
     Each entry includes the containing caller function's address/name **and**
-    the specific call-site address so you can jump directly to the call
+    the specific call-site address so you can jump directly to the call.
+
+    See also: callees (outgoing calls), xrefs_to (all xrefs),
+    callgraph (multi-level call graph).
+
     instruction.  Complements ``callees`` — together they give the full
     caller/callee relationship for a function.
 
@@ -2631,6 +2709,13 @@ def find_bytes(
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindBytesResult]:
     """Search byte patterns (supports ??) with offset/limit pagination.
+
+    Large match sets may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: find_regex (string/symbol regex search), insn_query
+    (instruction pattern search).
 
     Profile: analysis
     """
@@ -3315,7 +3400,19 @@ def export_funcs(
         str, "Export format: json (default), c_header, or prototypes"
     ] = "json",
 ) -> ExportFuncsJsonResult | ExportFuncsHeaderResult | ExportFuncsPrototypesResult:
-    """Export function data for addresses in json/c_header/prototypes formats."""
+    """Export function data (assembly, decompilation, xrefs, comments, prototype) for specific addresses.
+
+    **Formats:**
+    - ``json`` — Full detail per function (largest output; may trigger ``read_mcp_output``).
+    - ``c_header`` — Prototypes only, formatted as C header text.
+    - ``prototypes`` — List of ``{name, prototype}`` pairs.
+
+    For bulk analysis of many functions, use ``analyze_batch`` or
+    ``decompile_batch`` instead — they are more token-efficient.
+
+    See also: decompile_batch (batch decompilation), analyze_batch (batch analysis),
+    analyze_function (compact single-function analysis).
+    """
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -3389,6 +3486,14 @@ def callgraph(
     ] = 200,
 ) -> list[CallGraphResult]:
     """Build bounded callgraph from roots with depth/node/edge limits.
+
+    Large graphs may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: analyze_component (multi-function group analysis),
+    trace_data_chain (data-flow traversal), callees / get_function_callers
+    (direct neighbors of a single function).
 
     Heavy: for deep or wide graphs use invoke_tool(..., async_mode=True) or task_submit + task_poll."""
     roots = normalize_list_input(roots)
@@ -4018,6 +4123,13 @@ def find_similar_functions(
     **Performance:** Uses a bounded min-heap so only the top `max_results` matches
     are kept in memory. A cheap size pre-filter skips functions whose size differs
     by >10× from the reference, avoiding expensive FlowChart creation for outliers.
+
+    Large result sets may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: analyze_function (deep analysis of a single function),
+    get_function_hash (exact hash matching).
     """
     try:
         ea = parse_address(address)
@@ -4212,6 +4324,13 @@ def trace_data_chain(
         path: ordered list of nodes visited, each with addr/type/function/instruction/name
         terminated_at: reason traversal stopped (depth_limit, no_more_xrefs, node_limit)
         depth_reached: actual deepest depth reached
+
+    Large outputs may be truncated at 50 KB with an ``output_id``.
+    If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
+    the full result in chunks.
+
+    See also: trace_data_flow (composite backward slice with Miasm/Triton),
+    xrefs_to (single-hop references), xref_query (filtered xref search).
     """
     if direction not in ("forward", "backward"):
         return {"ok": False, "error": f"direction must be 'forward' or 'backward', got {direction!r}"}
