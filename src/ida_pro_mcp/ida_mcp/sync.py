@@ -247,8 +247,8 @@ def idasync(f):
     return wrapper
 
 
-def tool_timeout(seconds: float):
-    """Decorator to override per-tool timeout (seconds).
+def tool_timeout(seconds: float, prefer_async: bool = False):
+    """Decorator to override per-tool timeout (seconds) and optionally auto-async.
 
     IMPORTANT: Must be applied BEFORE @idasync (i.e., listed AFTER it)
     so the attribute exists when it captures the function in closure.
@@ -256,12 +256,20 @@ def tool_timeout(seconds: float):
     Correct order:
         @tool
         @idasync
-        @tool_timeout(90.0)  # innermost
+        @tool_timeout(90.0, prefer_async=True)  # innermost
         def my_func(...):
+
+    When prefer_async=True, the tools/call dispatcher in rpc.py automatically
+    submits the tool as a background task instead of executing synchronously.
+    The caller immediately receives a task_id and polls with task_poll().
+    This eliminates the trial-and-error loop where agents must discover which
+    tools are slow enough to need task_submit.
     """
 
     def decorator(func):
         setattr(func, "__ida_mcp_timeout_sec__", seconds)
+        if prefer_async:
+            setattr(func, "__ida_mcp_prefer_async__", True)
         return func
 
     return decorator

@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from typing import Any, Optional
 from .arg_aliases import normalize_tool_args
 from .zeromcp import (
@@ -304,6 +305,10 @@ def _cache_output(output_id: str, data: Any) -> None:
 
 def _install_tools_call_patch() -> None:
     original = MCP_SERVER.registry.methods["tools/call"]
+    # Thread-local re-entry guard: the task worker dispatches tools through
+    # tools/call internally, so we must not re-submit a prefer_async tool
+    # when execution originates from _execute_task().
+    _reentry = threading.local()
 
     def patched(
         name: str, arguments: Optional[dict] = None, _meta: Optional[dict] = None
@@ -312,6 +317,30 @@ def _install_tools_call_patch() -> None:
         # (HTTP, SSE, stdio proxy) benefits — not just proxy-routed calls.
         if arguments:
             arguments = normalize_tool_args(name, arguments)
+
+        # === auto-async: if the tool has prefer_async=True, auto-submit
+        # as a background task so the agent never times out waiting ===
+        tool_fn = MCP_SERVER.tools.methods.get(name)
+        if (tool_fn is not None
+                and getattr(tool_fn, "__ida_mcp_prefer_async__", False)
+                and not getattr(_reentry, "active", False)):
+            task_submit_fn = MCP_SERVER.tools.methods.get("task_submit")
+            if task_submit_fn is not None:
+                try:
+                    result = task_submit_fn(tool_name=name, arguments=arguments or {})
+                    if result.get("task_id"):
+                        return {
+                            "structuredContent": result,
+                            "content": [{
+                                "type": "text",
+                                "text": json.dumps(result, separators=(",", ":")),
+                            }],
+                            "isError": False,
+                            "_meta": {"ida_mcp": {"async_submit": True}},
+                        }
+                except Exception:
+                    pass  # fall through to synchronous execution
+
         response = original(name, arguments, _meta)
 
         if response.get("isError"):
@@ -347,6 +376,7 @@ def _install_tools_call_patch() -> None:
         }
 
     MCP_SERVER.registry.methods["tools/call"] = patched
+    MCP_SERVER.registry._reentry_guard = _reentry  # expose for task worker
 
 
 # Install the output limiting patch

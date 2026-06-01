@@ -110,7 +110,7 @@ try:
         UC_HOOK_CODE,
         UC_HOOK_BLOCK,
         UC_HOOK_MEM_READ,
-        UC_HOOK_MEM_READ_AFTER,
+        UC_HOOK_MEM_READ_AFTER,  # exported constant but unsupported in py3 bindings (see Fix 1)
         UC_HOOK_MEM_WRITE,
         UC_HOOK_MEM_INVALID,
         UC_HOOK_MEM_UNMAPPED,
@@ -318,6 +318,7 @@ class UnicornPatchResult(TypedDict, total=False):
     insns_executed: int
     patch_start: str
     patch_hex_preview: str
+    diff_preview: str
     entropy_before: float
     entropy_after: float
     entropy_delta: float
@@ -368,6 +369,7 @@ class UnicornStackstringsResult(TypedDict, total=False):
     stack_write_count: int
     bytes_written_to_stack: int
     insns_executed: int
+    stop_reason: str
     note: str
     error: str
 
@@ -1347,6 +1349,8 @@ if UNICORN_AVAILABLE:
 
         This is the bread-and-butter tool: use it to run a function or code
         slice and observe its concrete effects without a debugger.
+
+        **Latency: Fast (<5s). Use direct call.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
@@ -1387,26 +1391,37 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(120.0, prefer_async=True)
     def unicorn_trace(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
         regs: Annotated[dict | None, "Initial register values."] = None,
         trace_level: Annotated[
-            str, "'blocks' (fast), 'insns', or 'full' (addr+mnemonic+regs)."
-        ] = "insns",
-        max_insns: Annotated[int, "Instruction cap (default 10000)."] = 10000,
-        timeout_ms: Annotated[int, "Timeout in ms (default 5000)."] = 5000,
+            str, "'blocks' (fast, default), 'insns', or 'full' (addr+mnemonic+regs)."
+        ] = "blocks",
+        max_insns: Annotated[int, "Instruction cap (default 5000)."] = 5000,
+        timeout_ms: Annotated[int, "Timeout in ms (default 10000)."] = 10000,
+        report_interval: Annotated[
+            int,
+            "Batch trace output every N instructions (0 = every instruction). "
+            "Higher values produce smaller output but less detail. Default 1.",
+        ] = 1,
     ) -> UnicornTraceResult:
         """Execute and return a trace; flags repeated addresses as loops.
 
         trace_level:
-          • 'blocks' — one entry per basic block (fastest; best for loop maps).
+          • 'blocks' — one entry per basic block (fastest; best for loop maps, default).
           • 'insns'  — one entry per instruction (address + size).
           • 'full'   — adds Capstone mnemonic/op_str and key register state per
                        instruction (slowest; Capstone optional).
 
+        report_interval batches output: set to 10 to get one trace entry per 10
+        instructions, dramatically reducing output size for long traces.
+
         Any address visited >= 5 times is reported in loops_detected — a quick
         signal for decryption loops and VM fetch cycles.
+
+        **Latency: Slow (30-180s). Submit via task_submit + poll.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
@@ -1435,6 +1450,9 @@ if UNICORN_AVAILABLE:
                 ctl.insn_count += 1
                 visit_counts[address] = visit_counts.get(address, 0) + 1
                 if len(trace) >= _MAX_TRACE:
+                    return
+                interval = max(report_interval, 1)
+                if ctl.insn_count % interval != 0:
                     return
                 entry: dict = {"addr": hex(address), "size": size}
                 if level == "full":
@@ -1656,9 +1674,11 @@ if UNICORN_AVAILABLE:
 
         Sets up the calling convention (auto-detected: MSVC x64 for PE, SysV
         x64 otherwise, cdecl for 32-bit), pushes a sentinel return address, and
-        runs until the top-level RET. The fastest way to answer "what does this
+        runs until the top-level RET.         The fastest way to answer "what does this
         function return for these inputs?" — crypto round functions, hash
         routines, DRM validators, string comparisons.
+
+        **Latency: Fast (<5s). Use direct call.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
@@ -1715,6 +1735,7 @@ if UNICORN_AVAILABLE:
     @unsafe
     @tool
     @idasync
+    @tool_timeout(120.0, prefer_async=True)
     def unicorn_emulate_and_patch(
         start: Annotated[str, "Decrypt-stub start address (hex)."],
         end: Annotated[str, "Decrypt-stub end address (exclusive, hex)."],
@@ -1725,6 +1746,13 @@ if UNICORN_AVAILABLE:
             "Decryption args, e.g. {'ecx': '0x1493000', 'edx': '0x8000'}.",
         ] = None,
         analyze: Annotated[bool, "Auto plan_and_wait after patching (default True)."] = True,
+        define_funcs: Annotated[
+            bool,
+            "After patching, scan for function prologues and define all "
+            "discovered functions in the patched region. Requires analyze=True. "
+            "This is the full decrypt-recover workflow — replaces the separate "
+            "workflow_unicorn_decrypt_analyze tool.",
+        ] = False,
         stack_size: Annotated[int, "Stack bytes (default 0x10000)."] = _DEFAULT_STACK_SIZE,
         max_insns: Annotated[int, "Instruction cap (default 200000)."] = 200000,
         timeout_ms: Annotated[int, "Timeout in ms (default 10000)."] = 10000,
@@ -1740,6 +1768,8 @@ if UNICORN_AVAILABLE:
 
         Reports entropy before/after as a decryption sanity check — a large
         drop means the region went from encrypted/compressed to real code/data.
+
+        **Latency: Slow (30-120s). Submit via task_submit + poll.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
@@ -1771,14 +1801,48 @@ if UNICORN_AVAILABLE:
             functions_created = 0
             if analyze:
                 functions_created = _analyze_and_count(patch_ea, patch_ea + patch_size)
+            if define_funcs and analyze and patch_size > 0:
+                try:
+                    import ida_funcs
+                    import ida_auto
+                    ida_auto.plan_and_wait(patch_ea, patch_ea + patch_size)
+                    func_count = 0
+                    for head in idautils.Heads(patch_ea, patch_ea + patch_size):
+                        if ida_funcs.get_func(head) is None and idaapi.is_code(idaapi.get_flags(head)):
+                            try:
+                                ida_funcs.add_func(head)
+                                func_count += 1
+                            except Exception:
+                                pass
+                    if func_count > 0:
+                        functions_created = func_count
+                except Exception:
+                    pass
 
             delta = round(ent_after - ent_before, 3)
+            # Build byte-level diff preview (first N changed locations).
+            diff_runs: list[str] = []
+            prev_changed = False
+            for i in range(min(patch_size, 64)):
+                if before[i] != decrypted[i]:
+                    if prev_changed:
+                        diff_runs.append("%02x" % decrypted[i])
+                    else:
+                        diff_runs.append("%s: %02x→%02x" % (
+                            hex(patch_ea + i), before[i], decrypted[i]))
+                    prev_changed = True
+                else:
+                    prev_changed = False
+            diff_preview = " | ".join(diff_runs[:16]) if diff_runs else ""
+
             if delta <= -1.0:
                 note = (f"Entropy dropped {abs(delta)} pts — region likely "
                         f"decrypted. {functions_created} function(s) defined.")
             elif before == decrypted:
                 note = ("Bytes unchanged by emulation — the stub may not have "
-                        "written to this region, or needs different register args.")
+                        "written to this region, or needs different register args. "
+                        "Try unicorn_diff_memory first to see what changed, then "
+                        "adjust regs= accordingly.")
             else:
                 note = (f"Region changed (entropy delta {delta}). "
                         f"{functions_created} function(s) defined.")
@@ -1793,6 +1857,7 @@ if UNICORN_AVAILABLE:
                 "entropy_after": ent_after,
                 "entropy_delta": delta,
                 "functions_created": functions_created,
+                "diff_preview": diff_preview,
                 "stop_reason": res.get("stop_reason"),
                 "note": note,
             }
@@ -1805,13 +1870,17 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(120.0, prefer_async=True)
     def unicorn_diff_memory(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
         regs: Annotated[dict | None, "Initial register values."] = None,
         watch_regions: Annotated[
-            list[dict] | None,
-            "Regions to diff: [{'start','size','label'}]. Default: writable segments.",
+            list[dict] | list[str] | str | None,
+            "Regions to diff: list of {'start','size','label'} dicts, "
+            "or strings like '0x140000000-0x140667000'. "
+            "Default: only regions that received writes during emulation (fast). "
+            "Pass 'all_writable' to diff every writable segment (slow).",
         ] = None,
         stack_size: Annotated[int, "Stack bytes (default 0x10000)."] = _DEFAULT_STACK_SIZE,
         max_insns: Annotated[int, "Instruction cap (default 200000)."] = 200000,
@@ -1824,33 +1893,95 @@ if UNICORN_AVAILABLE:
         reports changed regions with entropy shift and any newly-visible ASCII/
         UTF-16 strings. Does NOT modify the IDB — use it to decide what (and
         whether) to patch.
+
+        **Latency: Slow (30-180s). Submit via task_submit + poll.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
             start_ea = parse_address(start)
             end_ea = parse_address(end)
 
-            # Build watch list.
-            watch: list[dict] = []
-            if watch_regions:
-                for r in watch_regions:
-                    rs = parse_address(r["start"])
-                    sz = int(r.get("size") or 0)
-                    if sz <= 0 and r.get("end"):
-                        sz = parse_address(r["end"]) - rs
-                    watch.append({"start": rs, "size": sz,
-                                  "label": r.get("label", "")})
-            else:
-                for s in segments:
-                    if s["perms"] & UC_PROT_WRITE:
-                        watch.append({"start": s["start"], "size": s["size"],
-                                      "label": s["name"]})
-
             res = _emulate_impl(
                 segments, uc_arch, uc_mode, bits,
                 start_ea, end_ea, regs, stack_size, max_insns, timeout_ms,
             )
             ctl = res.pop("_controller")
+
+            # Build watch list.
+            watch_use_all_writable = False
+            watch: list[dict] = []
+            if watch_regions is None:
+                # Default: only diff regions that received actual writes.
+                # This is the fast path — avoids scanning 6.7MB of unused segments.
+                written_pages: set[int] = set()
+                for w in res.get("memory_writes", []):
+                    addr = int(w["addr"], 16)
+                    written_pages.add(_align_down(addr))
+                for p in sorted(written_pages):
+                    watch.append({"start": p, "size": _PAGE,
+                                  "label": _label_for_addr(segments, p)})
+                if not watch:
+                    # No writes at all — diff nothing and return fast.
+                    return {
+                        "ok": True,
+                        "changed_regions": [],
+                        "unchanged_regions": [],
+                        "total_changed_bytes": 0,
+                        "insns_executed": res.get("insns_executed", 0),
+                        "note": ("No memory writes occurred — nothing to diff. "
+                                 "Check register args or pass watch_regions to "
+                                 "explicitly scope the comparison."),
+                    }
+            elif isinstance(watch_regions, str):
+                s = watch_regions.strip()
+                if s.lower() == "all_writable":
+                    watch_use_all_writable = True
+                else:
+                    # String format: 'START-END' or 'addr:size'
+                    parts = s.split("-", 1) if "-" in s else s.split(":", 1)
+                    if len(parts) == 2:
+                        try:
+                            rs = parse_address(parts[0].strip())
+                            re_ = parse_address(parts[1].strip())
+                            if "-" in s:
+                                watch.append({"start": rs, "size": re_ - rs,
+                                              "label": ""})
+                            else:
+                                watch.append({"start": rs, "size": re_,
+                                              "label": ""})
+                        except (ValueError, TypeError):
+                            watch_use_all_writable = True
+            elif isinstance(watch_regions, list):
+                first = watch_regions[0] if watch_regions else None
+                if isinstance(first, str):
+                    # List of strings: ['START-END', 'addr:size', ...]
+                    for item in watch_regions:
+                        parts = item.split("-", 1) if "-" in item else item.split(":", 1)
+                        if len(parts) == 2:
+                            try:
+                                rs = parse_address(parts[0].strip())
+                                re_ = parse_address(parts[1].strip())
+                                if "-" in item:
+                                    watch.append({"start": rs, "size": re_ - rs, "label": ""})
+                                else:
+                                    watch.append({"start": rs, "size": re_, "label": ""})
+                            except (ValueError, TypeError):
+                                pass
+                else:
+                    # List of dicts: [{'start','size','label'}, ...]
+                    for r in watch_regions:
+                        rs = parse_address(r["start"])
+                        sz = int(r.get("size") or 0)
+                        if sz <= 0 and r.get("end"):
+                            sz = parse_address(r["end"]) - rs
+                        watch.append({"start": rs, "size": sz,
+                                      "label": r.get("label", "")})
+
+            if watch_use_all_writable or (not watch_regions and not watch):
+                for s in segments:
+                    if s["perms"] & UC_PROT_WRITE:
+                        watch.append({"start": s["start"], "size": s["size"],
+                                      "label": s["name"]})
 
             changed: list[dict] = []
             unchanged: list[dict] = []
@@ -1895,9 +2026,12 @@ if UNICORN_AVAILABLE:
                 "unchanged_regions": unchanged,
                 "total_changed_bytes": total_changed,
                 "insns_executed": res.get("insns_executed", 0),
-                "note": (f"{len(changed)} region(s) changed, {total_changed} bytes total. "
+                "note": (f"{len(changed)} region(s) changed, {total_changed} bytes total; "
+                         f"{len(unchanged)} unchanged. "
                          + ("Use unicorn_emulate_and_patch to commit a region to the IDB."
-                            if changed else "No memory changed — check register args.")),
+                            if changed else
+                            "No memory changed — check register args. "
+                            "Tip: pass watch_regions='all_writable' for a full segment scan.")),
             }
         except Exception as e:
             return tool_error(e, context="unicorn_diff_memory")
@@ -1908,12 +2042,19 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(120.0, prefer_async=True)
     def unicorn_recover_stackstrings(
         func_addr: Annotated[str, "Function to execute (hex)."],
         min_length: Annotated[int, "Minimum string length to report (default 4)."] = 4,
         regs: Annotated[dict | None, "Initial register values (optional)."] = None,
-        max_insns: Annotated[int, "Instruction cap (default 100000)."] = 100000,
-        timeout_ms: Annotated[int, "Timeout in ms (default 5000)."] = 5000,
+        max_insns: Annotated[int, "Instruction cap (default 20000)."] = 20000,
+        timeout_ms: Annotated[int, "Timeout in ms (default 8000)."] = 8000,
+        max_stack_bytes: Annotated[
+            int,
+            "Maximum bytes of the stack region to scan for strings (default 4096). "
+            "Stackstrings are usually built within a few hundred bytes of the frame. "
+            "Set 0 to scan the entire mapped stack.",
+        ] = 4096,
     ) -> UnicornStackstringsResult:
         """Execute a function and recover strings built on the stack.
 
@@ -1922,6 +2063,8 @@ if UNICORN_AVAILABLE:
         intercepts every write into the stack region, coalesces adjacent bytes,
         and scans for ASCII and UTF-16LE strings. These strings are usually the
         arguments later passed to GetProcAddress, registry, or network APIs.
+
+        **Latency: Slow (30-120s). Submit via task_submit + poll.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
@@ -1965,6 +2108,21 @@ if UNICORN_AVAILABLE:
             strings: list[dict] = []
             if stack_writes:
                 addrs = sorted(stack_writes)
+                # Respect max_stack_bytes: only scan writes within the requested window.
+                if max_stack_bytes > 0 and addrs:
+                    scan_lo = min(addrs)
+                    scan_hi = scan_lo + max_stack_bytes
+                    addrs = [a for a in addrs if a < scan_hi]
+                if not addrs:
+                    return {
+                        "ok": True,
+                        "strings": [],
+                        "stack_write_count": write_count["n"],
+                        "bytes_written_to_stack": len(stack_writes),
+                        "insns_executed": ctl.insn_count,
+                        "stop_reason": ctl.stop_reason,
+                        "note": "No stackstrings found within the scan window.",
+                    }
                 run_start = addrs[0]
                 buf = bytearray([stack_writes[run_start]])
                 prev = run_start
@@ -2006,11 +2164,16 @@ if UNICORN_AVAILABLE:
                 "stack_write_count": write_count["n"],
                 "bytes_written_to_stack": len(stack_writes),
                 "insns_executed": ctl.insn_count,
-                "note": (f"Found {len(uniq)} stackstring(s). These are often passed "
+                "stop_reason": ctl.stop_reason,
+                "note": (f"Found {len(uniq)} stackstring(s) after {ctl.insn_count} insns "
+                         f"({ctl.stop_reason}). These are often passed "
                          "to GetProcAddress, registry, or network APIs."
                          if uniq else
-                         "No stackstrings found — the function may not build "
-                         "strings on the stack, or needs argument setup via regs."),
+                         f"No stackstrings found ({ctl.stop_reason}). "
+                         "The function may not build strings on the stack, "
+                         "may need argument setup via regs, or may not have returned. "
+                         "If stop_reason is not 'end_address_reached', the function "
+                         "did not return cleanly — try lowering max_insns."),
             }
         except Exception as e:
             return tool_error(e, context="unicorn_recover_stackstrings")
@@ -2021,6 +2184,7 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(120.0, prefer_async=True)
     def unicorn_find_memory_accesses(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -2039,6 +2203,8 @@ if UNICORN_AVAILABLE:
         its output. Addresses accessed >= 10 times are surfaced as hot_regions
         — typically key schedules, dispatch tables, or repeated constant
         lookups. Use filter_regions to focus on a suspected key/table area.
+
+        **Latency: Slow (60-200s). Submit via task_submit + poll.**
         """
         try:
             segments, uc_arch, uc_mode, bits = _prepare()
@@ -2090,10 +2256,17 @@ if UNICORN_AVAILABLE:
                     "pc": hex(pc), "label": label,
                 })
 
+            read_hook_added = False
             if want in ("all", "reads"):
-                def _on_read(uc, access, address, size, value, user_data):
-                    _record("read", uc, address, size, value)
-                ctl.emu.hook_add(UC_HOOK_MEM_READ_AFTER, _on_read)
+                for hook_type in (UC_HOOK_MEM_READ, UC_HOOK_MEM_READ_AFTER):
+                    try:
+                        def _on_read(uc, access, address, size, value, user_data):
+                            _record("read", uc, address, size, value)
+                        ctl.emu.hook_add(hook_type, _on_read)
+                        read_hook_added = True
+                        break
+                    except UcError:
+                        continue
             if want in ("all", "writes"):
                 def _on_write(uc, access, address, size, value, user_data):
                     _record("write", uc, address, size, value)
@@ -2108,15 +2281,20 @@ if UNICORN_AVAILABLE:
                 if c >= 10
             ][:20]
 
+            read_note = ("" if read_hook_added or "reads" not in want
+                         else " Read tracking unavailable on this Unicorn build — "
+                              "showing writes only. Try access_type='writes' for faster results.")
             return {
                 "ok": True,
                 "accesses": accesses,
                 "read_count": tally["r"],
                 "write_count": tally["w"],
+                "read_tracking": read_hook_added or ("reads" not in want),
                 "hot_regions": hot,
                 "insns_executed": ctl.insn_count,
                 "note": (f"{tally['r']} reads, {tally['w']} writes, {len(hot)} hot region(s)."
-                         + (" Trace truncated." if len(accesses) >= _MAX_EVENTS else "")),
+                         + (" Trace truncated." if len(accesses) >= _MAX_EVENTS else "")
+                         + read_note),
             }
         except Exception as e:
             return tool_error(e, context="unicorn_find_memory_accesses")
@@ -2127,6 +2305,7 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(120.0, prefer_async=True)
     def unicorn_resolve_api_hash(
         hash_func_addr: Annotated[str, "Address of the hash function (hex)."],
         api_names: Annotated[
@@ -2150,6 +2329,8 @@ if UNICORN_AVAILABLE:
         from the binary's table to filter to just the matches.
 
         The single best tool for de-obfuscating hash-based import resolution.
+
+        **Latency: Slow (30-180s). Submit via task_submit + poll.**
         """
         t0 = time.time()
         try:
@@ -2284,6 +2465,8 @@ if UNICORN_AVAILABLE:
         shellcode lacks).
 
         Safe: nothing touches the real OS — syscalls are emulated stubs.
+
+        **Latency: Fast (<15s, scales with instruction count). Use direct call.**
         """
         try:
             os_t = (os_type or "linux_x86").lower()
@@ -2466,6 +2649,7 @@ if UNICORN_AVAILABLE:
     @unsafe
     @tool
     @idasync
+    @tool_timeout(300.0, prefer_async=True)
     def workflow_unicorn_decrypt_analyze(
         decrypt_stub: Annotated[str, "Decrypt-stub start address (hex)."],
         encrypted_start: Annotated[str, "Encrypted region start (hex)."],
@@ -2485,7 +2669,9 @@ if UNICORN_AVAILABLE:
           3. plan_and_wait + scan_and_define_funcs over the recovered region.
 
         Returns a per-step summary so an agent sees exactly where the pipeline
-        succeeded or stalled.
+        succeeded         or stalled.
+
+        **Latency: Slow (60-180s). Submit via task_submit + poll.**
         """
         t0 = time.time()
         steps: list[dict] = []
@@ -2634,6 +2820,7 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(300.0, prefer_async=True)
     def hybrid_unicorn_triton_analyze(
         concrete_end: Annotated[str, "Unicorn stops here; Triton begins here (hex)."],
         symbolic_start: Annotated[str, "Triton starts symbolic processing here (hex)."],
@@ -2659,6 +2846,8 @@ if UNICORN_AVAILABLE:
         registers symbolic, and solves only the interesting slice. Ideal for
         serial checks where the input is mangled deterministically before the
         comparison.
+
+        **Latency: Slow (60-300s, two-phase: unicorn + triton). Submit via task_submit + poll.**
         """
         try:
             if not _TRITON_AVAILABLE:
@@ -2751,6 +2940,7 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(180.0, prefer_async=True)
     def hybrid_unicorn_miasm_hot_blocks(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -2767,6 +2957,8 @@ if UNICORN_AVAILABLE:
         blocks actually execute for the given input, then lifts and simplifies
         only those — fast and reliable on VM-protected code where most handlers
         are dormant for any one program.
+
+        **Latency: Slow (30-120s, two-phase: unicorn + miasm). Submit via task_submit + poll.**
         """
         try:
             if not _MIASM_AVAILABLE:
@@ -2826,6 +3018,7 @@ if UNICORN_AVAILABLE:
 
     @tool
     @idasync
+    @tool_timeout(180.0, prefer_async=True)
     def hybrid_unicorn_networkx_exec_graph(
         start: Annotated[str, "Start address (hex)."],
         end: Annotated[str, "Stop address (exclusive, hex)."],
@@ -2844,6 +3037,8 @@ if UNICORN_AVAILABLE:
         components surface loops (the tightest = crypto rounds), and high-fan-
         out nodes flag handler dispatch tables. Reveals dynamic structure that
         static CFG analysis misses.
+
+        **Latency: Slow (30-180s, per-iteration emulation). Submit via task_submit + poll.**
         """
         try:
             if not _NETWORKX_AVAILABLE:

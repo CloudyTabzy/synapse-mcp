@@ -178,7 +178,16 @@ def _execute_task(task_id: str) -> None:
             "params": {"name": tool_name, "arguments": arguments},
             "id": task_id,
         }
-        resp = MCP_SERVER.registry.dispatch(envelope)
+        # Set re-entry guard so prefer_async tools execute synchronously
+        # inside the task worker rather than spawning nested tasks.
+        guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
+        if guard is not None:
+            guard.active = True
+        try:
+            resp = MCP_SERVER.registry.dispatch(envelope)
+        finally:
+            if guard is not None:
+                guard.active = False
         if resp is not None and "error" in resp:
             err_msg = resp["error"].get("message", "unknown error")
             _backend.update_state(
