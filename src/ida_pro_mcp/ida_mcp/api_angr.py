@@ -960,7 +960,7 @@ if ANGR_AVAILABLE:
 
     def _gather_load_hints_internal(binary_path: str | None = None, arch: str | None = None,
                                     base_address: str | None = None) -> dict:
-        """Collect IDA inputs for the worker (no @idasync — for internal callers)."""
+        """Raw IDA hint gather — assumes it is already running on the main thread."""
         path = binary_path or idaapi.get_input_file_path() or ""
         a = arch or _detect_arch()[0]
         base = None
@@ -974,11 +974,26 @@ if ANGR_AVAILABLE:
         return {"binary_path": path, "arch": a, "base_addr": base,
                 "entry_point": _ida_entry_point()}
 
-    @idasync
+    _gather_load_hints_marshalled = idasync(_gather_load_hints_internal)
+
     def _gather_load_hints(binary_path: str | None = None, arch: str | None = None,
                            base_address: str | None = None) -> dict:
-        """Collect the IDA-derived inputs the worker needs (it has no IDA access)."""
-        return _gather_load_hints_internal(binary_path, arch, base_address)
+        """Collect the IDA-derived inputs the worker needs — safe from ANY context.
+
+        Calls IDA directly when already on the main thread (e.g. inside an
+        @idasync tool — calling the marshalled version there would nest
+        execute_sync and raise IDASyncError). When invoked off the main thread
+        (e.g. a non-@idasync tool like angr_backward_slice), IDA raises
+        "Function can be called from the main thread only"; we catch that and
+        marshal via execute_sync. This removes the footgun where the caller had
+        to pick the right variant — the V10 backward_slice regression.
+        """
+        try:
+            return _gather_load_hints_internal(binary_path, arch, base_address)
+        except RuntimeError as e:
+            if "main thread" in str(e).lower():
+                return _gather_load_hints_marshalled(binary_path, arch, base_address)
+            raise
 
     @idasync
     def _enrich_slice_addresses(addrs: list, target_reg: str | None) -> list[dict]:
@@ -1794,7 +1809,7 @@ if ANGR_AVAILABLE:
         and workflow_solve_crackme (which composes find_paths into a one-call solver).
         """
         if _use_worker():
-            hints = _gather_load_hints_internal()
+            hints = _gather_load_hints()
             avoid_list: list[str] = []
             if avoid_addresses:
                 avoid_list = [hex(parse_address(a)) for a in normalize_list_input(avoid_addresses) if a]
@@ -1874,20 +1889,6 @@ if ANGR_AVAILABLE:
             input_size=input_size, char_constraint=char_constraint,
             max_paths=max_paths, use_dfs=use_dfs, use_veritesting=use_veritesting,
             loop_bound=loop_bound, project_id=project_id,
-            timeout_seconds=timeout_seconds,
-        )
-        return _find_paths_impl(
-            target_address=target_address,
-            source_address=source_address,
-            avoid_addresses=avoid_addresses,
-            input_mode=input_mode,
-            input_size=input_size,
-            char_constraint=char_constraint,
-            max_paths=max_paths,
-            use_dfs=use_dfs,
-            use_veritesting=use_veritesting,
-            loop_bound=loop_bound,
-            project_id=project_id,
             timeout_seconds=timeout_seconds,
         )
 
@@ -2740,7 +2741,12 @@ if ANGR_AVAILABLE:
         no-worker case use the in-process path.
         """
         if use_cfg_only and _use_worker():
-            hints = _gather_load_hints_internal()
+            # angr_backward_slice is NOT @idasync (so the worker wait below stays
+            # off the IDA main thread). The hint gather touches IDA APIs, so it
+            # must marshal to the main thread — use the @idasync _gather_load_hints,
+            # NOT _gather_load_hints_internal (which assumes it's already on the
+            # main thread, and raised "can be called from the main thread only").
+            hints = _gather_load_hints()
             res = _worker_request(
                 "backward_slice",
                 {"load": hints, "project_id": project_id,

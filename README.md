@@ -85,7 +85,7 @@ total_exports: 50
 
 The `_format: TOON_TABULAR` marker is always the first line — agents know the encoding immediately and can parse accordingly. The `[50]` length count and `{fields}` header give models an explicit schema to validate against, which [benchmarks across four LLMs](https://github.com/toon-format/toon) show reduces hallucinated aggregation errors while cutting token usage by ~40%.
 
-**Zero configuration.** No flags, no per-tool parameters, no schema changes. Install `toon_format` in the Python that serializes responses and encoding engages automatically. The eligibility check is structural: any `ok: true` tool response containing a uniform flat array of ≥ 20 objects triggers TOON encoding. Everything else — nested structures, small lists, error responses — passes through as plain JSON unchanged. On encode, the result's text content becomes TOON and `structuredContent` is omitted so the full JSON doesn't ship alongside it.
+**Zero configuration.** No flags, no per-tool parameters, no schema changes. Install `toon_format` in the Python that serializes responses and encoding engages automatically. The eligibility check is structural: any `ok: true` tool response containing a uniform flat array of ≥ 10 objects triggers TOON encoding. Everything else — nested structures, small lists, error responses — passes through as plain JSON unchanged. On encode, the result's text content becomes TOON and `structuredContent` is omitted so the full JSON doesn't ship alongside it.
 
 **Tools that benefit most:**
 
@@ -102,7 +102,7 @@ The `_format: TOON_TABULAR` marker is always the first line — agents know the 
 pip install toon_format
 ```
 
-On startup the server logs `[MCP] TOON encoding active — uniform arrays ≥20 rows auto-compressed` when the package is present, and quietly tells you what to run if it is not.
+On startup the server logs `[MCP] TOON encoding active — uniform arrays ≥10 rows auto-compressed` when the package is present, and quietly tells you what to run if it is not.
 
 > **Note:** TOON encoding runs in the proxy layer (`ida-pro-mcp`). It requires no changes to the IDA plugin and no changes to any tool. It is a server-side concern only.
 
@@ -132,14 +132,6 @@ Install optional analysis engines? (space=toggle, enter=confirm):
 [✓] filetype  — magic-byte file type identification
 [✓] lief      — binary format analysis, checksec, signatures
 [✓] yara      — signature scanning, threat detection, IDB annotation
-```
-
-### Manual Install
-```bash
-pip uninstall ida-pro-mcp ida-pro-mcp-xjoker -y
-pip install -e .
-ida-pro-mcp --install
-ida-pro-mcp --install-deps all       # optional engines
 ```
 
 ### Verify
@@ -180,13 +172,17 @@ flowchart TB
     subgraph Engines["Optional Analysis Engines"]
         H[Triton<br/>Symbolic Execution]
         I[Miasm<br/>IR Lifting]
-        I2[Angr<br/>Symbolic Execution]
         J[Construct<br/>Format Parsing]
         K[dissect.cstruct<br/>C Syntax]
         L[filetype<br/>Magic Bytes]
         M[LIEF<br/>Binary Analysis]
         N[YARA<br/>Signature Scanning]
         N2[NetworkX<br/>Graph Metrics]
+    end
+
+    subgraph AngrWorker["Angr Worker Process"]
+        I2[Angr<br/>Symbolic Execution]
+        I3[Project Cache<br/>LRU · max 3]
     end
 
     A --> B
@@ -197,13 +193,13 @@ flowchart TB
     F --> G
     F -.-> H
     F -.-> I
-    F -.-> I2
     F -.-> J
     F -.-> K
     F -.-> L
     F -.-> M
     F -.-> N
     F -.-> N2
+    F -- "socket IPC\n(plain dicts)" --> I2
 ```
 
 **Execution modes:**
@@ -311,10 +307,10 @@ Requires: `pip install miasm`
 | `miasm_patch_instruction` | Assemble + patch directly into IDA database (`@unsafe`) |
 | `miasm_solve_path_constraints` | Enumerate CFG paths; Z3 solve via Triton when available |
 
-### 🐍 Angr — Symbolic Execution (`angr_*`)  ⚠️ Known Issues / TBD
+### 🐍 Angr — Symbolic Execution (`angr_*`)
 Requires: `pip install angr` (~200 MB; NOT included in `--install-deps all`)
 
-> **Status (2026-05-22):** Several known issues fixed in the latest patch — `SpillingCFG.neighbors()` replaced with manual BFS, the `CFGFast` generator `len()` error resolved, and the claripy SIGINT handler assertion hardened with a three-layer patch (module-level no-ops + counter reset + class-method patch) plus a runtime retry guard that re-applies the patch and retries if an assertion still fires mid-exploration. These fixes have **not yet been stress-tested** on a broad set of binaries; treat this module as **experimental** until a dedicated regression pass confirms stability. Report issues.
+> **Architecture:** Angr runs in a **dedicated background process** — not on IDA's main thread. Only plain Python dicts cross the process boundary (via a localhost socket with an authkey handshake), so the cffi/unicorn pickle crash that plagued earlier versions is impossible by construction. The worker is force-killable on timeout, meaning a runaway symbolic exploration can never freeze IDA. The worker self-exits when IDA closes (socket EOF watchdog), so no orphaned processes linger. IDA-derived inputs (binary path, arch, image base, entry point) are collected on the main thread, then the heavy angr work runs fully off it. Raw blob binaries with no PE/ELF/MachO header load automatically via a `blob` backend fallback, rebased to IDA's imagebase so addresses match the IDB. `angr_status` reports the detected file format and whether blob fallback will be used before any load attempt.
 
 **Status probe** (always available, even without angr installed):
 
@@ -890,7 +886,6 @@ Feature freeze is in effect. The focus is now on **stability, accuracy, and hard
 
 | Priority | Area | What needs work |
 |----------|------|----------------|
-| **P0** | Angr integration | `CFGEmulated` / `SpillingCFG` crashes on angr 9.2+. Need version-gated code paths or stricter angr-version pinning. |
 | **P0** | NetworkX address resolution | Bare-hex fallback is implemented but not yet stress-tested across large call graphs with real malware samples. |
 | **P1** | Triton workflow polish | `workflow_solve_crackme` could benefit from a Triton-only fallback path when angr is unavailable or broken. |
 | **P1** | Schema robustness | One malformed tool must never crash `tools/list` — defensive wrapping already in `zeromcp`, but keep auditing new tools. |
@@ -905,7 +900,8 @@ These ideas are documented but **not scheduled**. They will only be picked up if
 - **Capstone / Keystone** — independent disassembly/assembly outside IDA's state.
 - **Unicorn Engine** — concrete emulation of decrypt stubs and VM interpreters.
 - **Standalone Z3 bridge** — direct SMT solving without pulling in Triton or Angr.
-- **angr hardening** — full `SpillingCFG` compatibility layer or migration to angr's newer `Decompiler` APIs.
+- **angr DDG-backed slicing** — full `CFGEmulated` + CDG + DDG path for `angr_backward_slice` (`use_cfg_only=False`); currently the precise mode runs in-process and is slow on large binaries.
+- **angr Unicorn hybrid** — `hybrid_angr_unicorn_concrete` (concrete Unicorn prefix + angr symbolic suffix); pending Phase 6.3.
 
 ### Contributing
 
