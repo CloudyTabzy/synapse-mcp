@@ -102,6 +102,14 @@ class DiffBeforeAfterResult(TypedDict, total=False):
     error: str
 
 
+class FindFunctionsByStringResult(TypedDict, total=False):
+    ok: bool
+    pattern: str
+    functions: list[dict[str, Any]]
+    total: int
+    error: str | None
+
+
 class TraceDataFlowNode(TypedDict):
     addr: str
     func: str | None
@@ -587,6 +595,77 @@ def diff_before_after(
         "action_applied": applied,
         "changes_detected": before != after,
     }
+
+
+@tool
+@idasync
+@tool_timeout(60.0)
+def find_functions_by_string(
+    pattern: Annotated[str, "String pattern to search for (substring match, case-sensitive)"],
+    limit: Annotated[int, "Max functions to return (default: 100, max: 1000)"] = 100,
+) -> FindFunctionsByStringResult:
+    """Find all functions that reference a given string pattern.
+
+    Searches the IDB string table for substring matches, then resolves
+    cross-references back to their containing functions. Returns a deduplicated
+    list of functions with the specific string addresses that triggered the match.
+
+    Workflow: Use this to locate code that handles a UI message, error text,
+    or protocol constant without manually chaining find_regex + xrefs_to calls.
+
+    See also: find_regex (regex search across strings/symbols),
+    xrefs_to (single-hop references), analyze_function (deep per-function analysis).
+    """
+    try:
+        from .api_core import _get_strings_cache
+        strings = _get_strings_cache()
+        matched_addrs: list[tuple[int, str]] = []
+        for ea, text in strings:
+            if pattern in text:
+                matched_addrs.append((ea, text))
+
+        if not matched_addrs:
+            return {
+                "ok": True,
+                "pattern": pattern,
+                "functions": [],
+                "total": 0,
+                "error": None,
+            }
+
+        func_map: dict[int, dict] = {}
+        for str_ea, text in matched_addrs:
+            for xref in idautils.XrefsTo(str_ea, 0):
+                caller_func = idaapi.get_func(xref.frm)
+                if not caller_func:
+                    continue
+                fstart = caller_func.start_ea
+                if fstart not in func_map:
+                    fname = ida_funcs.get_func_name(fstart) or f"sub_{fstart:X}"
+                    func_map[fstart] = {
+                        "addr": hex(fstart),
+                        "name": fname,
+                        "matches": [],
+                    }
+                match_info = {"string_addr": hex(str_ea), "string": text}
+                # Dedupe match entries per function
+                if match_info not in func_map[fstart]["matches"]:
+                    func_map[fstart]["matches"].append(match_info)
+
+        func_list = list(func_map.values())
+        total = len(func_list)
+        if limit > 0 and len(func_list) > limit:
+            func_list = func_list[:limit]
+
+        return {
+            "ok": True,
+            "pattern": pattern,
+            "functions": func_list,
+            "total": total,
+            "error": None,
+        }
+    except Exception as e:
+        return {"ok": False, "pattern": pattern, "functions": [], "total": 0, **item_error(e, "find_functions_by_string")}
 
 
 # ---------------------------------------------------------------------------

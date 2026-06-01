@@ -174,7 +174,9 @@ class AnalyzeBatchResult(TypedDict, total=False):
 class XrefsToResult(TypedDict, total=False):
     addr: str
     xrefs: list[Xref] | None
+    total: int
     more: bool
+    has_more: bool
     note: str
     error: str
     error_type: str
@@ -226,7 +228,9 @@ class CalleeResultItem(TypedDict):
 class CalleesResult(TypedDict, total=False):
     addr: str
     callees: list[CalleeResultItem] | None
+    total: int
     more: bool
+    has_more: bool
     error: str
     error_type: str
     hint: str
@@ -243,7 +247,9 @@ class FunctionCallersResult(TypedDict, total=False):
     name: str
     callers: list[FunctionCallersItem] | None
     caller_count: int
+    total: int
     more: bool
+    has_more: bool
     error: str
     error_type: str
     hint: str
@@ -458,6 +464,9 @@ class CallGraphResult(TypedDict, total=False):
     edges: list[CallGraphEdge]
     max_depth: int
     truncated: bool
+    has_more: bool
+    total_nodes: int
+    total_edges: int
     limit_reason: str | None
     max_nodes: int
     max_edges: int
@@ -1106,6 +1115,111 @@ def decompile_batch(
 
 @tool
 @idasync
+@tool_timeout(120.0)
+def decompile_range(
+    start: Annotated[str, "Start address (inclusive) — hex or symbol name"],
+    end: Annotated[str, "End address (inclusive) — hex or symbol name"],
+    max_lines_each: Annotated[
+        int,
+        "Pseudocode lines per function (default: 0 = unlimited). "
+        "Set to 10-20 for a compact scanning pass; 0 for full output.",
+    ] = 0,
+    include_addresses: Annotated[
+        bool,
+        "Include /*0xNNNN*/ per-line address markers (default: False to save tokens).",
+    ] = False,
+) -> dict:
+    """Decompile all functions within an address range.
+
+    Iterates functions in the range and decompiles each one. Returns results in
+    address order, each with {"addr", "name", "code", "truncated", "error"}.
+
+    See also: decompile_batch (explicit address list), decompile (single function),
+    func_profile (metrics-only scan of a range).
+    """
+    try:
+        import ida_hexrays as _hr
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if start_ea > end_ea:
+            start_ea, end_ea = end_ea, start_ea
+
+        if not _hr.init_hexrays_plugin():
+            return {"ok": False, "error": "Hex-Rays decompiler is not available"}
+
+        addrs = []
+        for fn_ea in idautils.Functions():
+            if fn_ea >= start_ea and fn_ea <= end_ea:
+                addrs.append(hex(fn_ea))
+
+        if not addrs:
+            return {"ok": False, "error": f"No functions found in range {hex(start_ea)} - {hex(end_ea)}"}
+
+        results: list[dict] = []
+        succeeded = 0
+        failed = 0
+
+        for raw_addr in addrs:
+            try:
+                ea = parse_address(raw_addr)
+                func_name = ida_funcs.get_func_name(ea) or hex(ea)
+                code = decompile_function_safe(
+                    ea,
+                    include_addresses=include_addresses,
+                    max_lines=max_lines_each,
+                )
+                if code is None:
+                    decompile_error = "Decompilation failed"
+                    try:
+                        hf = _hr.hexrays_failure_t()
+                        _hr.decompile(ea, hf)
+                    except _hr.DecompilationFailure:
+                        desc = hf.desc()
+                        if desc:
+                            decompile_error = desc
+                    except Exception:
+                        pass
+                    entry: dict = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "code": None,
+                        "error": decompile_error,
+                        "hint": "Decompilation failed. Use disasm(addr='...') for assembly fallback, or analyze_function(addr='...') for a compact overview.",
+                    }
+                    failed += 1
+                else:
+                    entry = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "code": code,
+                    }
+                    if max_lines_each > 0 and "// ... (" in code and " more line" in code:
+                        entry["truncated"] = True
+                    succeeded += 1
+                results.append(entry)
+            except Exception as exc:
+                entry = {
+                    "addr": raw_addr,
+                    "name": raw_addr,
+                    "code": None,
+                    **item_error(exc, f"decompile_range entry {raw_addr!r}"),
+                }
+                failed += 1
+                results.append(entry)
+
+        return {
+            "ok": True,
+            "results": results,
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+        }
+    except Exception as e:
+        return {"ok": False, **tool_error(e, "decompile_range")}
+
+
+@tool
+@idasync
 @tool_timeout(90.0)
 def disasm(
     addr: Annotated[str, "Function address or name to disassemble"],
@@ -1279,6 +1393,181 @@ def disasm(
             "cursor": {"done": True},
             **item_error(e, f"disassemble at {addr}"),
         }
+
+
+@tool
+@idasync
+@tool_timeout(90.0)
+def disasm_batch(
+    addresses: Annotated[
+        list[str] | str,
+        "Function addresses or names — list or comma-separated string. "
+        "e.g. ['main', '0x401000', 'sub_401234'] or 'main,0x401000'",
+    ],
+    max_instructions: Annotated[
+        int, "Max instructions per function (default: 500, max: 50000)"
+    ] = 500,
+    offset: Annotated[int, "Skip first N instructions per function (default: 0)"] = 0,
+    skip_errors: Annotated[
+        bool,
+        "Continue past failures — failed entries get error= instead of asm= "
+        "(default: True). Set False to abort on the first disassembly failure.",
+    ] = True,
+) -> dict:
+    """Disassemble multiple functions in one call — one round-trip, compact results.
+
+    More token-efficient than calling disasm() N times. Returns results in
+    input order, each with {"addr", "name", "asm", "instruction_count",
+    "total_instructions", "cursor", "error"}.
+
+    See also: disasm (single function), decompile_batch (batch pseudocode),
+    analyze_batch (configurable per-function analysis).
+    """
+    try:
+        addrs = normalize_list_input(addresses)
+        if not addrs:
+            return {"ok": False, "error": "No addresses provided"}
+
+        results: list[dict] = []
+        succeeded = 0
+        failed = 0
+
+        for raw_addr in addrs:
+            raw_addr = raw_addr.strip()
+            if not raw_addr:
+                continue
+            try:
+                ea = parse_address(raw_addr)
+                func_name = ida_funcs.get_func_name(ea) or hex(ea)
+                # Re-use disasm logic inline to avoid double tool call overhead
+                func = idaapi.get_func(ea)
+                seg = idaapi.getseg(ea)
+                if not seg:
+                    entry = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "asm": None,
+                        "error": "No segment found",
+                        "cursor": {"done": True},
+                    }
+                    failed += 1
+                    results.append(entry)
+                    if not skip_errors:
+                        break
+                    continue
+
+                if func:
+                    header_addr = ea
+                else:
+                    header_addr = ea
+
+                lines: list[dict] = []
+                seen = 0
+                total_count = 0
+                more = False
+
+                if func:
+                    total_count = sum(1 for _ in idautils.FuncItems(func.start_ea))
+
+                def _maybe_add_disasm(item_ea: int) -> bool:
+                    nonlocal seen, total_count, more
+                    if func:
+                        total_count += 1
+                    if seen < offset:
+                        seen += 1
+                        return True
+                    if len(lines) < max_instructions:
+                        line = ida_lines.generate_disasm_line(item_ea, 0)
+                        instruction = ida_lines.tag_remove(line) if line else ""
+                        entry_line: dict = {
+                            "addr": f"{item_ea:x}",
+                            "instruction": compact_whitespace(instruction),
+                        }
+                        name = ida_name.get_ea_name(item_ea)
+                        if name:
+                            entry_line["label"] = name
+                        comments = _collect_line_comments(item_ea)
+                        if comments:
+                            entry_line["comments"] = comments
+                        refs = _collect_line_refs(item_ea)
+                        if refs:
+                            entry_line["refs"] = refs
+                        lines.append(entry_line)
+                        seen += 1
+                        return True
+                    more = True
+                    seen += 1
+                    return True
+
+                if func:
+                    for item_ea in idautils.FuncItems(func.start_ea):
+                        if item_ea == idaapi.BADADDR:
+                            continue
+                        if item_ea < ea:
+                            continue
+                        if not _maybe_add_disasm(item_ea):
+                            break
+                else:
+                    item_ea = ea
+                    while item_ea < seg.end_ea:
+                        if item_ea == idaapi.BADADDR:
+                            break
+                        if _decode_insn_at(item_ea) is None:
+                            break
+                        if not _maybe_add_disasm(item_ea):
+                            break
+                        item_ea = _next_head(item_ea, seg.end_ea)
+                        if item_ea == idaapi.BADADDR:
+                            break
+
+                if not func and not lines:
+                    entry = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "asm": None,
+                        "error": "No instructions found",
+                        "cursor": {"done": True},
+                    }
+                    failed += 1
+                else:
+                    out: DisassemblyFunction = {
+                        "name": func_name if func else "<no function>",
+                        "start_ea": hex(header_addr),
+                        "segment": idaapi.get_segm_name(seg) or "UNKNOWN",
+                        "lines": lines,
+                    }
+                    entry = {
+                        "addr": raw_addr,
+                        "name": func_name,
+                        "asm": out,
+                        "instruction_count": len(lines),
+                        "total_instructions": total_count if func else None,
+                        "cursor": ({"next": offset + max_instructions} if more else {"done": True}),
+                    }
+                    succeeded += 1
+                results.append(entry)
+            except Exception as exc:
+                entry = {
+                    "addr": raw_addr,
+                    "name": raw_addr,
+                    "asm": None,
+                    "cursor": {"done": True},
+                    **item_error(exc, f"disasm_batch entry {raw_addr!r}"),
+                }
+                failed += 1
+                results.append(entry)
+                if not skip_errors:
+                    break
+
+        return {
+            "ok": True,
+            "results": results,
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+        }
+    except Exception as e:
+        return {"ok": False, **tool_error(e, "disasm_batch")}
 
 
 # ============================================================================
@@ -1634,11 +1923,13 @@ def xrefs_to(
         try:
             ea = parse_address(addr)
             xrefs = []
+            total = 0
             more = False
             for xref in idautils.XrefsTo(ea):
+                total += 1
                 if len(xrefs) >= limit:
                     more = True
-                    break
+                    continue
                 xrefs.append(
                     Xref(
                         addr=hex(xref.frm),
@@ -1646,7 +1937,13 @@ def xrefs_to(
                         fn=get_function(xref.frm, raise_error=False),
                     )
                 )
-            row: XrefsToResult = {"addr": addr, "xrefs": xrefs, "more": more}
+            row: XrefsToResult = {
+                "addr": addr,
+                "xrefs": xrefs,
+                "total": total,
+                "more": more,
+                "has_more": more,
+            }
             if not xrefs:
                 import idc as _idc
                 flags = _idc.get_full_flags(ea)
@@ -1918,13 +2215,11 @@ def callees(
                 )
                 continue
             func_end = func.end_ea
-            callees_dict = {}
+            callees_dict: dict[int, dict] = {}
+            total = 0
             more = False
             current_ea = func_start
             while current_ea < func_end:
-                if len(callees_dict) >= limit:
-                    more = True
-                    break
                 insn = _decode_insn_at(current_ea)
                 if insn is None:
                     next_ea = _next_head(current_ea, func_end)
@@ -1948,21 +2243,28 @@ def callees(
                         )
                         func_name = ida_name.get_name(target)
                         if func_name is not None:
-                            callees_dict[target] = {
-                                "addr": hex(target),
-                                "name": func_name,
-                                "type": func_type,
-                            }
+                            if len(callees_dict) < limit:
+                                callees_dict[target] = {
+                                    "addr": hex(target),
+                                    "name": func_name,
+                                    "type": func_type,
+                                }
+                            else:
+                                more = True
+                            total += 1
                 next_ea = _next_head(current_ea, func_end)
                 if next_ea == idaapi.BADADDR:
                     break
                 current_ea = next_ea
 
+            callee_list = list(callees_dict.values())
             results.append(
                 {
                     "addr": fn_addr,
-                    "callees": list(callees_dict.values()),
+                    "callees": callee_list,
+                    "total": total,
                     "more": more,
+                    "has_more": more,
                 }
             )
         except Exception as e:
@@ -2150,11 +2452,9 @@ def get_function_callers(
                 continue
 
             seen: dict[int, FunctionCallersItem] = {}
+            total = 0
             more = False
             for call_ea in idautils.CodeRefsTo(func.start_ea, True):
-                if len(seen) >= limit:
-                    more = True
-                    break
                 # Only count actual call instructions, not data refs or jump tables
                 insn = idaapi.insn_t()
                 idaapi.decode_insn(insn, call_ea)
@@ -2167,19 +2467,26 @@ def get_function_callers(
                     continue
                 cstart = caller_func.start_ea
                 if cstart not in seen:
-                    seen[cstart] = {
-                        "func_addr": hex(cstart),
-                        "func_name": ida_name.get_name(cstart) or f"sub_{cstart:X}",
-                        "call_ea": hex(call_ea),
-                    }
+                    if len(seen) < limit:
+                        seen[cstart] = {
+                            "func_addr": hex(cstart),
+                            "func_name": ida_name.get_name(cstart) or f"sub_{cstart:X}",
+                            "call_ea": hex(call_ea),
+                        }
+                    else:
+                        more = True
+                    total += 1
 
+            caller_list = list(seen.values())
             results.append(
                 {
                     "addr": hex(func.start_ea),
                     "name": ida_name.get_name(func.start_ea) or f"sub_{func.start_ea:X}",
-                    "callers": list(seen.values()),
+                    "callers": caller_list,
                     "caller_count": len(seen),
+                    "total": total,
                     "more": more,
+                    "has_more": more,
                 }
             )
         except Exception as e:
@@ -3593,6 +3900,9 @@ def callgraph(
                     "edges": edges,
                     "max_depth": max_depth,
                     "truncated": truncated,
+                    "has_more": truncated,
+                    "total_nodes": len(nodes),
+                    "total_edges": len(edges),
                     "limit_reason": limit_reason,
                     "max_nodes": max_nodes,
                     "max_edges": max_edges,
@@ -3666,6 +3976,7 @@ class TraceDataChainResult(TypedDict, total=False):
     edges: list[ChainEdge]
     terminated_at: TerminatedAt | None
     node_count: int
+    has_more: bool
     cross_functions: NotRequired[bool]
     functions_entered: NotRequired[list[str]]
     error: str
@@ -4507,6 +4818,7 @@ def trace_data_chain(
         "edges": edges,
         "terminated_at": terminated_at,
         "node_count": len(nodes),
+        "has_more": terminated_reason in ("node_limit", "edge_limit", "depth_limit"),
         "cross_functions": _cross_func,
     }
     if functions_entered:

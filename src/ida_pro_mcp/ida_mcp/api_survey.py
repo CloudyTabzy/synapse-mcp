@@ -94,6 +94,7 @@ class SurveyBinaryResult(TypedDict, total=False):
     interesting_functions: list[SurveyInterestingFunction]
     imports_by_category: SurveyImportsByCategory
     call_graph_summary: SurveyCallGraphSummary
+    _recommended_tools: dict[str, str]
     _note: str
     error: str
 
@@ -490,6 +491,14 @@ def survey_binary(
             result["interesting_functions"] = _build_interesting_functions(func_eas, truncated)
             result["imports_by_category"] = _build_imports_by_category()
             result["call_graph_summary"] = _build_call_graph_summary(func_eas)
+
+        result["_recommended_tools"] = {
+            "interesting_strings": "Use list_strings(min_length=4) or entity_query(kind='strings', filter='...') for the full string table.",
+            "interesting_functions": "Use analyze_function(addr='...') for deep analysis, or func_profile(addr='...') for metrics-only profiling.",
+            "imports_by_category": "Use trace_data_chain(address='...', cross_functions=true) to find callers of suspicious imports.",
+            "call_graph_summary": "Use callgraph(roots=['start'], max_depth=3) for detailed caller topology.",
+            "overall": "Start with analyze_function or decompile_batch for the most interesting functions, then trace data flow from suspicious strings/imports.",
+        }
 
         if truncated:
             result["_note"] = (
