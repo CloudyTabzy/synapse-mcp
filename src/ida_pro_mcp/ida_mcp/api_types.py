@@ -2975,3 +2975,309 @@ def type_propagate(
     except Exception as e:
         logger.exception("type_propagate failed")
         return tool_error(e)
+
+
+# ============================================================================
+# Struct Recovery — Phase 7.1
+# ============================================================================
+
+class _FieldAccessEntry:
+    __slots__ = ("offset", "size", "is_write")
+    def __init__(self, offset: int, size: int, is_write: bool):
+        self.offset = offset
+        self.size = size
+        self.is_write = is_write
+
+
+class _StructFieldCollector(ida_hexrays.ctree_visitor_t):
+    """Walk a cfunc ctree and collect raw field accesses per local variable.
+
+    Detects two patterns:
+    - Typed member refs: ``cot_memptr`` / ``cot_memref`` on a cot_var base
+    - Raw pointer arithmetic: ``*(T*)(var + N)`` via ``_decompose_ptr_access``
+    """
+
+    def __init__(self, cfunc: ida_hexrays.cfunc_t, ptr_size: int):
+        ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+        self.cfunc = cfunc
+        self.ptr_size = ptr_size
+        self.lvars = cfunc.get_lvars()
+        # var_idx → list[_FieldAccessEntry]
+        self.accesses: dict[int, list[_FieldAccessEntry]] = {}
+
+    def _record(self, var_idx: int, offset: int, size: int, is_write: bool) -> None:
+        # Sanity filter: skip negative or implausibly large offsets
+        if offset < 0 or offset > 0x20000:
+            return
+        self.accesses.setdefault(var_idx, []).append(
+            _FieldAccessEntry(offset, size or self.ptr_size, is_write)
+        )
+
+    def visit_expr(self, expr) -> int:
+        try:
+            op = expr.op
+            # Typed struct member access
+            if op == ida_hexrays.cot_memptr or op == ida_hexrays.cot_memref:
+                base = expr.x
+                if base is not None and base.op == ida_hexrays.cot_var:
+                    sz = 0
+                    try:
+                        if not expr.type.empty():
+                            sz = expr.type.get_size()
+                    except Exception:
+                        pass
+                    self._record(base.v.idx, expr.m, sz or self.ptr_size, False)
+                return 0
+
+            # Raw pointer arithmetic: *(T*)(var + N)
+            decomp = _decompose_ptr_access(expr)
+            if decomp is not None:
+                base_expr, offset, access_size = decomp
+                base_expr = _unwrap_casts(base_expr)
+                if base_expr is not None and base_expr.op == ida_hexrays.cot_var:
+                    self._record(base_expr.v.idx, offset, access_size, False)
+        except Exception:
+            pass
+        return 0
+
+
+class RecoveredField(TypedDict, total=False):
+    offset: int
+    offset_hex: str
+    access_size: int
+    reads: int
+    writes: int
+
+
+class RecoveredCandidate(TypedDict, total=False):
+    var_name: str
+    var_idx: int
+    var_type: str
+    already_typed: bool
+    access_count: int
+    distinct_offsets: int
+    max_offset: int
+    layout: list[RecoveredField]
+    struct_name: str | None
+    c_def: str | None
+
+
+class StructRecoveryResult(TypedDict, total=False):
+    ok: bool
+    func_ea: str
+    func_name: str
+    candidates_found: int
+    candidates: list[RecoveredCandidate]
+    error: str
+    error_type: str
+    hint: str
+
+
+def _is_struct_typed(tif: ida_typeinf.tinfo_t) -> bool:
+    """True if the type is already a named struct — skip these variables."""
+    try:
+        inner = tif
+        # Peel off one pointer layer
+        if inner.is_ptr():
+            inner = inner.get_pointed_object()
+        return inner.is_udt() and bool(inner.get_type_name())
+    except Exception:
+        return False
+
+
+@tool
+@idasync
+def struct_recovery(
+    addr: Annotated[
+        str,
+        "Address or name of the function to analyze (hex or symbol).",
+    ],
+    min_fields: Annotated[
+        int,
+        "Minimum distinct field offsets required to report a candidate (default 2). "
+        "Set to 1 to see all pointer variables with any field access.",
+    ] = 2,
+    skip_typed: Annotated[
+        bool,
+        "Skip variables that already have a named struct type applied (default True). "
+        "Set to False to include already-typed variables in the report.",
+    ] = True,
+    create_struct: Annotated[
+        bool,
+        "Auto-create an IDA struct type for each candidate and register it in the "
+        "type library. Default False (dry-run). @unsafe — modifies the IDB.",
+    ] = False,
+) -> StructRecoveryResult:
+    """Recover struct field layouts from raw pointer accesses in a decompiled function.
+
+    Decompiles the target function, walks the Hex-Rays ctree, and collects every
+    field offset accessed through each local pointer variable. Variables accessed
+    at two or more distinct offsets are reported as struct candidates with their
+    inferred field layout.
+
+    This complements ``type_propagate`` (which requires you to name a specific
+    variable and traces it cross-function) by automatically surfacing *all*
+    candidate struct pointers within a single function in one call.
+
+    Output per candidate:
+    - ``var_name`` / ``var_idx``: the decompiler variable
+    - ``var_type``: currently assigned type (often ``void *`` or ``_BYTE *``)
+    - ``layout``: list of ``{offset, access_size, reads, writes}`` entries
+    - ``c_def``: C struct definition (if ``create_struct=True``, also registered in TIL)
+    - ``struct_name``: IDA type name (only when ``create_struct=True``)
+
+    After identifying a good candidate, use ``type_propagate`` for deeper
+    cross-function analysis, or ``set_type`` to apply the inferred layout.
+
+    Note: only compile-time-constant field offsets are captured. Variable-stride
+    array indexing (``ptr[i]``) is not tracked.
+    """
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return {
+                "ok": False,
+                "error": "Hex-Rays decompiler not available.",
+                "hint": "Ensure Hex-Rays is installed and licensed.",
+            }
+
+        try:
+            func_ea = parse_address(addr)
+        except Exception:
+            func_ea = ida_name.get_name_ea(idaapi.BADADDR, addr)
+            if func_ea == idaapi.BADADDR:
+                return {"ok": False, "error": f"Address '{addr}' not found."}
+
+        pfn = ida_funcs.get_func(func_ea)
+        if pfn is None:
+            return {"ok": False, "func_ea": hex(func_ea), "error": "No function at that address."}
+        func_ea = pfn.start_ea
+
+        func_name = ida_funcs.get_func_name(func_ea) or idc.get_name(func_ea, idc.GN_VISIBLE) or hex(func_ea)
+
+        try:
+            hf = ida_hexrays.hexrays_failure_t()
+            cfunc = ida_hexrays.decompile(func_ea, hf)
+            if cfunc is None:
+                return {
+                    "ok": False,
+                    "func_ea": hex(func_ea),
+                    "func_name": func_name,
+                    "error": f"Decompilation failed: {hf.str}",
+                }
+        except Exception as de:
+            return {
+                "ok": False,
+                "func_ea": hex(func_ea),
+                "func_name": func_name,
+                "error": f"Decompilation exception: {de}",
+            }
+
+        ptr_size = 8 if compat.inf_is_64bit() else 4
+
+        collector = _StructFieldCollector(cfunc, ptr_size)
+        collector.apply_to(cfunc.body, None)
+
+        lvars = cfunc.get_lvars()
+        candidates: list[RecoveredCandidate] = []
+
+        for var_idx, entries in collector.accesses.items():
+            if var_idx < 0 or var_idx >= len(lvars):
+                continue
+
+            lvar = lvars[var_idx]
+            var_type_str = str(lvar.type()) if lvar.type() else "unknown"
+
+            # Skip already-named struct types if requested
+            if skip_typed and _is_struct_typed(lvar.type()):
+                continue
+
+            # Aggregate accesses by offset
+            by_offset: dict[int, dict] = {}
+            for e in entries:
+                if e.offset not in by_offset:
+                    by_offset[e.offset] = {"reads": 0, "writes": 0, "max_size": 0}
+                slot = by_offset[e.offset]
+                if e.is_write:
+                    slot["writes"] += 1
+                else:
+                    slot["reads"] += 1
+                slot["max_size"] = max(slot["max_size"], e.size)
+
+            distinct = len(by_offset)
+            if distinct < min_fields:
+                continue
+
+            layout: list[RecoveredField] = []
+            for off in sorted(by_offset.keys()):
+                s = by_offset[off]
+                layout.append({
+                    "offset": off,
+                    "offset_hex": hex(off),
+                    "access_size": s["max_size"] or ptr_size,
+                    "reads": s["reads"],
+                    "writes": s["writes"],
+                })
+
+            cand: RecoveredCandidate = {
+                "var_name": lvar.name or f"v{var_idx}",
+                "var_idx": var_idx,
+                "var_type": var_type_str,
+                "already_typed": _is_struct_typed(lvar.type()),
+                "access_count": len(entries),
+                "distinct_offsets": distinct,
+                "max_offset": max(by_offset.keys()),
+                "layout": layout,
+            }
+
+            if create_struct:
+                fields = [(e["offset"], e["access_size"]) for e in layout]
+                safe_name = func_name.replace("sub_", "Rec_").replace(".", "_")[:32]
+                base_name = f"{safe_name}_{lvar.name or f'v{var_idx}'}"
+                result_pair = _build_struct_type(fields, base_name)
+                if result_pair:
+                    struct_name, c_def = result_pair
+                    cand["struct_name"] = struct_name
+                    cand["c_def"] = c_def
+                else:
+                    cand["struct_name"] = None
+                    cand["c_def"] = None
+            else:
+                # Always include a dry-run c_def for reference
+                lines = [f"struct {{  // {var_type_str}"]
+                for f in layout:
+                    sz_type = {1: "char", 2: "short", 4: "int", 8: "__int64"}.get(
+                        f["access_size"], "__int64"
+                    )
+                    lines.append(f"    {sz_type} field_{f['offset']:X};  // +0x{f['offset']:X}")
+                lines.append("};")
+                cand["c_def"] = "\n".join(lines)
+                cand["struct_name"] = None
+
+            candidates.append(cand)
+
+        # Sort by distinct_offsets descending (most interesting first)
+        candidates.sort(key=lambda c: c["distinct_offsets"], reverse=True)
+
+        result: StructRecoveryResult = {
+            "ok": True,
+            "func_ea": hex(func_ea),
+            "func_name": func_name,
+            "candidates_found": len(candidates),
+            "candidates": candidates,
+        }
+        if candidates:
+            result["hint"] = (
+                "Use type_propagate(addr='func::var_name') for cross-function analysis, "
+                "or set_type to apply a struct definition to the variable."
+            )
+        else:
+            result["hint"] = (
+                f"No struct candidates found (min_fields={min_fields}). "
+                "Try min_fields=1 to see all pointer variables, or skip_typed=False "
+                "to include already-typed variables."
+            )
+        return result
+
+    except Exception as e:
+        logger.exception("struct_recovery failed")
+        return {"ok": False, **tool_error(e, f"struct_recovery({addr!r})")}

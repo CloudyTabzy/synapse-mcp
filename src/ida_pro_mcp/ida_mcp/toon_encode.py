@@ -82,8 +82,19 @@ def encode_result_to_toon(data: dict) -> str:
 
 
 def maybe_toon_encode_result(data: Any) -> str | None:
-    """Return a TOON string when ``data`` qualifies and TOON is available, else None."""
-    if not TOON_AVAILABLE or not toon_qualifies(data):
+    """Return a TOON string when ``data`` qualifies and TOON is available, else None.
+
+    Tools can opt out of TOON encoding by including ``"_toon_skip": True`` in their
+    result dict.  The flag is consumed here (popped before encoding) so it never
+    appears in the agent's structured response.  Use this for structured reference
+    data (COM vtable tables, schema definitions, etc.) where the tabular TOON form
+    would remove ``structuredContent`` and break MCP schema validation.
+    """
+    if not TOON_AVAILABLE:
+        return None
+    if isinstance(data, dict) and data.pop("_toon_skip", False):
+        return None
+    if not toon_qualifies(data):
         return None
     try:
         encoded = encode_result_to_toon(data)

@@ -25,7 +25,9 @@ from typing import Annotated, NotRequired, TypedDict
 import ida_bytes
 import ida_funcs
 import ida_idp
+import ida_name
 import ida_segment
+import ida_typeinf
 import ida_ua
 import ida_xref
 import idaapi
@@ -1495,4 +1497,890 @@ def find_function_prologues(
             "hits": [],
             "candidates_found": 0,
             "functions_created": 0,
+        })
+
+
+# ============================================================================
+# COM / DirectX vtable knowledge base
+# ============================================================================
+
+# Flat vtable layouts for well-known COM interfaces (slot 0 = first entry).
+# Each list contains the method names in vtable order, including inherited ones.
+# Source: DirectX SDK headers / Windows SDK (dxgi.h, d3d11.h, d3d9.h, d3d12.h).
+_COM_VTABLE_DB: dict[str, list[str]] = {
+    "IUnknown": [
+        "QueryInterface",           # 0
+        "AddRef",                   # 1
+        "Release",                  # 2
+    ],
+    "IDispatch": [
+        "QueryInterface",           # 0
+        "AddRef",                   # 1
+        "Release",                  # 2
+        "GetTypeInfoCount",         # 3
+        "GetTypeInfo",              # 4
+        "GetIDsOfNames",            # 5
+        "Invoke",                   # 6
+    ],
+    "IDXGIObject": [
+        "QueryInterface",           # 0
+        "AddRef",                   # 1
+        "Release",                  # 2
+        "SetPrivateData",           # 3
+        "SetPrivateDataInterface",  # 4
+        "GetPrivateData",           # 5
+        "GetParent",                # 6
+    ],
+    "IDXGIDeviceSubObject": [
+        "QueryInterface",           # 0
+        "AddRef",                   # 1
+        "Release",                  # 2
+        "SetPrivateData",           # 3
+        "SetPrivateDataInterface",  # 4
+        "GetPrivateData",           # 5
+        "GetParent",                # 6
+        "GetDevice",                # 7
+    ],
+    "IDXGISwapChain": [
+        # IUnknown
+        "QueryInterface",           # 0
+        "AddRef",                   # 1
+        "Release",                  # 2
+        # IDXGIObject
+        "SetPrivateData",           # 3
+        "SetPrivateDataInterface",  # 4
+        "GetPrivateData",           # 5
+        "GetParent",                # 6
+        # IDXGIDeviceSubObject
+        "GetDevice",                # 7
+        # IDXGISwapChain
+        "Present",                  # 8  ← render loop
+        "GetBuffer",                # 9
+        "SetFullscreenState",       # 10
+        "GetFullscreenState",       # 11
+        "GetDesc",                  # 12
+        "ResizeBuffers",            # 13
+        "ResizeTarget",             # 14
+        "GetContainingOutput",      # 15
+        "GetFrameStatistics",       # 16
+        "GetLastPresentCount",      # 17
+    ],
+    "IDXGISwapChain1": [
+        # IUnknown
+        "QueryInterface",           # 0
+        "AddRef",                   # 1
+        "Release",                  # 2
+        # IDXGIObject
+        "SetPrivateData",           # 3
+        "SetPrivateDataInterface",  # 4
+        "GetPrivateData",           # 5
+        "GetParent",                # 6
+        # IDXGIDeviceSubObject
+        "GetDevice",                # 7
+        # IDXGISwapChain
+        "Present",                  # 8
+        "GetBuffer",                # 9
+        "SetFullscreenState",       # 10
+        "GetFullscreenState",       # 11
+        "GetDesc",                  # 12
+        "ResizeBuffers",            # 13
+        "ResizeTarget",             # 14
+        "GetContainingOutput",      # 15
+        "GetFrameStatistics",       # 16
+        "GetLastPresentCount",      # 17
+        # IDXGISwapChain1
+        "GetDesc1",                 # 18
+        "GetFullscreenDesc",        # 19
+        "GetHwnd",                  # 20
+        "GetCoreWindow",            # 21
+        "Present1",                 # 22  ← render loop (DX11.1+)
+        "IsTemporaryMonoSupported", # 23
+        "GetRestrictToOutput",      # 24
+        "SetBackgroundColor",       # 25
+        "GetBackgroundColor",       # 26
+        "SetRotation",              # 27
+        "GetRotation",              # 28
+    ],
+    "IDXGISwapChain2": [
+        # slots 0-28: same as IDXGISwapChain1
+        "QueryInterface", "AddRef", "Release",
+        "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent",
+        "GetDevice",
+        "Present", "GetBuffer", "SetFullscreenState", "GetFullscreenState",
+        "GetDesc", "ResizeBuffers", "ResizeTarget", "GetContainingOutput",
+        "GetFrameStatistics", "GetLastPresentCount",
+        "GetDesc1", "GetFullscreenDesc", "GetHwnd", "GetCoreWindow",
+        "Present1", "IsTemporaryMonoSupported", "GetRestrictToOutput",
+        "SetBackgroundColor", "GetBackgroundColor", "SetRotation", "GetRotation",
+        # IDXGISwapChain2
+        "SetSourceSize",                # 29
+        "GetSourceSize",                # 30
+        "SetMaximumFrameLatency",       # 31
+        "GetMaximumFrameLatency",       # 32
+        "GetFrameLatencyWaitableObject",# 33
+        "SetMatrixTransform",           # 34
+        "GetMatrixTransform",           # 35
+    ],
+    "IDXGISwapChain3": [
+        # slots 0-35: IDXGISwapChain2
+        "QueryInterface", "AddRef", "Release",
+        "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent",
+        "GetDevice",
+        "Present", "GetBuffer", "SetFullscreenState", "GetFullscreenState",
+        "GetDesc", "ResizeBuffers", "ResizeTarget", "GetContainingOutput",
+        "GetFrameStatistics", "GetLastPresentCount",
+        "GetDesc1", "GetFullscreenDesc", "GetHwnd", "GetCoreWindow",
+        "Present1", "IsTemporaryMonoSupported", "GetRestrictToOutput",
+        "SetBackgroundColor", "GetBackgroundColor", "SetRotation", "GetRotation",
+        "SetSourceSize", "GetSourceSize", "SetMaximumFrameLatency",
+        "GetMaximumFrameLatency", "GetFrameLatencyWaitableObject",
+        "SetMatrixTransform", "GetMatrixTransform",
+        # IDXGISwapChain3
+        "GetCurrentBackBufferIndex",    # 36
+        "CheckColorSpaceSupport",       # 37
+        "SetColorSpace1",               # 38
+        "ResizeBuffers1",               # 39
+    ],
+    "IDXGISwapChain4": [
+        # slots 0-39: IDXGISwapChain3
+        "QueryInterface", "AddRef", "Release",
+        "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent",
+        "GetDevice",
+        "Present", "GetBuffer", "SetFullscreenState", "GetFullscreenState",
+        "GetDesc", "ResizeBuffers", "ResizeTarget", "GetContainingOutput",
+        "GetFrameStatistics", "GetLastPresentCount",
+        "GetDesc1", "GetFullscreenDesc", "GetHwnd", "GetCoreWindow",
+        "Present1", "IsTemporaryMonoSupported", "GetRestrictToOutput",
+        "SetBackgroundColor", "GetBackgroundColor", "SetRotation", "GetRotation",
+        "SetSourceSize", "GetSourceSize", "SetMaximumFrameLatency",
+        "GetMaximumFrameLatency", "GetFrameLatencyWaitableObject",
+        "SetMatrixTransform", "GetMatrixTransform",
+        "GetCurrentBackBufferIndex", "CheckColorSpaceSupport",
+        "SetColorSpace1", "ResizeBuffers1",
+        # IDXGISwapChain4
+        "SetHDRMetaData",               # 40
+    ],
+    "IDirect3D9": [
+        "QueryInterface",               # 0
+        "AddRef",                       # 1
+        "Release",                      # 2
+        "RegisterSoftwareDevice",       # 3
+        "GetAdapterCount",              # 4
+        "GetAdapterIdentifier",         # 5
+        "GetAdapterModeCount",          # 6
+        "EnumAdapterModes",             # 7
+        "GetAdapterDisplayMode",        # 8
+        "CheckDeviceType",              # 9
+        "CheckDeviceFormat",            # 10
+        "CheckDeviceMultiSampleType",   # 11
+        "CheckDepthStencilMatch",       # 12
+        "CheckDeviceFormatConversion",  # 13
+        "GetDeviceCaps",                # 14
+        "GetAdapterMonitor",            # 15
+        "CreateDevice",                 # 16
+    ],
+    "IDirect3DDevice9": [
+        "QueryInterface",               # 0
+        "AddRef",                       # 1
+        "Release",                      # 2
+        "TestCooperativeLevel",         # 3
+        "GetAvailableTextureMem",       # 4
+        "EvictManagedResources",        # 5
+        "GetDirect3D",                  # 6
+        "GetDeviceCaps",                # 7
+        "GetDisplayMode",               # 8
+        "GetCreationParameters",        # 9
+        "SetCursorProperties",          # 10
+        "SetCursorPosition",            # 11
+        "ShowCursor",                   # 12
+        "CreateAdditionalSwapChain",    # 13
+        "GetSwapChain",                 # 14
+        "GetNumberOfSwapChains",        # 15
+        "Reset",                        # 16
+        "Present",                      # 17  ← render loop (D3D9)
+        "GetBackBuffer",                # 18
+        "GetRasterStatus",              # 19
+        "SetDialogBoxMode",             # 20
+        "SetGammaRamp",                 # 21
+        "GetGammaRamp",                 # 22
+        "CreateTexture",                # 23
+        "CreateVolumeTexture",          # 24
+        "CreateCubeTexture",            # 25
+        "CreateVertexBuffer",           # 26
+        "CreateIndexBuffer",            # 27
+        "CreateRenderTarget",           # 28
+        "CreateDepthStencilSurface",    # 29
+        "UpdateSurface",                # 30
+        "UpdateTexture",                # 31
+        "GetRenderTargetData",          # 32
+        "GetFrontBufferData",           # 33
+        "StretchRect",                  # 34
+        "ColorFill",                    # 35
+        "CreateOffscreenPlainSurface",  # 36
+        "SetRenderTarget",              # 37
+        "GetRenderTarget",              # 38
+        "SetDepthStencilSurface",       # 39
+        "GetDepthStencilSurface",       # 40
+        "BeginScene",                   # 41
+        "EndScene",                     # 42
+        "Clear",                        # 43
+        "SetTransform",                 # 44
+        "GetTransform",                 # 45
+        "MultiplyTransform",            # 46
+        "SetViewport",                  # 47
+        "GetViewport",                  # 48
+        "SetMaterial",                  # 49
+        "GetMaterial",                  # 50
+        "SetLight",                     # 51
+        "GetLight",                     # 52
+        "LightEnable",                  # 53
+        "GetLightEnable",               # 54
+        "SetClipPlane",                 # 55
+        "GetClipPlane",                 # 56
+        "SetRenderState",               # 57
+        "GetRenderState",               # 58
+        "CreateStateBlock",             # 59
+        "BeginStateBlock",              # 60
+        "EndStateBlock",                # 61
+        "SetClipStatus",                # 62
+        "GetClipStatus",                # 63
+        "GetTexture",                   # 64
+        "SetTexture",                   # 65
+        "GetTextureStageState",         # 66
+        "SetTextureStageState",         # 67
+        "GetSamplerState",              # 68
+        "SetSamplerState",              # 69
+        "ValidateDevice",               # 70
+        "SetPaletteEntries",            # 71
+        "GetPaletteEntries",            # 72
+        "SetCurrentTexturePalette",     # 73
+        "GetCurrentTexturePalette",     # 74
+        "SetScissorRect",               # 75
+        "GetScissorRect",               # 76
+        "SetSoftwareVertexProcessing",  # 77
+        "GetSoftwareVertexProcessing",  # 78
+        "SetNPatchMode",                # 79
+        "GetNPatchMode",                # 80
+        "DrawPrimitive",                # 81
+        "DrawIndexedPrimitive",         # 82
+        "DrawPrimitiveUP",              # 83
+        "DrawIndexedPrimitiveUP",       # 84
+        "ProcessVertices",              # 85
+        "CreateVertexDeclaration",      # 86
+        "SetVertexDeclaration",         # 87
+        "GetVertexDeclaration",         # 88
+        "SetFVF",                       # 89
+        "GetFVF",                       # 90
+        "CreateVertexShader",           # 91
+        "SetVertexShader",              # 92
+        "GetVertexShader",              # 93
+        "SetVertexShaderConstantF",     # 94
+        "GetVertexShaderConstantF",     # 95
+        "SetVertexShaderConstantI",     # 96
+        "GetVertexShaderConstantI",     # 97
+        "SetVertexShaderConstantB",     # 98
+        "GetVertexShaderConstantB",     # 99
+        "SetStreamSource",              # 100
+        "GetStreamSource",              # 101
+        "SetStreamSourceFreq",          # 102
+        "GetStreamSourceFreq",          # 103
+        "SetIndices",                   # 104
+        "GetIndices",                   # 105
+        "CreatePixelShader",            # 106
+        "SetPixelShader",               # 107
+        "GetPixelShader",               # 108
+        "SetPixelShaderConstantF",      # 109
+        "GetPixelShaderConstantF",      # 110
+        "SetPixelShaderConstantI",      # 111
+        "GetPixelShaderConstantI",      # 112
+        "SetPixelShaderConstantB",      # 113
+        "GetPixelShaderConstantB",      # 114
+        "DrawRectPatch",                # 115
+        "DrawTriPatch",                 # 116
+        "DeletePatch",                  # 117
+        "CreateQuery",                  # 118
+    ],
+    "ID3D11Device": [
+        # IUnknown
+        "QueryInterface",               # 0
+        "AddRef",                       # 1
+        "Release",                      # 2
+        # ID3D11Device
+        "CreateBuffer",                 # 3
+        "CreateTexture1D",              # 4
+        "CreateTexture2D",              # 5
+        "CreateTexture3D",              # 6
+        "CreateShaderResourceView",     # 7
+        "CreateUnorderedAccessView",    # 8
+        "CreateRenderTargetView",       # 9
+        "CreateDepthStencilView",       # 10
+        "CreateInputLayout",            # 11
+        "CreateVertexShader",           # 12
+        "CreateGeometryShader",         # 13
+        "CreateGeometryShaderWithStreamOutput", # 14
+        "CreatePixelShader",            # 15
+        "CreateHullShader",             # 16
+        "CreateDomainShader",           # 17
+        "CreateComputeShader",          # 18
+        "CreateClassLinkage",           # 19
+        "CreateBlendState",             # 20
+        "CreateDepthStencilState",      # 21
+        "CreateRasterizerState",        # 22
+        "CreateSamplerState",           # 23
+        "CreateQuery",                  # 24
+        "CreatePredicate",              # 25
+        "CreateCounter",                # 26
+        "CreateDeferredContext",        # 27
+        "OpenSharedResource",           # 28
+        "CheckFormatSupport",           # 29
+        "CheckMultisampleQualityLevels",# 30
+        "CheckCounterInfo",             # 31
+        "CheckCounter",                 # 32
+        "CheckFeatureSupport",          # 33
+        "GetPrivateData",               # 34
+        "SetPrivateData",               # 35
+        "SetPrivateDataInterface",      # 36
+        "GetFeatureLevel",              # 37
+        "GetCreationFlags",             # 38
+        "GetDeviceRemovedReason",       # 39
+        "GetImmediateContext",          # 40
+        "SetExceptionMode",             # 41
+        "GetExceptionMode",             # 42
+    ],
+    # ID3D12Object (base for all D3D12 resources)
+    "ID3D12Object": [
+        "QueryInterface",               # 0
+        "AddRef",                       # 1
+        "Release",                      # 2
+        "GetPrivateData",               # 3
+        "SetPrivateData",               # 4
+        "SetPrivateDataInterface",      # 5
+        "SetName",                      # 6
+    ],
+    "ID3D12CommandQueue": [
+        # IUnknown + ID3D12Object + ID3D12DeviceChild + ID3D12Pageable
+        "QueryInterface",               # 0
+        "AddRef",                       # 1
+        "Release",                      # 2
+        "GetPrivateData",               # 3
+        "SetPrivateData",               # 4
+        "SetPrivateDataInterface",      # 5
+        "SetName",                      # 6
+        "GetDevice",                    # 7  (ID3D12DeviceChild)
+        # ID3D12CommandQueue
+        "UpdateTileMappings",           # 8
+        "CopyTileMappings",             # 9
+        "ExecuteCommandLists",          # 10  ← D3D12 frame submit
+        "SetMarker",                    # 11
+        "BeginEvent",                   # 12
+        "EndEvent",                     # 13
+        "Signal",                       # 14
+        "Wait",                         # 15
+        "GetTimestampFrequency",        # 16
+        "GetClockCalibration",          # 17
+        "GetDesc",                      # 18
+    ],
+}
+
+# Reverse lookup: method name → [(interface, slot_index), ...]
+_COM_METHOD_REVERSE: dict[str, list[tuple[str, int]]] = {}
+for _iface, _methods in _COM_VTABLE_DB.items():
+    for _slot, _method in enumerate(_methods):
+        _COM_METHOD_REVERSE.setdefault(_method, []).append((_iface, _slot))
+
+# Render-loop vtable call signatures: (interface, method, slot_index, description)
+# Used by find_render_loop to locate frame-presentation calls.
+_RENDER_LOOP_SIGNATURES: list[tuple[str, str, int, str]] = [
+    ("IDXGISwapChain",  "Present",             8,  "DXGI swap chain present (DX10/11)"),
+    ("IDXGISwapChain1", "Present1",            22, "DXGI swap chain present1 (DX11.1+)"),
+    ("IDirect3DDevice9","Present",             17, "Direct3D 9 device present"),
+    ("ID3D12CommandQueue", "ExecuteCommandLists", 10, "D3D12 submit command lists"),
+]
+
+
+class ComMethodResult(TypedDict, total=False):
+    slot: int
+    offset_hex: str
+    method: str
+    interface: str
+    inherited_from: str | None
+
+
+class ComVtableResult(TypedDict, total=False):
+    ok: bool
+    interface: str
+    source: str
+    method_count: int
+    methods: list[ComMethodResult]
+    vtable_ea: str | None
+    error: str
+    error_type: str
+    hint: str
+
+
+class RenderLoopHit(TypedDict, total=False):
+    func_ea: str
+    func_name: str
+    call_ea: str
+    vtable_slot: int
+    vtable_offset_hex: str
+    interface: str
+    method: str
+    description: str
+
+
+class RenderLoopResult(TypedDict, total=False):
+    ok: bool
+    ptr_size: int
+    hits: list[RenderLoopHit]
+    hits_count: int
+    functions_scanned: int
+    error: str
+    error_type: str
+    hint: str
+
+
+def _try_ida_type_vtable(interface: str) -> list[str] | None:
+    """Try to read a COM vtable layout from IDA's type library.
+
+    IDA stores COM interface types as a struct named ``{Interface}Vtbl``
+    whose members are function pointers in vtable order.  If the user
+    loaded a DirectX type library (via Load type library... or FLIRT),
+    this returns the method names; otherwise returns None.
+    """
+    try:
+        vtbl_name = f"{interface}Vtbl"
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_named_type(None, vtbl_name):
+            return None
+        if not tif.is_udt():
+            return None
+        udt = ida_typeinf.udt_type_data_t()
+        if not tif.get_udt_details(udt):
+            return None
+        names: list[str] = []
+        for udm in udt:
+            names.append(udm.name or f"slot_{len(names)}")
+        return names if names else None
+    except Exception:
+        return None
+
+
+def _build_method_table(
+    interface: str,
+    methods: list[str],
+    ptr_size: int,
+) -> list[ComMethodResult]:
+    """Convert a flat method name list into ComMethodResult records."""
+    out: list[ComMethodResult] = []
+    for slot, method in enumerate(methods):
+        out.append({
+            "slot": slot,
+            "offset_hex": hex(slot * ptr_size),
+            "method": method,
+            "interface": interface,
+        })
+    return out
+
+
+@tool
+@idasync
+def resolve_com_vtable(
+    interface: Annotated[
+        str | None,
+        "COM interface name, e.g. 'IDXGISwapChain', 'IDirect3DDevice9', 'ID3D11Device'. "
+        "Case-insensitive prefix matching supported (e.g. 'dxgiswap' finds IDXGISwapChain*).",
+    ] = None,
+    index: Annotated[
+        int | None,
+        "Return only the method at this vtable slot index (0-based). "
+        "Omit to return all methods.",
+    ] = None,
+    method: Annotated[
+        str | None,
+        "Look up a method name across all known interfaces (e.g. 'Present'). "
+        "Returns every interface and slot where this method appears.",
+    ] = None,
+    addr: Annotated[
+        str | None,
+        "Read the actual vtable at this address and annotate each slot with the "
+        "resolved method name. Requires interface= to know which layout to use.",
+    ] = None,
+    ptr_size: Annotated[
+        int | None,
+        "Pointer size in bytes: 4 (32-bit) or 8 (64-bit). "
+        "Defaults to the IDB's native pointer size.",
+    ] = None,
+    list_interfaces: Annotated[
+        bool,
+        "List all known interface names in the database. Useful for tab-completion.",
+    ] = False,
+) -> dict:
+    """Resolve COM/DirectX vtable method names by interface and slot index.
+
+    Covers the most common graphics APIs:
+    - DXGI: IUnknown, IDXGIObject, IDXGIDeviceSubObject,
+            IDXGISwapChain/1/2/3/4
+    - D3D9: IDirect3D9, IDirect3DDevice9
+    - D3D11: ID3D11Device
+    - D3D12: ID3D12Object, ID3D12CommandQueue
+
+    Usage patterns:
+
+    **Look up one slot:**
+      ``resolve_com_vtable(interface="IDXGISwapChain", index=8)``
+      → {slot: 8, method: "Present", offset_hex: "0x40"}
+
+    **Full interface table:**
+      ``resolve_com_vtable(interface="IDXGISwapChain")``
+      → list of all 18 methods with slot numbers and offsets
+
+    **Reverse lookup by name:**
+      ``resolve_com_vtable(method="Present")``
+      → all interfaces + slots where Present appears
+
+    **Read vtable from IDB address:**
+      ``resolve_com_vtable(interface="IDXGISwapChain", addr="0x14012A3F0")``
+      → reads function pointers from IDB, correlates with known methods
+
+    **List all known interfaces:**
+      ``resolve_com_vtable(list_interfaces=True)``
+
+    Sources checked in order: IDA type library (if DirectX headers loaded),
+    then the built-in database.
+    """
+    try:
+        # Determine native pointer size
+        if ptr_size is None:
+            ptr_size = 8 if compat.inf_is_64bit() else 4
+
+        # --- list_interfaces mode ---
+        if list_interfaces:
+            known = sorted(_COM_VTABLE_DB.keys())
+            return _annotate({
+                "ok": True,
+                "interfaces": known,
+                "count": len(known),
+                "hint": "Use interface= with any of these names, or a case-insensitive prefix.",
+            })
+
+        # --- reverse lookup by method name ---
+        if method and not interface:
+            hits = _COM_METHOD_REVERSE.get(method, [])
+            if not hits:
+                # Try case-insensitive
+                ml = method.lower()
+                hits = [
+                    (iface, slot)
+                    for meth_name, entries in _COM_METHOD_REVERSE.items()
+                    if meth_name.lower() == ml
+                    for iface, slot in entries
+                ]
+            if not hits:
+                return _annotate({
+                    "ok": False,
+                    "error": f"Method '{method}' not found in any known COM interface.",
+                    "hint": "Use list_interfaces=True to see all interfaces, or check spelling.",
+                })
+            results = []
+            for iface, slot in sorted(hits, key=lambda t: (t[0], t[1])):
+                results.append({
+                    "interface": iface,
+                    "slot": slot,
+                    "offset_hex": hex(slot * ptr_size),
+                    "method": method,
+                })
+            return _annotate({
+                "ok": True,
+                "method": method,
+                "matches": results,
+                "count": len(results),
+            })
+
+        if not interface:
+            return _annotate({
+                "ok": False,
+                "error": "Provide interface=, method=, or list_interfaces=True.",
+                "hint": "Example: resolve_com_vtable(interface='IDXGISwapChain', index=8)",
+            })
+
+        # --- Resolve interface name (case-insensitive prefix) ---
+        iface_resolved: str | None = None
+        il = interface.lower()
+        # Exact match first
+        for name in _COM_VTABLE_DB:
+            if name.lower() == il:
+                iface_resolved = name
+                break
+        # Prefix match
+        if not iface_resolved:
+            candidates = [n for n in _COM_VTABLE_DB if n.lower().startswith(il)]
+            if len(candidates) == 1:
+                iface_resolved = candidates[0]
+            elif len(candidates) > 1:
+                return _annotate({
+                    "ok": False,
+                    "error": f"Prefix '{interface}' matches multiple interfaces: {candidates}",
+                    "hint": "Use a more specific name.",
+                })
+        if not iface_resolved:
+            return _annotate({
+                "ok": False,
+                "error": f"Unknown COM interface '{interface}'.",
+                "hint": "Use list_interfaces=True to see all known interfaces.",
+            })
+
+        # --- Load method list: IDA type library first, then built-in DB ---
+        source = "builtin"
+        methods = _try_ida_type_vtable(iface_resolved)
+        if methods:
+            source = "ida_typelibrary"
+        else:
+            methods = _COM_VTABLE_DB[iface_resolved]
+
+        # --- Filter by index ---
+        if index is not None:
+            if index < 0 or index >= len(methods):
+                return _annotate({
+                    "ok": False,
+                    "interface": iface_resolved,
+                    "error": f"Slot {index} out of range (0-{len(methods)-1} for {iface_resolved}).",
+                })
+            entry: ComMethodResult = {
+                "slot": index,
+                "offset_hex": hex(index * ptr_size),
+                "method": methods[index],
+                "interface": iface_resolved,
+            }
+            result: ComVtableResult = {
+                "ok": True,
+                "interface": iface_resolved,
+                "source": source,
+                "method_count": len(methods),
+                "methods": [entry],
+            }
+            return _annotate(result)
+
+        method_table = _build_method_table(iface_resolved, methods, ptr_size)
+
+        # --- Optionally read actual vtable from IDB ---
+        vtable_ea_str: str | None = None
+        if addr:
+            try:
+                vtable_ea = parse_address(addr)
+                vtable_ea_str = hex(vtable_ea)
+                for entry in method_table:
+                    slot = entry["slot"]
+                    slot_ea = vtable_ea + slot * ptr_size
+                    if ptr_size == 8:
+                        func_ea = idc.get_qword(slot_ea)
+                    else:
+                        func_ea = idc.get_wide_dword(slot_ea)
+                    if func_ea and func_ea != idaapi.BADADDR:
+                        entry["func_ea"] = hex(func_ea)
+                        entry["func_name"] = (
+                            ida_funcs.get_func_name(func_ea)
+                            or idc.get_name(func_ea, idc.GN_VISIBLE)
+                            or ""
+                        )
+            except Exception as addr_e:
+                return _annotate({
+                    "ok": False,
+                    "interface": iface_resolved,
+                    "error": f"Could not read vtable at '{addr}': {addr_e}",
+                })
+
+        out: dict = {
+            "ok": True,
+            "interface": iface_resolved,
+            "source": source,
+            "method_count": len(methods),
+            "methods": method_table,
+            # Opt out of TOON tabular encoding — method tables are structural
+            # COM data, not row-oriented data, and losing structuredContent
+            # breaks MCP schema validation for callers expecting a dict.
+            "_toon_skip": True,
+        }
+        if vtable_ea_str is not None:
+            out["vtable_ea"] = vtable_ea_str
+        return _annotate(out)
+
+    except Exception as e:
+        return _annotate({**tool_error(e, f"resolve_com_vtable({interface!r})"), "interface": interface})
+
+
+@tool
+@idasync
+def find_render_loop(
+    section: Annotated[
+        str,
+        "Section to scan. Default '.text'. Can also be a hex range 'start:end' "
+        "or the special value 'all' to scan every executable segment.",
+    ] = ".text",
+    apis: Annotated[
+        list[str] | str | None,
+        "Limit detection to specific APIs. Choices: 'dxgi', 'd3d9', 'd3d12', or 'all' (default). "
+        "Example: ['dxgi', 'd3d9']",
+    ] = None,
+    limit: Annotated[int, "Max hits to return (default 50)"] = 50,
+    include_disasm: Annotated[
+        bool,
+        "Include the disassembly line at each call site. Default True.",
+    ] = True,
+) -> RenderLoopResult:
+    """Scan binary for Direct3D / DXGI frame-presentation call sites.
+
+    Identifies functions that contain vtable calls matching known render-loop
+    signatures:
+
+    | API      | Method                      | Slot | Offset (64-bit) |
+    |----------|-----------------------------|------|-----------------|
+    | DXGI     | IDXGISwapChain::Present     | 8    | 0x40            |
+    | DXGI     | IDXGISwapChain1::Present1   | 22   | 0xB0            |
+    | D3D9     | IDirect3DDevice9::Present   | 17   | 0x88 (64) / 0x44 (32) |
+    | D3D12    | ID3D12CommandQueue::ExecuteCommandLists | 10 | 0x50   |
+
+    Detection is assembly-level: looks for ``call [reg + N]`` instructions
+    where N matches a known Present/ExecuteCommandLists vtable offset, making
+    it fast and decompiler-independent.
+
+    Returns the containing function address + call site for each hit.
+    Use ``identify_vtable_call`` to trace the object register backward to
+    confirm which specific COM object is being called.
+    """
+    try:
+        ptr_size = 8 if compat.inf_is_64bit() else 4
+
+        # Build the set of (offset, sig) pairs to scan for
+        api_filter: set[str] = set()
+        if apis is None or apis == "all":
+            api_filter = {"dxgi", "d3d9", "d3d12"}
+        else:
+            if isinstance(apis, str):
+                apis = [apis]
+            for a in apis:
+                api_filter.add(a.lower().strip())
+
+        sigs_to_scan: list[tuple[int, str, str, str]] = []
+        for iface, meth, slot, desc in _RENDER_LOOP_SIGNATURES:
+            tag = "dxgi" if "DXGI" in iface or "D3D11" in iface else \
+                  "d3d9" if "D3D9" in iface or "Direct3D9" in iface or "Direct3DDevice9" in iface else \
+                  "d3d12"
+            if tag not in api_filter:
+                continue
+            offset = slot * ptr_size
+            sigs_to_scan.append((offset, iface, meth, desc))
+
+        if not sigs_to_scan:
+            return _annotate({
+                "ok": False,
+                "ptr_size": ptr_size,
+                "hits": [],
+                "hits_count": 0,
+                "functions_scanned": 0,
+                "error": "No signatures selected. Check the apis= parameter.",
+            })
+
+        # Determine address ranges to scan
+        ranges: list[tuple[int, int]] = []
+        if section == "all":
+            for seg_ea in idautils.Segments():
+                seg = ida_segment.getseg(seg_ea)
+                if seg and (seg.perm & ida_segment.SEGPERM_EXEC):
+                    ranges.append((seg.start_ea, seg.end_ea))
+        elif ":" in section:
+            parts = section.split(":", 1)
+            try:
+                ranges.append((parse_address(parts[0]), parse_address(parts[1])))
+            except Exception as e:
+                return _annotate({
+                    **tool_error(e, f"parse range '{section}'"),
+                    "ptr_size": ptr_size, "hits": [], "hits_count": 0, "functions_scanned": 0,
+                })
+        else:
+            seg = _section_by_name(section)
+            if seg is None:
+                return _annotate({
+                    "ok": False,
+                    "ptr_size": ptr_size,
+                    "hits": [], "hits_count": 0, "functions_scanned": 0,
+                    "error": f"Section '{section}' not found. Use get_binary_sections to list available sections.",
+                })
+            ranges.append((seg.start_ea, seg.end_ea))
+
+        # Build offset set for fast O(1) lookup per instruction
+        offset_to_sigs: dict[int, list[tuple[str, str, str]]] = {}
+        for offset, iface, meth, desc in sigs_to_scan:
+            offset_to_sigs.setdefault(offset, []).append((iface, meth, desc))
+
+        hits: list[RenderLoopHit] = []
+        functions_seen: set[int] = set()
+
+        for start_ea, end_ea in ranges:
+            ea = start_ea
+            while ea < end_ea and len(hits) < limit:
+                insn = _decoded_or_none(ea)
+                if insn is None:
+                    ea += 1
+                    continue
+
+                # We want: call [reg + const_offset]
+                # IDA opcode: NN_call + operand type o_displ
+                is_call = (insn.itype == getattr(ida_idp, "NN_call", -1) or
+                           insn.itype == getattr(ida_idp, "NN_callfi", -1) or
+                           insn.itype == getattr(ida_idp, "NN_callni", -1))
+
+                if is_call:
+                    op = insn.ops[0]
+                    if op.type == ida_ua.o_displ:
+                        # op.addr holds the displacement
+                        disp = int(op.addr) & 0xFFFFFFFF
+                        # Sign-extend 32-bit disp for 64-bit addresses
+                        if disp >= 0x80000000:
+                            disp -= 0x100000000
+                        if disp in offset_to_sigs and disp >= 0:
+                            for iface, meth, desc in offset_to_sigs[disp]:
+                                pfn = ida_funcs.get_func(ea)
+                                func_ea = pfn.start_ea if pfn else ea
+                                func_name = (ida_funcs.get_func_name(func_ea)
+                                             or idc.get_name(func_ea, idc.GN_VISIBLE)
+                                             or hex(func_ea))
+                                hit: RenderLoopHit = {
+                                    "func_ea": hex(func_ea),
+                                    "func_name": func_name,
+                                    "call_ea": hex(ea),
+                                    "vtable_slot": disp // ptr_size,
+                                    "vtable_offset_hex": hex(disp),
+                                    "interface": iface,
+                                    "method": meth,
+                                    "description": desc,
+                                }
+                                if include_disasm:
+                                    hit["disasm"] = _safe_disasm(ea)
+                                hits.append(hit)
+                                functions_seen.add(func_ea)
+
+                ea += max(insn.size, 1)
+
+        render_result: dict = {
+            "ok": True,
+            "ptr_size": ptr_size,
+            "hits": hits,
+            "hits_count": len(hits),
+            "functions_scanned": len(functions_seen),
+        }
+        if hits:
+            render_result["hint"] = (
+                "Use identify_vtable_call(call_addr=hit['call_ea']) to trace "
+                "the object register backward and confirm the COM interface type."
+            )
+        return _annotate(render_result)
+
+    except Exception as e:
+        return _annotate({
+            **tool_error(e, "find_render_loop"),
+            "ptr_size": 8,
+            "hits": [],
+            "hits_count": 0,
+            "functions_scanned": 0,
         })

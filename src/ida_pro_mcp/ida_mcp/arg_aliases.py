@@ -144,6 +144,19 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     # Unicorn tools — natural aliases for regs/timeout params.
     # Global max_instructions→max_insns already covers max_insns remapping.
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # COM / DirectX vtable tools
+    # -----------------------------------------------------------------------
+    # resolve_com_vtable: "slot" is a natural alias for the integer "index" param
+    "resolve_com_vtable":           {"slot": "index", "iface": "interface", "name": "interface"},
+    # find_render_loop: natural names for the "section" and "apis" params
+    "find_render_loop":             {"seg": "section", "segment": "section", "api": "apis"},
+    # struct_recovery: accept "function" or "address" as aliases for addr
+    "struct_recovery":              {"function": "addr", "address": "addr", "min_distinct": "min_fields"},
+    # -----------------------------------------------------------------------
+    # Unicorn tools — natural aliases for regs/timeout params.
+    # Global max_instructions→max_insns already covers max_insns remapping.
+    # -----------------------------------------------------------------------
     "unicorn_emulate":              {"registers": "regs", "timeout": "timeout_ms"},
     "unicorn_trace":                {"registers": "regs", "timeout": "timeout_ms"},
     "unicorn_call_function":        {"timeout": "timeout_ms"},
