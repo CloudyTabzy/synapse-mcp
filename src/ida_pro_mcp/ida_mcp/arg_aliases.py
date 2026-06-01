@@ -140,6 +140,23 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     "construct_batch_parse_array": {"limit": "count"},
     "cstruct_parse_at_address":   {"limit": "count"},
     "find_xref_signatures":       {"limit": "top", "address": "addrs"},
+    # -----------------------------------------------------------------------
+    # Unicorn tools — natural aliases for regs/timeout params.
+    # Global max_instructions→max_insns already covers max_insns remapping.
+    # -----------------------------------------------------------------------
+    "unicorn_emulate":              {"registers": "regs", "timeout": "timeout_ms"},
+    "unicorn_trace":                {"registers": "regs", "timeout": "timeout_ms"},
+    "unicorn_call_function":        {"timeout": "timeout_ms"},
+    "unicorn_emulate_and_patch":    {"registers": "regs", "timeout": "timeout_ms"},
+    "unicorn_diff_memory":          {"registers": "regs", "timeout": "timeout_ms"},
+    "unicorn_recover_stackstrings": {"registers": "regs", "timeout": "timeout_ms"},
+    "unicorn_find_memory_accesses": {"registers": "regs", "timeout": "timeout_ms"},
+    "unicorn_resolve_api_hash":     {"timeout": "timeout_ms"},
+    "unicorn_emulate_shellcode":    {"timeout": "timeout_ms"},
+    "workflow_unicorn_decrypt_analyze": {"registers": "regs", "timeout": "timeout_ms"},
+    "hybrid_unicorn_triton_analyze":    {"registers": "regs", "timeout": "timeout_ms"},
+    "hybrid_unicorn_miasm_hot_blocks":  {"registers": "regs", "timeout": "timeout_ms"},
+    "hybrid_unicorn_networkx_exec_graph": {"timeout": "timeout_ms"},
 }
 
 

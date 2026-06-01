@@ -278,6 +278,7 @@ class UnicornMemWrite(TypedDict, total=False):
     size: int
     value: str
     hex: str
+    repeat: int  # present when consecutive identical writes were collapsed
 
 
 class UnicornEmulateResult(TypedDict, total=False):
@@ -676,19 +677,6 @@ def _gather_ida_segments_internal() -> list[dict]:
             "name": name,
         })
     return out
-
-
-_gather_ida_segments_marshalled = idasync(_gather_ida_segments_internal)
-
-
-def _gather_ida_segments() -> list[dict]:
-    """Safe from any context — direct on the main thread, marshalled otherwise."""
-    try:
-        return _gather_ida_segments_internal()
-    except RuntimeError as e:
-        if "main thread" in str(e).lower():
-            return _gather_ida_segments_marshalled()
-        raise
 
 
 def _seg_for_addr(segments: list[dict], addr: int) -> dict | None:
@@ -1225,23 +1213,96 @@ def unicorn_status() -> UnicornStatusResult:
 
 
 # ============================================================================
+# Memory-write post-processing — pure Python, no IDA.
+# ============================================================================
+
+
+def _compress_mem_writes(
+    writes: list[dict],
+    filter_range: tuple[int, int] | None = None,
+) -> list[dict]:
+    """Run-length compress consecutive identical writes; optionally filter by range.
+
+    Consecutive writes to the same addr+size+value are collapsed into one entry
+    with a ``repeat`` field. This eliminates the common CRT zero-init pattern
+    (hundreds of identical 1-byte 0x00 writes to 0x0) that makes raw output
+    unreadable for agents.
+
+    filter_range=(lo, hi): keep only writes where lo <= addr < hi.
+    """
+    if not writes:
+        return writes
+    if filter_range is not None:
+        lo, hi = filter_range
+        writes = [w for w in writes if lo <= int(w["addr"], 16) < hi]
+    if not writes:
+        return writes
+    out: list[dict] = []
+    i = 0
+    while i < len(writes):
+        w = writes[i]
+        j = i + 1
+        while (j < len(writes) and
+               writes[j]["addr"] == w["addr"] and
+               writes[j]["size"] == w["size"] and
+               writes[j]["value"] == w["value"]):
+            j += 1
+        count = j - i
+        entry = dict(w)
+        if count > 1:
+            entry["repeat"] = count
+        out.append(entry)
+        i = j
+    return out
+
+
+def _parse_filter_range(
+    filter_str: str | None,
+    segments: list[dict],
+) -> tuple[int, int] | None:
+    """Parse a write-filter string into (lo, hi), or None for no filtering.
+
+    Formats:
+      ``'0x140000000-0x140667000'``  — explicit hex range (inclusive start, exclusive end)
+      ``'image'``                    — union of all IDA segments (min_start..max_end)
+    """
+    if not filter_str:
+        return None
+    s = filter_str.strip().lower()
+    if s == "image":
+        if not segments:
+            return None
+        lo = min(seg["start"] for seg in segments)
+        hi = max(seg["start"] + seg["size"] for seg in segments)
+        return lo, hi
+    if "-" in s:
+        parts = s.split("-", 1)
+        try:
+            return int(parts[0].strip(), 16), int(parts[1].strip(), 16)
+        except ValueError:
+            return None
+    return None
+
+
+# ============================================================================
 # All other tools require unicorn. Registered only when present.
 #
 # Tools are @tool-only (NOT @idasync): the emulation loop must run off the IDA
-# main thread so a long run never freezes the UI. IDA-derived data is gathered
-# up front via _gather_ida_segments(), which marshals to the main thread on its
-# own. This mirrors angr_backward_slice's threading model.
+# main thread so a long run never freezes the UI. IDA data (segments + arch) is
+# gathered up front via _prepare(), which uses idasync to marshal exactly once
+# to the main thread, returning plain Python objects the emulation core never
+# needs to touch IDA for again.
 # ============================================================================
 
 if UNICORN_AVAILABLE:
 
-    def _prepare() -> tuple[list[dict], int, int, int]:
-        """Gather segments + arch on the main thread. Returns (segs, arch, mode, bits)."""
-        segments = _gather_ida_segments()
-        uc_arch, uc_mode, bits = _gather_arch()
-        return segments, uc_arch, uc_mode, bits
+    def _prepare_internal() -> tuple[list[dict], int, int, int]:
+        """Gather all IDA data needed for emulation. Must run on main thread."""
+        segs = _gather_ida_segments_internal()
+        arch, mode, bits = _detect_uc_arch()
+        return segs, arch, mode, bits
 
-    _gather_arch = idasync(_detect_uc_arch)
+    _prepare = idasync(_prepare_internal)
 
     # =====================================================================
     # U.1 — unicorn_emulate
@@ -1261,6 +1322,12 @@ if UNICORN_AVAILABLE:
         bypass_antidebug: Annotated[
             bool, "Neutralise RDTSC/CPUID anti-analysis checks (default False)."
         ] = False,
+        filter_writes_to: Annotated[
+            str | None,
+            "Only report memory writes within this range: 'START-END' hex (e.g. "
+            "'0x140000000-0x140667000') or 'image' (all IDA segments). "
+            "Consecutive identical writes are always deduplicated. Default: report all.",
+        ] = None,
     ) -> UnicornEmulateResult:
         """Concrete-emulate an IDA address range with all segments mapped.
 
@@ -1269,6 +1336,10 @@ if UNICORN_AVAILABLE:
         runs from `start` to `end`. Records register state, all memory writes,
         and any unmapped-memory faults (auto-mapped to zero pages so a stray
         access can't abort the run).
+
+        Consecutive identical writes (e.g. CRT zero-init loops) are collapsed
+        into a single entry with a ``repeat`` count so output stays readable.
+        Use filter_writes_to to scope write reporting to a region of interest.
 
         This is the bread-and-butter tool: use it to run a function or code
         slice and observe its concrete effects without a debugger.
@@ -1283,6 +1354,9 @@ if UNICORN_AVAILABLE:
                 bypass_antidebug=bypass_antidebug,
             )
             res.pop("_controller", None)
+            frange = _parse_filter_range(filter_writes_to, segments)
+            res["memory_writes"] = _compress_mem_writes(
+                res.get("memory_writes", []), frange)
             res["note"] = _emulate_note(res)
             return res
         except Exception as e:
@@ -1589,6 +1663,7 @@ if UNICORN_AVAILABLE:
                 max_insns, timeout_ms,
             )
             res.pop("_controller", None)
+            res["memory_writes"] = _compress_mem_writes(res.get("memory_writes", []))
             rv = res.get("return_value", "0x0")
             res["note"] = f"Returned {rv} after {res.get('insns_executed', 0)} instructions ({res.get('stop_reason')})."
             return res
