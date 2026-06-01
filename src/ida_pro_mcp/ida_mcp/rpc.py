@@ -1,6 +1,7 @@
 import json
 import os
 from typing import Any, Optional
+from .arg_aliases import normalize_tool_args
 from .zeromcp import (
     McpRpcRegistry,
     McpServer,
@@ -145,6 +146,8 @@ _TOOL_MODULE_EXACT: dict[str, str] = {
     "dump_vtable": "recon",
     "py_eval": "recon",
     "py_exec_file": "recon",
+    # composite / analysis tools without distinctive prefixes
+    "find_callers_of_import": "analysis",
     # symbolic (composite tools without distinctive prefixes)
     "analyze_function": "symbolic",
     "analyze_component": "symbolic",
@@ -305,6 +308,10 @@ def _install_tools_call_patch() -> None:
     def patched(
         name: str, arguments: Optional[dict] = None, _meta: Optional[dict] = None
     ) -> dict:
+        # Normalize arg aliases before dispatch so every MCP transport
+        # (HTTP, SSE, stdio proxy) benefits — not just proxy-routed calls.
+        if arguments:
+            arguments = normalize_tool_args(name, arguments)
         response = original(name, arguments, _meta)
 
         if response.get("isError"):

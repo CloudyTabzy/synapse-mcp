@@ -175,6 +175,7 @@ class XrefsToResult(TypedDict, total=False):
     addr: str
     xrefs: list[Xref] | None
     total: int
+    next_offset: int | None
     more: bool
     has_more: bool
     note: str
@@ -229,6 +230,7 @@ class CalleesResult(TypedDict, total=False):
     addr: str
     callees: list[CalleeResultItem] | None
     total: int
+    next_offset: int | None
     more: bool
     has_more: bool
     error: str
@@ -246,8 +248,8 @@ class FunctionCallersResult(TypedDict, total=False):
     addr: str
     name: str
     callers: list[FunctionCallersItem] | None
-    caller_count: int
     total: int
+    next_offset: int | None
     more: bool
     has_more: bool
     error: str
@@ -1893,11 +1895,13 @@ def analyze_batch(
 @idasync
 def xrefs_to(
     addrs: Annotated[list[str] | str, "Addresses or function names to find cross-references to (e.g. '0x11a9', 'check_pw', 'main')"],
-    limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
+    limit: Annotated[int, "Max xrefs per address per page (default: 100, max: 1000)"] = 100,
+    offset: Annotated[int, "Skip first N xrefs per address — pass next_offset from a previous result to page forward (default: 0)"] = 0,
 ) -> list[XrefsToResult]:
-    """Return xrefs to address(es) or named symbols, capped per target with truncation flag.
+    """Return xrefs to address(es) or named symbols, with pagination support.
 
     Accepts a single address/name or a list. Returns per-address results.
+    Use ``offset`` + ``next_offset`` to page through large xref sets.
 
     Empty results are expected for addresses in regions IDA has not analysed
     (e.g. encrypted sections). In that case:
@@ -1916,35 +1920,41 @@ def xrefs_to(
 
     if limit <= 0 or limit > 1000:
         limit = 1000
+    if offset < 0:
+        offset = 0
 
     results = []
 
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            xrefs = []
             total = 0
-            more = False
+            skip = offset
+            xrefs: list[Xref] = []
             for xref in idautils.XrefsTo(ea):
                 total += 1
-                if len(xrefs) >= limit:
-                    more = True
+                if skip > 0:
+                    skip -= 1
                     continue
-                xrefs.append(
-                    Xref(
-                        addr=hex(xref.frm),
-                        type="code" if xref.iscode else "data",
-                        fn=get_function(xref.frm, raise_error=False),
+                if len(xrefs) < limit:
+                    xrefs.append(
+                        Xref(
+                            addr=hex(xref.frm),
+                            type="code" if xref.iscode else "data",
+                            fn=get_function(xref.frm, raise_error=False),
+                        )
                     )
-                )
+            next_off: int | None = (offset + limit) if (offset + limit < total) else None
+            more = next_off is not None
             row: XrefsToResult = {
                 "addr": addr,
                 "xrefs": xrefs,
                 "total": total,
+                "next_offset": next_off,
                 "more": more,
                 "has_more": more,
             }
-            if not xrefs:
+            if not xrefs and offset == 0:
                 import idc as _idc
                 flags = _idc.get_full_flags(ea)
                 if _idc.is_unknown(flags):
@@ -2191,9 +2201,10 @@ def xrefs_to_field(
 @idasync
 def callees(
     addrs: Annotated[list[str] | str, "Function addresses or names to get callees for (e.g. '0x123e', 'main')"],
-    limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
+    limit: Annotated[int, "Max callees per function per page (default: 200, max: 500)"] = 200,
+    offset: Annotated[int, "Skip first N callees — pass next_offset from a previous result to page forward (default: 0)"] = 0,
 ) -> list[CalleesResult]:
-    """Return unique callees per function, capped by limit.
+    """Return unique callees per function, with pagination support.
 
     See also: get_function_callers (incoming calls), xrefs_to (all xrefs),
     callgraph (multi-level call graph).
@@ -2202,6 +2213,8 @@ def callees(
 
     if limit <= 0 or limit > 500:
         limit = 500
+    if offset < 0:
+        offset = 0
 
     results = []
 
@@ -2215,9 +2228,7 @@ def callees(
                 )
                 continue
             func_end = func.end_ea
-            callees_dict: dict[int, dict] = {}
-            total = 0
-            more = False
+            all_callees_dict: dict[int, CalleeResultItem] = {}
             current_ea = func_start
             while current_ea < func_end:
                 insn = _decode_insn_at(current_ea)
@@ -2235,7 +2246,7 @@ def callees(
                         target = op0.value
                     else:
                         target = None
-                    if target is not None and target not in callees_dict:
+                    if target is not None and target not in all_callees_dict:
                         func_type = (
                             "internal"
                             if idaapi.get_func(target) is not None
@@ -2243,26 +2254,24 @@ def callees(
                         )
                         func_name = ida_name.get_name(target)
                         if func_name is not None:
-                            if len(callees_dict) < limit:
-                                callees_dict[target] = {
-                                    "addr": hex(target),
-                                    "name": func_name,
-                                    "type": func_type,
-                                }
-                            else:
-                                more = True
-                            total += 1
+                            all_callees_dict[target] = {
+                                "addr": hex(target),
+                                "name": func_name,
+                                "type": func_type,
+                            }
                 next_ea = _next_head(current_ea, func_end)
                 if next_ea == idaapi.BADADDR:
                     break
                 current_ea = next_ea
 
-            callee_list = list(callees_dict.values())
+            page = paginate(list(all_callees_dict.values()), offset, limit)
+            more = page["next_offset"] is not None
             results.append(
                 {
                     "addr": fn_addr,
-                    "callees": callee_list,
-                    "total": total,
+                    "callees": page["data"],
+                    "total": page["total"],
+                    "next_offset": page["next_offset"],
                     "more": more,
                     "has_more": more,
                 }
@@ -2414,9 +2423,10 @@ def get_function_callers(
         list[str] | str,
         "Function addresses or names (e.g. '0x401000', 'check_password')",
     ],
-    limit: Annotated[int, "Max callers per function (default: 200, max: 500)"] = 200,
+    limit: Annotated[int, "Max callers per function per page (default: 200, max: 500)"] = 200,
+    offset: Annotated[int, "Skip first N callers — pass next_offset from a previous result to page forward (default: 0)"] = 0,
 ) -> list[FunctionCallersResult]:
-    """Return unique callers for each function, capped by limit.
+    """Return unique callers for each function, with pagination support.
 
     Each entry includes the containing caller function's address/name **and**
     the specific call-site address so you can jump directly to the call.
@@ -2424,7 +2434,7 @@ def get_function_callers(
     See also: callees (outgoing calls), xrefs_to (all xrefs),
     callgraph (multi-level call graph).
 
-    instruction.  Complements ``callees`` — together they give the full
+    Complements ``callees`` — together they give the full
     caller/callee relationship for a function.
 
     Profile: analysis
@@ -2432,6 +2442,8 @@ def get_function_callers(
     addrs = normalize_list_input(addrs)
     if limit <= 0 or limit > 500:
         limit = 500
+    if offset < 0:
+        offset = 0
 
     results: list[FunctionCallersResult] = []
     for fn_addr in addrs:
@@ -2451,9 +2463,7 @@ def get_function_callers(
                 )
                 continue
 
-            seen: dict[int, FunctionCallersItem] = {}
-            total = 0
-            more = False
+            all_seen: dict[int, FunctionCallersItem] = {}
             for call_ea in idautils.CodeRefsTo(func.start_ea, True):
                 # Only count actual call instructions, not data refs or jump tables
                 insn = idaapi.insn_t()
@@ -2466,25 +2476,22 @@ def get_function_callers(
                 if not caller_func:
                     continue
                 cstart = caller_func.start_ea
-                if cstart not in seen:
-                    if len(seen) < limit:
-                        seen[cstart] = {
-                            "func_addr": hex(cstart),
-                            "func_name": ida_name.get_name(cstart) or f"sub_{cstart:X}",
-                            "call_ea": hex(call_ea),
-                        }
-                    else:
-                        more = True
-                    total += 1
+                if cstart not in all_seen:
+                    all_seen[cstart] = {
+                        "func_addr": hex(cstart),
+                        "func_name": ida_name.get_name(cstart) or f"sub_{cstart:X}",
+                        "call_ea": hex(call_ea),
+                    }
 
-            caller_list = list(seen.values())
+            page = paginate(list(all_seen.values()), offset, limit)
+            more = page["next_offset"] is not None
             results.append(
                 {
                     "addr": hex(func.start_ea),
                     "name": ida_name.get_name(func.start_ea) or f"sub_{func.start_ea:X}",
-                    "callers": caller_list,
-                    "caller_count": len(seen),
-                    "total": total,
+                    "callers": page["data"],
+                    "total": page["total"],
+                    "next_offset": page["next_offset"],
                     "more": more,
                     "has_more": more,
                 }

@@ -24,6 +24,7 @@ import idc
 import json
 
 from .rpc import tool, get_cached_output, MCP_PROFILES
+from .arg_aliases import _GLOBAL_ARG_ALIASES, _TOOL_ARG_ALIASES
 from .sync import idasync, IDAError
 from .utils import (
     tool_error,
@@ -63,6 +64,8 @@ class ServerHealthResult(TypedDict):
     strings_cache_ready: bool
     strings_cache_size: int
     profiles: NotRequired[dict[str, int]]
+    arg_aliases: NotRequired[dict]
+    alias_tips: NotRequired[list[str]]
 
 
 class ServerWarmupStep(TypedDict, total=False):
@@ -417,6 +420,37 @@ def _build_health_payload() -> dict:
         result["profiles"] = {
             name: len(tools) for name, tools in sorted(MCP_PROFILES.items())
         }
+    result["arg_aliases"] = {
+        "global": dict(_GLOBAL_ARG_ALIASES),
+        "per_tool": {k: dict(v) for k, v in sorted(_TOOL_ARG_ALIASES.items())},
+    }
+    # Human-readable tips generated from the live tables — never go stale.
+    addr_single = sorted(t for t, a in _TOOL_ARG_ALIASES.items() if a.get("address") == "addr")
+    addr_batch  = sorted(t for t, a in _TOOL_ARG_ALIASES.items() if a.get("address") == "addrs")
+    tips: list[str] = []
+    if addr_single:
+        tips.append(
+            f"'addr' and 'address' are both accepted for these single-address tools: "
+            f"{', '.join(addr_single)}"
+        )
+    if addr_batch:
+        tips.append(
+            f"'addr' and 'address' are both accepted for these batch tools (mapped to 'addrs'): "
+            f"{', '.join(addr_batch)}"
+        )
+    tips.append(
+        "'src'/'start_address'/'start_ea'/'addr_a' → 'start';  "
+        "'dst'/'end_address'/'target_ea'/'addr_b' → 'end'"
+    )
+    tips.append(
+        "'max_results' and 'max_entries' → 'limit' globally "
+        "(except find_similar_functions which uses 'max_results' directly)"
+    )
+    tips.append(
+        "'max_instructions' → 'max_insns' globally; "
+        "disasm and disasm_batch reverse this automatically"
+    )
+    result["alias_tips"] = tips
     return result
 
 

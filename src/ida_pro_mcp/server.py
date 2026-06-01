@@ -152,86 +152,23 @@ LOCAL_TOOLS = {"list_instances", "select_instance", "invoke_on_instance", "compa
 # Most tools use `address` (singular) and `addrs` (plural) as canonical names.
 # Per-tool overrides below handle the two outliers (decompile, disasm) that use `addr`,
 # and the two tools (decompile_batch, triton_replay_instructions) that use `addresses`.
-_GLOBAL_ARG_ALIASES: dict[str, str] = {
-    "addr":        "address",   # address is canonical for the majority of tools
-    "addresses":   "addrs",     # addrs is canonical for most plural-address tools
-    "max_results": "limit",     # recon tools renamed to limit
-    "max_entries": "limit",     # dump_vtable renamed to limit
-    # Range / address helpers
-    "start_address":   "start",
-    "end_address":     "end",
-    "start_ea":        "start",
-    "target_ea":       "end",
-    "addr_a":          "start",
-    "addr_b":          "end",
-    "src":             "start",
-    "dst":             "end",
-    # Misc normalization
-    "architecture":    "arch",
-    "yara_rules":      "rules",
-    "custom_rules":    "rules",
-    "segment_name":    "segment",
-    "segment_names":   "segment",
-    "max_instructions": "max_insns",
-    "path":            "file_path",
-    "binary_path":     "file_path",
-    "output_path":     "file_path",
-}
-# Per-tool aliases applied only when that specific tool is being called.
-# Global addr→address fires first; these per-tool entries then convert back for
-# tools whose actual parameter is named `addr` / `addresses` / etc.
-_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
-    # --- address / addr flip-flops ---
-    "search_text":                {"start": "cursor", "offset": "cursor"},
-    "decompile":                  {"address": "addr"},
-    "disasm":                     {"address": "addr"},
-    "analyze_function":           {"address": "addr"},
-    "diff_before_after":          {"address": "addr"},
-    "trace_data_flow":            {"address": "addr", "start": "addr", "end": "addr"},
-    "dbg_run_to":                 {"address": "addr"},
-    "remove_type":                {"address": "addr"},
-    "find_global_writers":        {"address": "addr"},
-    "dump_vtable":                {"address": "addr"},
-    "analyze_cleanup_function":   {"address": "addr"},
-    "analyze_constructor":        {"address": "addr"},
-    "type_propagate":             {"address": "addr"},
-    # --- plural address variants ---
-    "decompile_batch":            {"addrs": "addresses"},
-    "disasm_batch":               {"addrs": "addresses"},
-    "triton_replay_instructions": {"addrs": "addresses"},
-    "yara_function_classifier":   {"addrs": "addresses"},
-    "find":                       {"addrs": "targets", "addresses": "targets"},
-    "callgraph":                  {"addrs": "roots", "addresses": "roots"},
-    # --- pagination limit aliases ---
-    "list_functions_enhanced":    {"limit": "count"},
-    "list_classes":               {"limit": "count"},
-    "imports":                    {"limit": "count"},
-    "get_bulk_function_hashes":   {"limit": "count"},
-    "batch_analyze_completeness": {"limit": "count"},
-    "construct_parse_ida_struct": {"limit": "count"},
-    "construct_batch_parse_array": {"limit": "count"},
-    "cstruct_parse_at_address":   {"limit": "count"},
-    "find_xref_signatures":       {"limit": "top"},
-}
-
-
-def _normalize_tool_args(tool_name: str, args: dict) -> dict:
-    """Rewrite deprecated/variant arg names to their canonical equivalents.
-
-    Never drops unrecognised keys — only renames known aliases so a call with
-    both the old and new name keeps whichever value was supplied last (new wins
-    because global aliases are applied first, then per-tool aliases).
-    """
-    if not args:
-        return args
-    result = dict(args)
-    for old, new in _GLOBAL_ARG_ALIASES.items():
-        if old in result and new not in result:
-            result[new] = result.pop(old)
-    for old, new in _TOOL_ARG_ALIASES.get(tool_name, {}).items():
-        if old in result and new not in result:
-            result[new] = result.pop(old)
-    return result
+# Alias tables and normalization logic live in ida_mcp/arg_aliases.py so the
+# IDA plugin (rpc.py) and this proxy share a single source of truth.
+# The plugin applies normalization inside its tools/call handler so aliases
+# fire for every MCP transport (HTTP, SSE, stdio).  The proxy applies it
+# here as well as a second pass — the operation is idempotent.
+try:
+    from .ida_mcp.arg_aliases import (
+        _GLOBAL_ARG_ALIASES,
+        _TOOL_ARG_ALIASES,
+        normalize_tool_args as _normalize_tool_args,
+    )
+except ImportError:
+    from ida_mcp.arg_aliases import (  # type: ignore[no-redef]
+        _GLOBAL_ARG_ALIASES,
+        _TOOL_ARG_ALIASES,
+        normalize_tool_args as _normalize_tool_args,
+    )
 LAZY_TOOLS = {"list_modules", "list_tools", "describe_tool", "invoke_tool"}
 LAZY_MODE = False
 

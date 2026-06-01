@@ -116,7 +116,12 @@ class FindCallersOfImportResult(TypedDict, total=False):
     import_addr: str | None
     functions: list[dict[str, Any]]
     total: int
+    next_offset: int | None
+    has_more: bool
+    suggestions: list[str]
     error: str | None
+    error_type: str
+    hint: str
 
 
 class TraceDataFlowNode(TypedDict):
@@ -681,13 +686,18 @@ def find_functions_by_string(
 @idasync
 @tool_timeout(60.0)
 def find_callers_of_import(
-    name: Annotated[str, "Import name to search for (e.g. 'CreateFileW', 'recv', 'memcpy')"],
-    limit: Annotated[int, "Max caller functions to return (default: 100, max: 1000)"] = 100,
+    name: Annotated[str, "Import name to search for (e.g. 'CreateFileW', 'recv', 'memcpy') — case-insensitive"],
+    limit: Annotated[int, "Max caller functions per page (default: 100, max: 1000)"] = 100,
+    offset: Annotated[int, "Skip first N caller functions — pass next_offset from a previous result to page forward (default: 0)"] = 0,
 ) -> FindCallersOfImportResult:
     """Find all functions that call a given imported API.
 
     Resolves the import name to its IAT slot, then traces all code references
     back to their containing functions. Returns a deduplicated list of callers.
+    Name matching is case-insensitive. Multiple IAT slots for the same name are merged.
+    When no match is found, a ``suggestions`` list of similar import names is returned
+    so the agent can retry with the correct spelling (e.g. passing "CreateFile" will
+    suggest "CreateFileA" and "CreateFileW").
 
     Workflow: Use this when you see a suspicious API (e.g. CreateRemoteThread,
     VirtualProtect) and want to find every function that invokes it.
@@ -701,54 +711,71 @@ def find_callers_of_import(
         import ida_funcs
         import idautils
 
+        if limit <= 0 or limit > 1000:
+            limit = 1000
+        if offset < 0:
+            offset = 0
+
+        name_lower = name.lower()
         all_imports = _collect_imports()
-        matched = []
-        for imp in all_imports:
-            if imp.get("imported_name") == name:
-                matched.append(imp)
+        matched = [
+            imp for imp in all_imports
+            if (imp.get("imported_name") or "").lower() == name_lower
+        ]
 
         if not matched:
+            import difflib
+            all_names = [imp.get("imported_name") or "" for imp in all_imports if imp.get("imported_name")]
+            suggestions = difflib.get_close_matches(name, all_names, n=5, cutoff=0.5)
+            # Also catch simple prefix matches that difflib misses (e.g. "CreateFile" → "CreateFileW")
+            if not suggestions:
+                suggestions = [n for n in all_names if n.lower().startswith(name_lower)][:5]
             return {
                 "ok": True,
                 "import_name": name,
                 "import_addr": None,
                 "functions": [],
                 "total": 0,
+                "next_offset": None,
+                "has_more": False,
+                "suggestions": suggestions,
                 "error": None,
             }
 
-        # Use the first match (most binaries have one slot per import)
-        target_imp = matched[0]
-        target_addr = int(target_imp["addr"], 16)
-
+        # Merge all IAT slots for this import (some binaries bind the same name twice)
         func_map: dict[int, dict] = {}
-        for call_ea in idautils.CodeRefsTo(target_addr, 0):
-            caller_func = idaapi.get_func(call_ea)
-            if not caller_func:
-                continue
-            fstart = caller_func.start_ea
-            if fstart not in func_map:
-                fname = ida_funcs.get_func_name(fstart) or f"sub_{fstart:X}"
-                func_map[fstart] = {
-                    "addr": hex(fstart),
-                    "name": fname,
-                    "call_sites": [],
-                }
-            site = hex(call_ea)
-            if site not in func_map[fstart]["call_sites"]:
-                func_map[fstart]["call_sites"].append(site)
+        import_addr = matched[0]["addr"]
+        for imp in matched:
+            target_addr = int(imp["addr"], 16)
+            for call_ea in idautils.CodeRefsTo(target_addr, 0):
+                caller_func = idaapi.get_func(call_ea)
+                if not caller_func:
+                    continue
+                fstart = caller_func.start_ea
+                if fstart not in func_map:
+                    fname = ida_funcs.get_func_name(fstart) or f"sub_{fstart:X}"
+                    func_map[fstart] = {
+                        "addr": hex(fstart),
+                        "name": fname,
+                        "call_sites": [],
+                    }
+                site = hex(call_ea)
+                if site not in func_map[fstart]["call_sites"]:
+                    func_map[fstart]["call_sites"].append(site)
 
-        func_list = list(func_map.values())
-        total = len(func_list)
-        if limit > 0 and len(func_list) > limit:
-            func_list = func_list[:limit]
+        all_funcs = list(func_map.values())
+        total = len(all_funcs)
+        page_funcs = all_funcs[offset: offset + limit]
+        next_off: int | None = (offset + limit) if (offset + limit < total) else None
 
         return {
             "ok": True,
             "import_name": name,
-            "import_addr": target_imp["addr"],
-            "functions": func_list,
+            "import_addr": import_addr,
+            "functions": page_funcs,
             "total": total,
+            "next_offset": next_off,
+            "has_more": next_off is not None,
             "error": None,
         }
     except Exception as e:
@@ -758,6 +785,8 @@ def find_callers_of_import(
             "import_addr": None,
             "functions": [],
             "total": 0,
+            "next_offset": None,
+            "has_more": False,
             **item_error(e, "find_callers_of_import"),
         }
 
