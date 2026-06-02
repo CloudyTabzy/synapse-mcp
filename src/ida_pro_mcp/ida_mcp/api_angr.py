@@ -66,7 +66,7 @@ import idaapi
 import idautils
 import idc
 
-from .rpc import tool
+from .rpc import tool, unsafe
 from .sync import idasync, tool_timeout
 from .utils import (
     parse_address,
