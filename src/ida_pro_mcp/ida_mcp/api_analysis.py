@@ -895,6 +895,79 @@ def _profile_function(
 
 
 # ============================================================================
+# IDA Auto-Analysis Status
+# ============================================================================
+
+# Human-readable names for ida_auto.atype_t constants
+_AU_PHASE_NAMES: dict | None = None
+
+
+def _build_au_phase_names() -> dict:
+    try:
+        import ida_auto as _au
+        return {v: n for n, v in {
+            "code analysis":          getattr(_au, "AU_CODE",   None),
+            "data analysis":          getattr(_au, "AU_DATA",   None),
+            "type analysis":          getattr(_au, "AU_TYPE",   None),
+            "library matching":       getattr(_au, "AU_CHLB",   None),
+            "library recognition":    getattr(_au, "AU_LIBF",   None),
+            "library recognition 2":  getattr(_au, "AU_LBF2",   None),
+            "library recognition 3":  getattr(_au, "AU_LBF3",   None),
+            "procedure detection":    getattr(_au, "AU_PROC",   None),
+            "function chunk":         getattr(_au, "AU_FCHUNK", None),
+            "tail analysis":          getattr(_au, "AU_TAIL",   None),
+            "unknown bytes":          getattr(_au, "AU_UNK",    None),
+            "cross-reference":        getattr(_au, "AU_USED",   None),
+            "weak type":              getattr(_au, "AU_WEAK",   None),
+            "final pass":             getattr(_au, "AU_FINAL",  None),
+        }.items() if v is not None}
+    except Exception:
+        return {}
+
+
+@tool
+@idasync
+def analysis_status() -> dict:
+    """Report whether IDA's auto-analysis is still running.
+
+    Returns ``is_complete: true`` when the auto-analysis queue is empty
+    (``AU_NONE``). When still running, ``phase`` describes the current
+    work stage and ``hint`` instructs the agent to wait before relying
+    on function counts, xrefs, or type information.
+
+    Call this at the start of any session with a freshly-opened binary,
+    or after triggering a re-analysis (e.g. with analyze_range).
+
+    Profile: discovery
+    """
+    global _AU_PHASE_NAMES
+    try:
+        import ida_auto as _au
+        if _AU_PHASE_NAMES is None:
+            _AU_PHASE_NAMES = _build_au_phase_names()
+
+        state = _au.get_auto_state()
+        au_none = getattr(_au, "AU_NONE", 0)
+        is_complete = (state == au_none)
+
+        phase = "idle" if is_complete else _AU_PHASE_NAMES.get(state, f"phase_{state}")
+        result: dict = {
+            "ok": True,
+            "is_complete": is_complete,
+            "phase": phase,
+        }
+        if not is_complete:
+            result["hint"] = (
+                f"IDA is still running auto-analysis ({phase}). "
+                "Function counts, xref data, and type info may be incomplete. "
+                "Call analysis_status() again before depending on those results."
+            )
+        return result
+    except Exception as e:
+        return {"ok": False, **tool_error(e, "analysis_status")}
+
+
+# ============================================================================
 # Code Analysis & Decompilation
 # ============================================================================
 

@@ -1236,3 +1236,131 @@ def remove_type(
         return {"ok": True, "addr": hex(ea)}
     except Exception as e:
         return {**tool_error(e, f"remove_type at {addr}"), "addr": addr}
+
+
+# ============================================================================
+# Stub / placeholder tagging
+# ============================================================================
+
+import re as _re
+
+_AUTO_NAME_RE = _re.compile(
+    r'^(sub|nullsub|loc|def|byte|word|dword|qword|oword|xmmword|ymmword|zmmword|unk|j_)_[0-9A-Fa-f]+$'
+)
+
+
+def _is_auto_generated_name(name: str) -> bool:
+    """Return True if name looks like an IDA-generated placeholder (sub_XXXX, loc_XXXX, …)."""
+    return bool(_AUTO_NAME_RE.match(name))
+
+
+@unsafe
+@tool
+@idasync
+def mark_functions_as_stubs(
+    addrs: Annotated[
+        list[str] | str,
+        "Function address(es) to tag — list or comma-separated. "
+        "e.g. ['0x2e0', '0x390'] or '0x2e0,0x390'.",
+    ],
+    reason: Annotated[
+        str,
+        "Tag reason to store in the function comment "
+        "(e.g. 'encrypted', 'thunk', 'placeholder'; default: 'stub').",
+    ] = "stub",
+    rename: Annotated[
+        bool,
+        "Prefix auto-named functions (sub_XXXX, nullsub_XXXX) with 'stub_' so they "
+        "stand out in function lists. Only renames if the current name is auto-generated. "
+        "Default: true.",
+    ] = True,
+) -> dict:
+    """Tag one or more functions as stubs / placeholders / encrypted blobs.
+
+    For each address:
+    - Sets a repeatable function comment ``[STUB:<reason>]`` so the tag
+      appears in disassembly listings and is visible to all analysis tools.
+    - Optionally renames auto-generated functions (``sub_*``, ``nullsub_*``, …)
+      with a ``stub_`` prefix so they are easy to filter from function lists.
+
+    Returns per-address status including the old name, new name (if renamed),
+    and whether the tag was applied.
+
+    Typical use: after ``lief_sections`` reveals a packed ``.text`` with entropy
+    > 7.2, tag all functions in the encrypted range so later analysis can skip them:
+
+        mark_functions_as_stubs(addrs=['0x2e0', '0x390', ...], reason='encrypted')
+
+    Then filter with: ``func_query([{\"name_regex\": \"^(?!stub_)\"}])``
+
+    See also: func_query (filter by name pattern), add_comment (free-form comments).
+    """
+    from .utils import normalize_list_input
+    import ida_name
+
+    raw_addrs = normalize_list_input(addrs)
+    if not raw_addrs:
+        return {"ok": False, "error": "No addresses provided"}
+
+    tag = f"[STUB:{reason}]"
+    results: list[dict] = []
+    tagged = 0
+    skipped = 0
+
+    for raw in raw_addrs:
+        raw = raw.strip()
+        if not raw:
+            continue
+        entry: dict = {"addr": raw}
+        try:
+            ea = parse_address(raw)
+            entry["addr"] = hex(ea)
+
+            func = ida_funcs.get_func(ea)
+            if func is None:
+                entry["ok"] = False
+                entry["error"] = "No function at this address"
+                skipped += 1
+                results.append(entry)
+                continue
+
+            # Function comment — repeatable so it shows in both listing and decompiler
+            old_cmt = idc.get_func_cmt(func.start_ea, 1) or ""
+            if tag not in old_cmt:
+                new_cmt = (old_cmt + "\n" + tag).strip() if old_cmt else tag
+                idc.set_func_cmt(func.start_ea, new_cmt, 1)
+
+            old_name = ida_funcs.get_func_name(func.start_ea) or hex(func.start_ea)
+            new_name = old_name
+            renamed = False
+
+            if rename and _is_auto_generated_name(old_name):
+                candidate = f"stub_{hex(func.start_ea)[2:]}"
+                flags = ida_name.SN_NOCHECK | ida_name.SN_FORCE
+                if ida_name.set_name(func.start_ea, candidate, flags):
+                    new_name = candidate
+                    renamed = True
+
+            entry.update({
+                "ok": True,
+                "old_name": old_name,
+                "new_name": new_name,
+                "renamed": renamed,
+                "comment_set": tag,
+            })
+            tagged += 1
+
+        except Exception as exc:
+            entry.update({**item_error(exc, f"mark_functions_as_stubs at {raw}"),
+                          "ok": False})
+            skipped += 1
+
+        results.append(entry)
+
+    return {
+        "ok": True,
+        "tagged": tagged,
+        "skipped": skipped,
+        "total": len(results),
+        "results": results,
+    }

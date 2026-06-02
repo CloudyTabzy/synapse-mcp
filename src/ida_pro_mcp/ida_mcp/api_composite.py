@@ -22,6 +22,8 @@ from .utils import (
     get_assembly_lines,
     normalize_list_input,
 )
+# Shared decompile-failure classification — avoids duplicating the MERR_* map
+from .api_analysis import _classify_merr, _DECOMPILE_DEFAULT_HINT  # noqa: PLC2701
 
 # Max decompile lines before truncation.
 _DECOMPILE_LINE_CAP = 100
@@ -44,6 +46,8 @@ class AnalyzeFunctionResult(TypedDict, total=False):
     size: int
     decompiled: str | None
     decompile_truncated: int
+    decompile_failure_reason: str   # "no_license" | "code_is_data" | "unsupported_isa" | "too_complex" | "timeout" | "unknown"
+    decompile_hint: str             # context-specific remediation hint when decompile failed
     assembly: str | None
     strings: list[str]
     constants: list[dict[str, Any]]
@@ -306,6 +310,21 @@ def _analyze_function_internal(
             result["decompiled"] = code
             if total_lines is not None:
                 result["decompile_truncated"] = total_lines
+            if code is None:
+                failure_reason = "unknown"
+                hint = _DECOMPILE_DEFAULT_HINT
+                try:
+                    import ida_hexrays as _hr
+                    if _hr.init_hexrays_plugin():
+                        hf = _hr.hexrays_failure_t()
+                        try:
+                            _hr.decompile(ea, hf)
+                        except _hr.DecompilationFailure:
+                            failure_reason, hint = _classify_merr(hf)
+                except Exception:
+                    pass
+                result["decompile_failure_reason"] = failure_reason
+                result["decompile_hint"] = hint
         except Exception:
             result["decompiled"] = None
 

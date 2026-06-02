@@ -791,7 +791,15 @@ def list_funcs(
         "List functions with optional filtering and pagination",
     ],
 ) -> list[Page[Function]]:
-    """List functions with optional filtering and offset/count pagination."""
+    """List functions with optional name-glob filtering and offset/count pagination.
+
+    **When to use:** simple name-pattern browsing, paginated dumps.
+    For size/type/regex constraints use ``func_query``.
+    For a multi-entity catalog (functions + globals + imports + strings in one call)
+    use ``entity_query``.
+    For richer per-function flags (is_thunk, is_library, has_prototype) use
+    ``list_functions_enhanced``.
+    """
     queries = normalize_dict_list(queries)
     all_functions = [get_function(addr) for addr in idautils.Functions()]
 
@@ -966,7 +974,13 @@ def func_query(
         "Richer function query (size/type/name filters + pagination)",
     ],
 ) -> list[FunctionQueryPage]:
-    """Query functions with richer filtering than list_funcs."""
+    """Query functions with size, type, and regex-name constraints.
+
+    **When to use:** you need to filter by function size, whether it has a type, or
+    match names with a full regex. For simple glob filtering use ``list_funcs``.
+    For a multi-entity catalog (functions + globals + imports + strings) use
+    ``entity_query``. For richer per-function flags use ``list_functions_enhanced``.
+    """
     queries = normalize_dict_list(queries)
 
     all_functions: list[dict] = []
@@ -1081,8 +1095,11 @@ def entity_query(
 ) -> list[EntityQueryPage]:
     """Universal query tool for functions, globals, imports, strings, and names.
 
-    This is the swiss-army-knife discovery tool. Use it when you need a catalog
-    of any entity type in the IDB.
+    **When to use:** you need to enumerate multiple entity kinds in one call, or want
+    projection/sorting over any entity type. For function-only queries:
+    - Name glob only → ``list_funcs``
+    - Size / type / regex constraints → ``func_query``
+    - Richer per-function flags (is_thunk, is_library) → ``list_functions_enhanced``
 
     Common queries:
       - All strings: {"kind": "strings", "count": 0}
@@ -1093,8 +1110,9 @@ def entity_query(
 
     Supports projection (fields), sorting (sort_by), and pagination (offset/count).
 
-    See also: list_funcs (function catalog), list_globals (global catalog),
-    imports_query (import catalog), find_regex (pattern search across strings/names).
+    See also: list_funcs (name-glob function list), func_query (size/type/regex),
+    list_functions_enhanced (function flags), list_globals (global catalog),
+    imports_query (import catalog), find_regex (regex search across strings/names).
     """
     queries = normalize_dict_list(queries)
     results: list[dict] = []
@@ -1317,6 +1335,12 @@ def find_regex(
     symbols (functions, globals, labels). Use ``search_strings``/``search_names`` to
     narrow the scope.
 
+    **Search semantics:** operates on IDA's internal string database — the strings
+    IDA identified and created items for during analysis. It does NOT scan raw file
+    bytes. Strings in packed/encrypted sections, or in DLLs that are not loaded into
+    the active IDB, will not appear here. For raw byte scanning of files on disk
+    (including DLLs not in the IDB), use ``lief_strings(file_path=...)`` instead.
+
     For searching the **disassembly listing or comments**, use ``search_text`` instead.
     For searching **raw bytes in data segments** (e.g. decrypted regions where IDA has
     not created string items), set ``scan_raw=true``.
@@ -1324,7 +1348,8 @@ def find_regex(
     For a simple list of all strings without a regex, use ``list_strings`` or
     ``entity_query(kind='strings')``.
 
-    See also: search_text (disassembly/comment search), entity_query (full catalog),
+    See also: lief_strings (raw file bytes, works on any file on disk),
+    search_text (disassembly/comment search), entity_query (full catalog),
     list_strings (simple string dump).
     """
     if limit <= 0:

@@ -5,6 +5,7 @@ select_instance makes this IDA instance proxy tool calls to the target.
 This lets a single MCP endpoint reach any running IDA instance.
 """
 
+import fnmatch
 import http.client
 import json
 import os
@@ -477,6 +478,93 @@ def get_active_instance() -> ActiveInstanceResult:
         "is_local": is_local,
         "reachable": probe_instance(host, port),
     })
+
+
+def _instance_matches(inst: dict, pattern: str) -> bool:
+    """Return True if pattern matches the instance binary name or idb_path."""
+    pat_lower = pattern.lower()
+    for field in ("binary", "idb_path", "input_file_path"):
+        val = (inst.get(field) or "").lower()
+        if not val:
+            continue
+        # Substring match OR glob match (whichever succeeds)
+        if pat_lower in val:
+            return True
+        # Glob: match against filename component and full path
+        basename = os.path.basename(val)
+        if fnmatch.fnmatch(basename, pat_lower) or fnmatch.fnmatch(val, pat_lower):
+            return True
+    return False
+
+
+@tool
+def find_instance(
+    matching: Annotated[
+        str,
+        "Case-insensitive substring or glob to match against binary name or IDB path. "
+        "Examples: 'Engine.dll', 'libplugins*', 'Affinity'.",
+    ],
+    auto_select: Annotated[
+        bool,
+        "If exactly one instance matches, automatically select it for subsequent calls "
+        "(equivalent to calling select_instance). Default: true.",
+    ] = True,
+) -> dict:
+    """Find an IDA instance by binary name or IDB path pattern.
+
+    When multiple IDA windows are open (e.g. one per DLL), use this to locate the
+    right instance without manually noting its port. Pass a partial name like
+    ``'libplugins'`` or a glob like ``'*.dll'``.
+
+    If exactly one match is found and ``auto_select=true``, the instance is
+    automatically selected for all subsequent tool calls — no need to call
+    ``select_instance`` separately.
+
+    See also: list_instances (enumerate all), select_instance (switch by port).
+    """
+    instances = discover_instances()
+    matches = [inst for inst in instances if _instance_matches(inst, matching)]
+
+    if not matches:
+        all_binaries = [inst.get("binary") or inst.get("idb_path", "") for inst in instances]
+        return {
+            "ok": False,
+            "matches": [],
+            "match_count": 0,
+            "error": f"No instance matched {matching!r}.",
+            "hint": (
+                f"Running instances: {all_binaries}. "
+                "Use list_instances() to see all available instances."
+            ),
+        }
+
+    selected = False
+    if auto_select and len(matches) == 1:
+        inst = matches[0]
+        _set_redirect_target(inst["host"], inst["port"])
+        selected = True
+
+    result: dict = {
+        "ok": True,
+        "matches": [
+            {k: v for k, v in m.items() if k in ("host", "port", "pid", "binary", "idb_path", "input_file_path")}
+            for m in matches
+        ],
+        "match_count": len(matches),
+        "auto_selected": selected,
+    }
+    if selected:
+        inst = matches[0]
+        result["hint"] = (
+            f"Instance '{inst.get('binary', '')}' (port {inst['port']}) selected. "
+            "All subsequent tool calls will target this instance."
+        )
+    elif len(matches) > 1:
+        result["hint"] = (
+            f"{len(matches)} instances matched. Call select_instance(port=...) "
+            "to choose one, or narrow the pattern."
+        )
+    return result
 
 
 @tool

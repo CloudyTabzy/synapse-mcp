@@ -1526,7 +1526,20 @@ if LIEF_AVAILABLE:
         minimum length. Executable sections (.text) are skipped by default
         because machine code produces many short garbage strings. Sections
         larger than max_section_size are also skipped. Also scans the PE
-        overlay when present."""
+        overlay when present.
+
+        **Search semantics:** operates on raw binary bytes read directly from the
+        file on disk — independent of IDA's analysis. This complements ``find_regex``
+        which searches IDA's internal string database (strings IDA identified during
+        analysis). Use this tool when:
+        - The binary is not loaded into IDA (pass ``file_path=`` explicitly).
+        - The target DLL is one of many in an install directory (see ``find_dll_by_purpose``).
+        - The .text section is encrypted/packed and IDA found no strings there.
+        - You want raw UTF-16LE strings that IDA may not have picked up.
+
+        See also: find_regex (IDA string database), find_dll_by_purpose (search across
+        many DLLs by keyword).
+        """
         try:
             path = _resolve_lief_path(file_path)
             binary = _lief.parse(path)
@@ -2845,6 +2858,208 @@ if LIEF_AVAILABLE:
                 "skipped_count": skipped,
                 "not_found_count": not_found,
                 "changes": changes,
+            }
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # B.1 — find_dll_by_purpose
+    # -----------------------------------------------------------------------
+
+    @tool
+    def find_dll_by_purpose(
+        install_dir: Annotated[
+            str,
+            "Directory to walk for PE/ELF binary files.",
+        ],
+        keywords: Annotated[
+            list[str] | str,
+            "Keywords to match (case-insensitive) in import names, export names, "
+            "and string literals. e.g. ['8bf', 'Plugin', 'Photoshop'].",
+        ],
+        max_results: Annotated[
+            int,
+            "Maximum number of matching files to return, ranked by match score (default: 20).",
+        ] = 20,
+        include_strings: Annotated[
+            bool,
+            "Search string literals in non-executable sections in addition to "
+            "import/export names (default: true). Slower on large files.",
+        ] = True,
+        max_file_size_mb: Annotated[
+            int,
+            "Skip files larger than this many MB (default: 50). Prevents stalling on "
+            "very large binaries like runtime frameworks.",
+        ] = 50,
+        extensions: Annotated[
+            list[str] | str,
+            "File extensions to include (without leading dot; default: ['dll', 'exe']).",
+        ] = ["dll", "exe"],
+    ) -> dict:
+        """Search an install directory for DLLs/EXEs that match a set of purpose keywords.
+
+        Walks ``install_dir`` recursively, parses each matching binary with LIEF, and
+        checks import names, export names, and string literals for any of the given
+        keywords. Returns a ranked list of candidates with match evidence so the agent
+        can identify which DLL to load into IDA next.
+
+        Typical use — finding the DLL that hosts Photoshop plugin logic in a 100-DLL
+        install directory:
+
+            find_dll_by_purpose(
+                install_dir='C:/Program Files/Affinity/Canva',
+                keywords=['8bf', 'Plugin', 'Photoshop', 'libplugins'],
+            )
+
+        Each result includes the file path, a score (number of distinct keyword hits),
+        and a ``matches`` list with ``source`` (import/export/string) and the matching
+        ``value``. Results are sorted by score descending.
+
+        See also: lief_imports (full import table), lief_exports (full export table),
+        lief_strings (full string scan of a single file).
+
+        Profile: lief
+        """
+        try:
+            kws = normalize_list_input(keywords)
+            if not kws:
+                return {"ok": False, "error": "No keywords provided"}
+            kws_lower = [k.lower() for k in kws if k.strip()]
+            if not kws_lower:
+                return {"ok": False, "error": "All keywords were empty"}
+
+            exts_raw = normalize_list_input(extensions) or ["dll", "exe"]
+            allowed_exts = {("." + e.lstrip(".")).lower() for e in exts_raw}
+
+            max_bytes = max_file_size_mb * 1_000_000
+            max_string_bytes = 5_000_000  # per-section string scan cap
+            min_str_len = 5
+
+            def _kw_hits(text: str) -> list[str]:
+                tl = text.lower()
+                return [k for k in kws_lower if k in tl]
+
+            def _quick_strings(content: bytes) -> list[str]:
+                """Fast ASCII string extractor — no LIEF overhead."""
+                results_s: list[str] = []
+                buf = bytearray()
+                for b in content:
+                    if 0x20 <= b <= 0x7E:
+                        buf.append(b)
+                    else:
+                        if len(buf) >= min_str_len:
+                            results_s.append(buf.decode("ascii", errors="replace"))
+                        buf.clear()
+                if len(buf) >= min_str_len:
+                    results_s.append(buf.decode("ascii", errors="replace"))
+                return results_s
+
+            candidates: list[dict] = []
+            files_scanned = 0
+            files_skipped = 0
+
+            for dirpath, _dirs, filenames in os.walk(install_dir):
+                for fname in filenames:
+                    _, ext = os.path.splitext(fname.lower())
+                    if ext not in allowed_exts:
+                        continue
+                    fpath = os.path.join(dirpath, fname)
+                    try:
+                        fsize = os.path.getsize(fpath)
+                    except OSError:
+                        continue
+                    if fsize > max_bytes:
+                        files_skipped += 1
+                        continue
+
+                    files_scanned += 1
+                    matches: list[dict] = []
+                    seen_matches: set[str] = set()
+
+                    def _add(source: str, value: str) -> None:
+                        key = f"{source}:{value.lower()}"
+                        if key not in seen_matches:
+                            seen_matches.add(key)
+                            matches.append({"source": source, "value": value})
+
+                    try:
+                        binary = _lief.parse(fpath)
+                        if binary is None:
+                            continue
+
+                        # Imports
+                        if isinstance(binary, _lief.PE.Binary):
+                            for imp in binary.imports:
+                                for entry in imp.entries:
+                                    name = entry.name or ""
+                                    if name and _kw_hits(name):
+                                        _add("import", name)
+                            exp = binary.get_export()
+                            if exp:
+                                for entry in exp.entries:
+                                    name = entry.name or ""
+                                    if name and _kw_hits(name):
+                                        _add("export", name)
+                        elif isinstance(binary, _lief.ELF.Binary):
+                            for sym in binary.dynamic_symbols:
+                                name = sym.name or ""
+                                if not name:
+                                    continue
+                                if _kw_hits(name):
+                                    _add("import" if not getattr(sym, "exported", False) else "export", name)
+
+                        # Strings from non-executable sections
+                        if include_strings:
+                            for sec in binary.sections:
+                                if _section_is_executable(sec):
+                                    continue
+                                if sec.size > max_string_bytes:
+                                    continue
+                                try:
+                                    content = bytes(sec.content)
+                                except Exception:
+                                    continue
+                                if not content:
+                                    continue
+                                for s in _quick_strings(content):
+                                    hits = _kw_hits(s)
+                                    if hits:
+                                        # Use the keyword as value label to avoid huge strings
+                                        snippet = s if len(s) <= 80 else s[:77] + "..."
+                                        _add("string", snippet)
+
+                    except Exception:
+                        continue
+
+                    if matches:
+                        # Score = number of distinct keywords that matched
+                        hit_kws = {m["value"].lower() for m in matches}
+                        score = sum(1 for k in kws_lower if any(k in v for v in hit_kws))
+                        candidates.append({
+                            "path": fpath,
+                            "score": score,
+                            "match_count": len(matches),
+                            "matches": matches[:30],  # cap evidence list
+                        })
+
+            # Sort by score desc, then match count desc
+            candidates.sort(key=lambda c: (-c["score"], -c["match_count"]))
+            top = candidates[:max_results]
+
+            return {
+                "ok": True,
+                "install_dir": install_dir,
+                "keywords": kws,
+                "files_scanned": files_scanned,
+                "files_skipped_oversized": files_skipped,
+                "results": top,
+                "total_matches": len(candidates),
+                "hint": (
+                    "Load the top-ranked file into IDA with File → Open, then use "
+                    "lief_imports / lief_exports / lief_strings on it for a deeper look."
+                ) if top else (
+                    "No matches found. Try broader keywords or set include_strings=true."
+                ),
             }
         except Exception as e:
             return {**tool_error(e), "ok": False}
