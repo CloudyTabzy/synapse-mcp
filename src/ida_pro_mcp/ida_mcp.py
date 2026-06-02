@@ -235,12 +235,14 @@ class MCP(idaapi.plugin_t):
             import ida_nalt
             binary = ida_nalt.get_root_filename() or ""
             idb_path = idc.get_idb_path() or ""
+            input_file = ida_nalt.get_input_file_path() or ""
             file_path = register_instance(
                 host=self.host,
                 port=port,
                 pid=os.getpid(),
                 binary=binary,
                 idb_path=idb_path,
+                input_file_path=input_file,
             )
             self._registered_port = port
             print(f"[MCP] Registered instance: {binary} (pid={os.getpid()}, port={port})")

@@ -55,9 +55,46 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
+_IDA_DB_EXTENSIONS = frozenset({".i64", ".idb", ".id0", ".id1", ".nam", ".til"})
+
+
 def _resolve_lief_path(file_path: str) -> str:
-    """Return file_path if given, else the IDB's source binary path."""
-    return file_path if file_path else idaapi.get_input_file_path()
+    """Return file_path if given, else the IDB's source binary path.
+
+    Raises ValueError when the resolved path is an IDA database file so that
+    every lief_* tool gives an actionable error instead of a raw LIEF parse
+    failure.  All lief tool outer try/except blocks propagate this naturally.
+    """
+    path = file_path if file_path else (idaapi.get_input_file_path() or "")
+    if not path:
+        return path
+    _, ext = os.path.splitext(path.lower())
+    if ext in _IDA_DB_EXTENSIONS:
+        tip = ""
+        try:
+            src = idaapi.get_input_file_path() or ""
+            if src and src != path:
+                tip = f" IDA source binary: {src}"
+        except Exception:
+            pass
+        raise ValueError(
+            f"Path is an IDA database ({ext}), not a parseable binary. "
+            f"Pass the source PE/ELF/Mach-O path instead.{tip}"
+        )
+    return path
+
+
+def _entropy_class(ent: float | None) -> tuple[str, str]:
+    """Return (entropy_class, recommendation) for a section entropy value."""
+    if ent is None:
+        return ("unknown", "analyze")
+    if ent > 7.2:
+        return ("encrypted", "dump_at_runtime")
+    if ent > 6.0:
+        return ("compressed", "dump_at_runtime")
+    if ent > 4.5:
+        return ("code", "analyze")
+    return ("data", "skip")
 
 
 def _lief_write(binary, output_path: str) -> None:
@@ -366,6 +403,8 @@ class LiefSectionEntry(TypedDict, total=False):
     file_offset: int
     file_size: int
     entropy: float
+    entropy_class: str      # "encrypted" | "compressed" | "code" | "data" | "unknown"
+    recommendation: str     # "dump_at_runtime" | "analyze" | "skip"
     characteristics: list[str]
     is_executable: bool
     is_readable: bool
@@ -1053,6 +1092,7 @@ if LIEF_AVAILABLE:
                 except Exception:
                     pass
 
+                ec, rec = _entropy_class(ent)
                 entry: LiefSectionEntry = {
                     "name": name,
                     "virtual_address": hex(sec.virtual_address),
@@ -1060,6 +1100,8 @@ if LIEF_AVAILABLE:
                     "file_offset": sec.offset,
                     "file_size": sec.size,
                     "entropy": ent,
+                    "entropy_class": ec,
+                    "recommendation": rec,
                     "characteristics": chars,
                     "is_executable": is_exec,
                     "is_readable": is_read,

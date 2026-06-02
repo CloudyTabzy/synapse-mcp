@@ -67,6 +67,7 @@ class DecompileResult(TypedDict):
     refs: NotRequired[list[Ref]]
     warnings: NotRequired[list[DecompileWarning]]
     truncated: NotRequired[bool]
+    failure_reason: NotRequired[str]
     error: NotRequired[str]
     error_type: NotRequired[str]
     hint: NotRequired[str]
@@ -897,6 +898,59 @@ def _profile_function(
 # Code Analysis & Decompilation
 # ============================================================================
 
+# Lazy-initialised map: hexrays error code int → (failure_reason, hint).
+# Built on first decompile failure so ida_hexrays is never imported at module
+# load time (it may not be present when Hex-Rays is not installed).
+_MERR_REASON_MAP: dict | None = None
+
+_DECOMPILE_DEFAULT_HINT = (
+    "Use disasm(addr='...') for assembly fallback, "
+    "or analyze_function(addr='...') for a compact overview."
+)
+
+
+def _classify_merr(hf) -> tuple[str, str]:
+    """Return (failure_reason, hint) from a hexrays_failure_t.
+
+    Called after catching DecompilationFailure so hf.code is populated.
+    Returns ("unknown", default_hint) if the code is not in the map.
+    """
+    global _MERR_REASON_MAP
+    if _MERR_REASON_MAP is None:
+        try:
+            import ida_hexrays as _hr
+            _tbl = [
+                # const_name            failure_reason     hint
+                ("MERR_LICENSE",   "no_license",      "Hex-Rays license is not available. Check IDA licensing."),
+                ("MERR_BITNESS",   "unsupported_isa", "16-bit functions cannot be decompiled. Use disasm()."),
+                ("MERR_ONLY32",    "unsupported_isa", "64-bit Hex-Rays is required for this 64-bit database."),
+                ("MERR_ONLY64",    "unsupported_isa", "32-bit Hex-Rays is required for this 32-bit database."),
+                ("MERR_BADARCH",   "unsupported_isa", "Current processor is not supported by Hex-Rays. Use disasm()."),
+                ("MERR_EXTERN",    "unsupported_isa", "External/special segments cannot be decompiled. Use disasm()."),
+                ("MERR_INSN",      "code_is_data",    "Cannot convert to microcode — range may contain data, not code. Verify with disasm()."),
+                ("MERR_PROLOG",    "code_is_data",    "Prolog analysis failed — function may be too small or misidentified. Verify with disasm()."),
+                ("MERR_COMPLEX",   "too_complex",     "Function is too complex. Try decompile_range() on a smaller sub-range."),
+                ("MERR_FUNCSIZE",  "too_complex",     "Function is too large for Hex-Rays. Use decompile_batch() with max_lines_each= to sample."),
+                ("MERR_RECDEPTH",  "too_complex",     "Recursion depth exceeded during local variable allocation."),
+                ("MERR_HUGESTACK", "too_complex",     "Stack frame is too large for Hex-Rays."),
+                ("MERR_CANCELED",  "timeout",         "Decompilation was cancelled (timeout or user interrupt)."),
+            ]
+            m: dict = {}
+            for cname, reason, hint in _tbl:
+                v = getattr(_hr, cname, None)
+                if v is not None:
+                    m[v] = (reason, hint)
+            _MERR_REASON_MAP = m
+        except Exception:
+            _MERR_REASON_MAP = {}
+    try:
+        entry = _MERR_REASON_MAP.get(hf.code)
+        if entry:
+            return entry
+    except Exception:
+        pass
+    return ("unknown", _DECOMPILE_DEFAULT_HINT)
+
 
 @tool
 @idasync
@@ -939,6 +993,8 @@ def decompile(
         )
         if code is None:
             decompile_error = "Decompilation failed"
+            failure_reason = "unknown"
+            hint = _DECOMPILE_DEFAULT_HINT
             try:
                 import ida_hexrays as _hr
                 if _hr.init_hexrays_plugin():
@@ -949,13 +1005,15 @@ def decompile(
                         desc = hf.desc()
                         if desc:
                             decompile_error = desc
+                        failure_reason, hint = _classify_merr(hf)
             except Exception:
                 pass
             return {
                 "addr": addr,
                 "code": None,
+                "failure_reason": failure_reason,
                 "error": decompile_error,
-                "hint": "Decompilation failed. Use disasm(addr='...') for assembly fallback, or analyze_function(addr='...') for a compact overview.",
+                "hint": hint,
             }
 
         result: DecompileResult = {"addr": addr, "code": code}
@@ -1060,8 +1118,9 @@ def decompile_batch(
                     max_lines=max_lines_each,
                 )
                 if code is None:
-                    # Try to get a structured error from Hex-Rays
                     decompile_error = "Decompilation failed"
+                    failure_reason = "unknown"
+                    hint = _DECOMPILE_DEFAULT_HINT
                     try:
                         hf = _hr.hexrays_failure_t()
                         _hr.decompile(ea, hf)
@@ -1069,14 +1128,16 @@ def decompile_batch(
                         desc = hf.desc()
                         if desc:
                             decompile_error = desc
+                        failure_reason, hint = _classify_merr(hf)
                     except Exception:
                         pass
                     entry: dict = {
                         "addr": raw_addr,
                         "name": func_name,
                         "code": None,
+                        "failure_reason": failure_reason,
                         "error": decompile_error,
-                        "hint": "Decompilation failed. Use disasm(addr='...') for assembly fallback, or analyze_function(addr='...') for a compact overview.",
+                        "hint": hint,
                     }
                     failed += 1
                     if not skip_errors:
@@ -1172,6 +1233,8 @@ def decompile_range(
                 )
                 if code is None:
                     decompile_error = "Decompilation failed"
+                    failure_reason = "unknown"
+                    hint = _DECOMPILE_DEFAULT_HINT
                     try:
                         hf = _hr.hexrays_failure_t()
                         _hr.decompile(ea, hf)
@@ -1179,14 +1242,16 @@ def decompile_range(
                         desc = hf.desc()
                         if desc:
                             decompile_error = desc
+                        failure_reason, hint = _classify_merr(hf)
                     except Exception:
                         pass
                     entry: dict = {
                         "addr": raw_addr,
                         "name": func_name,
                         "code": None,
+                        "failure_reason": failure_reason,
                         "error": decompile_error,
-                        "hint": "Decompilation failed. Use disasm(addr='...') for assembly fallback, or analyze_function(addr='...') for a compact overview.",
+                        "hint": hint,
                     }
                     failed += 1
                 else:

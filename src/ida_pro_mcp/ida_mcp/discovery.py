@@ -15,12 +15,13 @@ import tempfile
 from typing import TypedDict
 
 
-class InstanceInfo(TypedDict):
+class InstanceInfo(TypedDict, total=False):
     host: str
     port: int
     pid: int
     binary: str
     idb_path: str
+    input_file_path: str    # source binary path (may not exist if binary was moved)
     started_at: str
 
 
@@ -39,7 +40,8 @@ def _instance_file_path(port: int) -> str:
 
 
 def register_instance(
-    host: str, port: int, pid: int, binary: str, idb_path: str
+    host: str, port: int, pid: int, binary: str, idb_path: str,
+    input_file_path: str = "",
 ) -> str:
     """Write an instance registration file. Returns the file path."""
     info: InstanceInfo = {
@@ -48,6 +50,7 @@ def register_instance(
         "pid": pid,
         "binary": binary,
         "idb_path": idb_path,
+        "input_file_path": input_file_path,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     instances_dir = get_instances_dir()

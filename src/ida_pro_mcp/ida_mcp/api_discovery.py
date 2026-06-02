@@ -7,6 +7,8 @@ This lets a single MCP endpoint reach any running IDA instance.
 
 import http.client
 import json
+import os
+import sys
 import threading
 from collections import OrderedDict
 from typing import Annotated, NotRequired, TypedDict
@@ -25,14 +27,26 @@ class InstanceSelectionResult(TypedDict, total=False):
     error: str
 
 
+_UAC_PREFIXES_WIN = (
+    "c:\\program files\\",
+    "c:\\program files (x86)\\",
+    "c:\\windows\\",
+    "c:\\programdata\\",
+)
+
+
 class ActiveInstanceResult(TypedDict, total=False):
     host: str
     port: int
     pid: int
     binary: str
     idb_path: str
+    input_file_path: str
     is_local: bool        # True when this instance is handling requests itself
     reachable: bool
+    source_missing: bool  # True when the source binary is not found on disk
+    source_warning: str   # hint when source_missing is True
+    uac_warning: str      # set on Windows when idb_path is in a UAC-protected dir
 
 
 class InstanceListItem(TypedDict, total=False):
@@ -394,6 +408,34 @@ def select_instance(
     return {"success": True, "host": host, "port": port}
 
 
+def _annotate_instance(result: dict) -> dict:
+    """Add source_missing and uac_warning fields to an instance result dict.
+
+    Called after the basic result dict is assembled so both the found-in-list
+    and fallback paths get the same diagnostics.
+    """
+    # Orphaned-IDB check: source binary no longer on disk
+    src = result.get("input_file_path") or ""
+    if src and not os.path.exists(src):
+        result["source_missing"] = True
+        result["source_warning"] = (
+            f"Source binary not found on disk: {src}. "
+            "IDA analysis works read-only; tools that require the raw file "
+            "(lief_*, yara_scan on file, angr_load_segment) will fail."
+        )
+
+    # UAC-path check (Windows only): IDB in a protected directory → autosave fails
+    if sys.platform == "win32":
+        idb = (result.get("idb_path") or "").lower()
+        if idb and any(idb.startswith(p) for p in _UAC_PREFIXES_WIN):
+            result["uac_warning"] = (
+                "IDB is in a UAC-protected directory. IDA may fail to autosave "
+                "or write analysis results. Move the IDB to a user-writable path."
+            )
+
+    return result
+
+
 @tool
 def get_active_instance() -> ActiveInstanceResult:
     """Return the IDA instance currently handling tool calls.
@@ -404,6 +446,12 @@ def get_active_instance() -> ActiveInstanceResult:
     Use this to confirm which binary is active before running analysis —
     avoids the classic mistake of querying the wrong IDB after switching
     instances.
+
+    Additional diagnostic fields when present:
+    - source_missing: True when the source binary is not found on disk.
+    - source_warning: actionable message explaining the consequence.
+    - uac_warning: set on Windows when the IDB lives in Program Files or
+      another UAC-protected path where IDA may silently fail to autosave.
     """
     redirect = get_redirect_target()
     if redirect:
@@ -416,19 +464,19 @@ def get_active_instance() -> ActiveInstanceResult:
     instances = discover_instances()
     for inst in instances:
         if inst.get("host") == host and inst.get("port") == port:
-            return {
+            return _annotate_instance({
                 **inst,
                 "is_local": is_local,
                 "reachable": probe_instance(host, port),
-            }
+            })
 
     # Instance not in discovery list (possible if it just started or is remote).
-    return {
+    return _annotate_instance({
         "host": host,
         "port": port,
         "is_local": is_local,
         "reachable": probe_instance(host, port),
-    }
+    })
 
 
 @tool
