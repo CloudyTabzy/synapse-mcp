@@ -16,18 +16,22 @@ MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
 MCP_SERVER = McpServer(MCP_SERVER_NAME, extensions=MCP_EXTENSIONS)
 
-# Auto-compress uniform-array responses into TOON tabular form when
-# toon_format is installed in IDA's Python. Runs for the direct-HTTP transport
-# (client → IDA plugin), which is the path server.py's proxy never sees.
+# Optionally compress uniform-array responses into TOON tabular form for the
+# direct-HTTP transport (client → IDA plugin). DISABLED BY DEFAULT: TOON drops
+# structuredContent, which breaks schema-enforcing MCP clients (and saves them
+# nothing). The post-processor self-gates on SYNAPSE_MCP_TOON; see toon_encode.py.
 try:
     from .toon_encode import TOON_AVAILABLE as _TOON_AVAILABLE
+    from .toon_encode import TOON_ENABLED as _TOON_ENABLED
     from .toon_encode import maybe_toon_encode_result as _maybe_toon
 
     MCP_SERVER.result_post_processor = lambda _name, result: _maybe_toon(result)
-    if _TOON_AVAILABLE:
-        print("[synapse-mcp] TOON response compression active (threshold: 10 rows)")
-    else:
+    if _TOON_ENABLED and _TOON_AVAILABLE:
+        print("[synapse-mcp] TOON response compression active (threshold: 20 rows) — structuredContent preserved")
+    elif _TOON_ENABLED and not _TOON_AVAILABLE:
         print("[synapse-mcp] TOON inactive — install toon_format in IDA's Python to enable")
+    else:
+        print("[synapse-mcp] TOON disabled — set SYNAPSE_MCP_TOON=0 to disable, unset to re-enable")
 except Exception as _toon_init_err:
     print(f"[synapse-mcp] TOON init error: {_toon_init_err}")
 

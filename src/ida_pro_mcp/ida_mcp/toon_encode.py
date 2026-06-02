@@ -14,6 +14,19 @@ Where this runs matters:
 Both paths import this module and fall back to plain JSON silently whenever
 ``toon_format`` is absent or the response doesn't qualify.
 
+Schema compatibility
+--------------------
+Every tool advertises an ``outputSchema`` (derived from its TypedDict return
+type). The MCP spec requires that such tools always return ``structuredContent``.
+
+TOON and schema are made compatible by shipping *both*:
+- ``content[0].text`` = TOON string  (compact representation the model reads)
+- ``structuredContent`` = original dict  (schema validation; never dropped)
+
+The model's context window receives ``content``, so it sees the compact TOON
+form and saves tokens.  The client framework validates against ``structuredContent``
+and never raises ``-32600``.  Neither breaks the other.
+
 TOON output format example (self-documenting):
     _format: TOON_TABULAR
     ok: true
@@ -25,6 +38,7 @@ TOON output format example (self-documenting):
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -37,9 +51,15 @@ except ImportError:
     TOON_AVAILABLE = False
     logger.debug("toon_format not found — responses will be plain JSON")
 
-# Minimum qualifying array length. Below this the per-row savings don't
-# outweigh the header overhead. Benchmarks show ~65% savings at 10+ rows.
-TOON_MIN_ROWS = 10
+# TOON is enabled by default when toon_format is installed.
+# Override with SYNAPSE_MCP_TOON=0 / false / no / off to disable.
+TOON_ENABLED = os.environ.get("SYNAPSE_MCP_TOON", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+# Minimum qualifying array length.  Below this the per-row savings don't
+# outweigh the header overhead.  At 20+ rows savings are consistently ~40-65%.
+TOON_MIN_ROWS = 20
 
 _PRIMITIVE = (str, int, float, bool, type(None))
 
@@ -84,15 +104,21 @@ def encode_result_to_toon(data: dict) -> str:
 def maybe_toon_encode_result(data: Any) -> str | None:
     """Return a TOON string when ``data`` qualifies and TOON is available, else None.
 
-    Tools can opt out of TOON encoding by including ``"_toon_skip": True`` in their
-    result dict.  The flag is consumed here (popped before encoding) so it never
-    appears in the agent's structured response.  Use this for structured reference
-    data (COM vtable tables, schema definitions, etc.) where the tabular TOON form
-    would remove ``structuredContent`` and break MCP schema validation.
+    Callers MUST keep ``structuredContent`` intact alongside the returned TOON
+    string in the MCP response — never drop it.  This ensures schema-enforcing
+    clients (MCP spec: tools with outputSchema must return structuredContent)
+    never see a ``-32600`` error, while the model still receives the compact TOON
+    text via ``content[0].text``.
+
+    Tools can opt out by including ``"_toon_skip": True`` in their result dict.
+    The marker is always consumed (popped) here so it never leaks into the
+    agent-visible structured response, regardless of whether TOON fires.
     """
-    if not TOON_AVAILABLE:
+    # Always consume the opt-out marker so it cannot leak into structuredContent.
+    skip = bool(isinstance(data, dict) and data.pop("_toon_skip", False))
+    if not TOON_ENABLED or not TOON_AVAILABLE:
         return None
-    if isinstance(data, dict) and data.pop("_toon_skip", False):
+    if skip:
         return None
     if not toon_qualifies(data):
         return None

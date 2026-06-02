@@ -128,9 +128,21 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     # -----------------------------------------------------------------------
     # limit / count / top variants
     # -----------------------------------------------------------------------
-    # find_similar_functions uses max_results as its REAL param — protect it
-    # from the global max_results→limit rename and also accept "limit".
+    # Tools whose REAL param is max_results — protect them from the global
+    # max_results→limit rename (which would otherwise produce the handler error
+    # "unexpected parameters: ['limit']") and also accept a literal "limit".
+    # The global rename fires first (max_results→limit), then these per-tool
+    # reversals restore "limit"→max_results. Net effect: max_results passes
+    # through unchanged AND a literal "limit" is accepted.
     "find_similar_functions":     {"limit": "max_results"},
+    "lief_strings":               {"limit": "max_results"},
+    "scan_signature":             {"limit": "max_results"},
+    "yara_scan":                  {"limit": "max_results"},
+    "sig_suggest_candidates":     {"limit": "max_results"},
+    "construct_scan_for_structs": {"limit": "max_results"},
+    "angr_backward_slice":        {"limit": "max_results"},
+    "nx_strongly_connected":      {"limit": "max_results"},
+    "nx_communities":             {"limit": "max_results"},
     "list_functions_enhanced":    {"limit": "count"},
     "list_classes":               {"limit": "count"},
     "imports":                    {"limit": "count"},

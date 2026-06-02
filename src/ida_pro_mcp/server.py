@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 try:
     from .ida_mcp.toon_encode import (
         TOON_AVAILABLE as _TOON_AVAILABLE,
+        TOON_ENABLED as _TOON_ENABLED,
         TOON_MIN_ROWS as _TOON_MIN_ROWS,
         maybe_toon_encode_result as _maybe_toon_encode_result,
     )
@@ -23,11 +24,13 @@ except ImportError:
     try:
         from ida_mcp.toon_encode import (
             TOON_AVAILABLE as _TOON_AVAILABLE,
+            TOON_ENABLED as _TOON_ENABLED,
             TOON_MIN_ROWS as _TOON_MIN_ROWS,
             maybe_toon_encode_result as _maybe_toon_encode_result,
         )
     except ImportError:
         _TOON_AVAILABLE = False
+        _TOON_ENABLED = False
         _TOON_MIN_ROWS = 20
         def _maybe_toon_encode_result(_data):
             return None
@@ -481,9 +484,10 @@ def _maybe_toon_encode_response(response: dict | None) -> dict | None:
 
     Fires only when toon_format is installed, the result is a successful
     (ok: true) dict, and it contains an array of >=20 uniform flat objects.
-    On success the text content becomes TOON and structuredContent is dropped
-    so the full JSON does not still ship and negate the savings. Falls back to
-    the original response on any error.
+    On success content[0].text becomes the compact TOON string while
+    structuredContent is preserved for schema validation — dropping it
+    would cause -32600 on schema-enforcing clients. Falls back to the
+    original response on any error.
     """
     if not _TOON_AVAILABLE or response is None:
         return response
@@ -501,7 +505,9 @@ def _maybe_toon_encode_response(response: dict | None) -> dict | None:
             return response
         encoded = copy.deepcopy(response)
         encoded["result"]["content"][0]["text"] = toon_text
-        encoded["result"].pop("structuredContent", None)
+        # structuredContent is intentionally kept: schema-enforcing clients
+        # require it when outputSchema is declared (MCP spec). The model reads
+        # content (TOON), the client framework validates structuredContent (JSON).
         return encoded
     except Exception:
         return response
@@ -1408,15 +1414,20 @@ def main():
         LAZY_MODE = False
         print("[MCP] Normal mode forced — exposing all tools upfront", file=sys.stderr)
 
-    if _TOON_AVAILABLE:
+    if _TOON_ENABLED and _TOON_AVAILABLE:
         print(
             f"[MCP] TOON encoding active — uniform arrays ≥{_TOON_MIN_ROWS} rows "
-            "auto-compressed in tool responses",
+            "auto-compressed; structuredContent preserved for schema validation",
+            file=sys.stderr,
+        )
+    elif _TOON_ENABLED and not _TOON_AVAILABLE:
+        print(
+            "[MCP] TOON encoding inactive (pip install toon_format to enable ~40% token savings)",
             file=sys.stderr,
         )
     else:
         print(
-            "[MCP] TOON encoding inactive (pip install toon_format to enable ~40% token savings)",
+            "[MCP] TOON encoding disabled (SYNAPSE_MCP_TOON=0)",
             file=sys.stderr,
         )
 

@@ -576,9 +576,9 @@ class McpServer:
         self._tools_list_cache: dict[str, list[dict]] = {}
 
         # Optional hook: (tool_name, result) -> alternate content text | None.
-        # When it returns a string, that string becomes the tool's text content
-        # and structuredContent is omitted. Used for response transforms such as
-        # TOON encoding. Defaults to None (no transform).
+        # When it returns a string, that string becomes content[0].text while
+        # structuredContent is still included for schema validation. Used for
+        # response transforms such as TOON encoding. Defaults to None (no transform).
         self.result_post_processor: Callable[[str, Any], str | None] | None = None
 
         # Register MCP protocol methods with correct names
@@ -867,9 +867,12 @@ class McpServer:
             result = tool_response.get("result") if tool_response else None
 
             # Optional response transform (e.g. TOON encoding). When it returns a
-            # string, use it as the sole text content and omit structuredContent —
-            # otherwise the full JSON would still ship via structuredContent and
-            # negate the token savings.
+            # string, that string becomes content[0].text (compact form the model
+            # reads), while structuredContent is ALWAYS kept for schema validation.
+            # Schema-enforcing clients require structuredContent when outputSchema is
+            # declared; dropping it causes -32600. Keeping both is safe: the model
+            # reads content (TOON), the client validates structuredContent (JSON).
+            structured = result if isinstance(result, dict) else {"result": result}
             if self.result_post_processor is not None:
                 try:
                     alt_text = self.result_post_processor(name, result)
@@ -878,12 +881,13 @@ class McpServer:
                 if isinstance(alt_text, str):
                     return {
                         "content": [{"type": "text", "text": alt_text}],
+                        "structuredContent": structured,
                         "isError": False,
                     }
 
             return {
                 "content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}],
-                "structuredContent": result if isinstance(result, dict) else {"result": result},
+                "structuredContent": structured,
                 "isError": False,
             }
         finally:
