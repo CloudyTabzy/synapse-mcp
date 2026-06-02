@@ -1178,18 +1178,31 @@ class McpServer:
         """Convert TypedDict to JSON schema"""
         try:
             hints = get_type_hints(typed_dict_class, include_extras=True)
-        except Exception as e:
-            # get_type_hints can fail when forward references in nested
-            # TypedDicts cannot be resolved (e.g. due to module reloads or
-            # functools.wraps changing the evaluation namespace). Fall back
-            # to the raw __annotations__ dict so we still generate a schema
-            # rather than silently dropping the tool or missing fields.
-            logger.warning(
-                "[MCP] get_type_hints failed for %s: %s. Falling back to __annotations__.",
-                typed_dict_class.__name__,
-                e,
+        except Exception:
+            # PEP 563 (from __future__ import annotations) turns all annotations
+            # into strings that get_type_hints() resolves via sys.modules[__module__].
+            # IDA's plugin importer can register modules under a prefixed key that
+            # differs from __module__, making the lookup return None and causing nested
+            # TypedDict names to raise NameError. Retry with the module dict explicit.
+            mod_name = getattr(typed_dict_class, '__module__', '')
+            mod = sys.modules.get(mod_name) or next(
+                (m for k, m in sys.modules.items() if k.endswith('.' + mod_name)),
+                None,
             )
-            hints = dict(getattr(typed_dict_class, '__annotations__', {}))
+            try:
+                hints = get_type_hints(
+                    typed_dict_class,
+                    globalns=vars(mod) if mod is not None else {},
+                    include_extras=True,
+                )
+            except Exception as e:
+                # Genuine resolution failure — fall back to raw __annotations__.
+                logger.warning(
+                    "[MCP] get_type_hints failed for %s: %s. Falling back to __annotations__.",
+                    typed_dict_class.__name__,
+                    e,
+                )
+                hints = dict(getattr(typed_dict_class, '__annotations__', {}))
 
         required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
         required = [key for key in hints.keys() if key in required_keys]
