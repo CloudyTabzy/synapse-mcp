@@ -40,6 +40,9 @@ networkx = ["networkx>=3.0"]
 # Unicorn: ~6 MB prebuilt wheel, QEMU-backed concrete CPU emulator. IDA-safe
 # (no signal handlers / no fork). Included in 'all'.
 unicorn  = ["unicorn>=2.1.0"]
+# NumPy: ~20 MB prebuilt wheel. Powers vectorized numerical binary analysis
+# (entropy maps, byte distribution / chi-square). Included in 'all'.
+numpy    = ["numpy>=2.0.0"]
 # TOON: server-side token-efficient encoding for large list tool responses.
 # Installed into the MCP server's Python (not IDA's Python).
 # Install: pip install toon_format  OR  uv add toon_format
@@ -52,6 +55,7 @@ all      = [
     "yara-python>=4.3.0",
     "networkx>=3.0",
     "unicorn>=2.1.0",
+    "numpy>=2.0.0",
 ]
 
 [dependency-groups]

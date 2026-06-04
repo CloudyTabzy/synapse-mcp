@@ -153,6 +153,16 @@ except Exception as _e:
     )
     api_unicorn = None  # type: ignore[assignment]
 
+try:
+    from . import api_numpy
+except Exception as _e:
+    _log.warning(
+        "api_numpy failed to load (%s: %s) — numpy_* tools unavailable. "
+        "Install with: pip install numpy\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_numpy = None  # type: ignore[assignment]
+
 # Build tool profiles after all api_*.py modules have loaded and registered tools.
 # Profiles group tools into logical domains used by server_health and lazy mode.
 from .rpc import MCP_SERVER, register_profile, get_tool_group  # noqa: E402
@@ -218,6 +228,7 @@ __all__ = [
     "api_angr",
     "api_networkx",
     "api_unicorn",
+    "api_numpy",
     # Re-exported components
     "idasync",
     "IDAError",

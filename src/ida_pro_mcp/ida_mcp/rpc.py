@@ -54,6 +54,7 @@ _TOOL_MODULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("sig_", "recon"),
     ("recon_", "recon"),
     ("dbg_", "recon"),
+    ("numpy_", "analysis"),
 )
 
 _TOOL_MODULE_EXACT: dict[str, str] = {
