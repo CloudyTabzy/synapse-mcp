@@ -10,7 +10,12 @@ try:
     from ..api_numpy import numpy_status
     from ..numpy_compat import NUMPY_AVAILABLE, np_entropy
     if NUMPY_AVAILABLE:
-        from ..api_numpy import numpy_entropy_map, numpy_byte_histogram
+        from ..api_numpy import (
+            numpy_entropy_map,
+            numpy_byte_histogram,
+            numpy_xor_key_recovery,
+            numpy_function_similarity,
+        )
 except ImportError:
     NUMPY_AVAILABLE = False
 
@@ -187,3 +192,143 @@ def test_byte_histogram_unmapped_address_errors():
     result = numpy_byte_histogram("0xffffffffff000000", 256)
     assert result.get("ok") is False
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# XOR key recovery — helper unit tests on synthetic data (no IDA needed)
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_xor_helpers_recover_4byte_key():
+    """Candidate-length detection + key recovery recover a known 4-byte key."""
+    _require_numpy()
+    import numpy as np
+    from ..api_numpy import _xor_candidate_lengths, _recover_xor_key
+
+    plain = (b"The quick brown fox jumps over the lazy dog. " * 120)[:4096]
+    pa = np.frombuffer(plain, dtype=np.uint8)
+    key = np.frombuffer(bytes([0xDE, 0xAD, 0xBE, 0xEF]), dtype=np.uint8)
+    cipher = (pa ^ np.resize(key, pa.size)).astype(np.uint8)
+
+    cand_lengths, top = _xor_candidate_lengths(cipher, 32)
+    assert 4 in cand_lengths, f"4 not in candidates {cand_lengths}"
+    # Text => dominant plaintext byte is space (0x20).
+    rec = _recover_xor_key(cipher, 4, 0x20)
+    assert rec.tolist() == [0xDE, 0xAD, 0xBE, 0xEF], rec.tolist()
+
+
+@test()
+def test_xor_helpers_single_byte_key():
+    """A single-byte XOR is recovered (entropy is unchanged; relies on freq)."""
+    _require_numpy()
+    import numpy as np
+    from ..api_numpy import _recover_xor_key
+
+    plain = (b"The quick brown fox jumps over the lazy dog. " * 120)[:4096]
+    pa = np.frombuffer(plain, dtype=np.uint8)
+    cipher = (pa ^ np.uint8(0x5A)).astype(np.uint8)
+    rec = _recover_xor_key(cipher, 1, 0x20)
+    assert rec.tolist() == [0x5A], rec.tolist()
+
+
+# ---------------------------------------------------------------------------
+# numpy_xor_key_recovery (tool-level)
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_xor_key_recovery_smoke():
+    """On a real code region the tool returns ranked candidates without crashing."""
+    _require_numpy()
+    addr, size = _first_code_region(4096)
+    result = numpy_xor_key_recovery(addr, size)
+    assert result.get("ok") is True, result
+    assert isinstance(result["key_candidates"], list) and result["key_candidates"]
+    assert isinstance(result["top_key_length_candidates"], list)
+    for c in result["key_candidates"]:
+        assert c["confidence"] in ("high", "medium", "low")
+        assert c["key_length"] >= 1
+
+
+@test()
+def test_xor_key_recovery_tiny_region_errors():
+    """A region below the minimum analysis size returns a structured error."""
+    _require_numpy()
+    addr, _ = _first_code_region(4096)
+    result = numpy_xor_key_recovery(addr, 8)
+    assert result.get("ok") is False
+    assert "small" in result.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# numpy_function_similarity
+# ---------------------------------------------------------------------------
+
+
+def _two_functions(min_size: int = 64):
+    import idautils
+    import idaapi
+
+    funcs = []
+    for f in idautils.Functions():
+        func = idaapi.get_func(f)
+        if func and (func.end_ea - func.start_ea) >= min_size:
+            funcs.append(f)
+    return funcs
+
+
+@test()
+def test_function_similarity_self_identical():
+    """A function compared to itself scores ~1.0 / identical (all methods)."""
+    _require_numpy()
+    funcs = _two_functions(64)
+    if not funcs:
+        skip_test("no function >= 64 bytes in fixture")
+    ea = hex(funcs[0])
+    for method in ("byte_histogram", "byte_entropy_histogram", "ncc"):
+        result = numpy_function_similarity(ea, ea, method=method)
+        assert result.get("ok") is True, result
+        assert result["score"] >= 0.99, f"{method}: {result['score']}"
+        assert result["interpretation"] == "identical"
+
+
+@test()
+def test_function_similarity_distinct_in_range():
+    """Two distinct functions produce a valid score in [0, 1]."""
+    _require_numpy()
+    funcs = _two_functions(64)
+    if len(funcs) < 2:
+        skip_test("need two functions >= 64 bytes")
+    result = numpy_function_similarity(hex(funcs[0]), hex(funcs[-1]))
+    assert result.get("ok") is True, result
+    assert 0.0 <= result["score"] <= 1.0
+    assert result["interpretation"] in (
+        "identical", "very_similar", "similar", "dissimilar",
+    )
+
+
+@test()
+def test_function_similarity_min_bytes_guard():
+    """min_bytes larger than the function triggers the too-small guard."""
+    _require_numpy()
+    import idautils
+
+    f = next(iter(idautils.Functions()), None)
+    if f is None:
+        skip_test("no functions in fixture")
+    result = numpy_function_similarity(hex(f), hex(f), min_bytes=10 ** 9)
+    assert result.get("ok") is False
+    assert "too small" in result.get("error", "").lower()
+
+
+@test()
+def test_function_similarity_bad_method():
+    """An unknown method returns a structured error."""
+    _require_numpy()
+    funcs = _two_functions(64)
+    if not funcs:
+        skip_test("no function >= 64 bytes")
+    result = numpy_function_similarity(hex(funcs[0]), hex(funcs[0]), method="bogus")
+    assert result.get("ok") is False
+    assert "method" in result.get("error", "").lower()

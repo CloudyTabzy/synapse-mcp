@@ -28,9 +28,12 @@ Profile: analysis
 """
 
 import logging
+from functools import reduce
+from math import gcd
 from typing import Annotated, TypedDict
 
 import ida_bytes
+import ida_funcs
 
 from .rpc import tool
 from .sync import idasync, tool_timeout
@@ -119,6 +122,51 @@ class NumpyByteHistogramResult(TypedDict, total=False):
     error_type: str
 
 
+class KeyLengthCandidate(TypedDict):
+    key_length: int
+    ioc_rate: float
+
+
+class XorKeyCandidate(TypedDict, total=False):
+    key_hex: str
+    key_length: int
+    assumed_plaintext: str
+    plaintext_entropy_after: float
+    entropy_reduction: float
+    printable_ratio: float
+    null_ratio: float
+    sample_decrypted_hex: str
+    sample_decrypted_ascii: str
+    confidence: str
+
+
+class NumpyXorResult(TypedDict, total=False):
+    ok: bool
+    addr: str
+    size_analyzed: int
+    analysis_capped: bool
+    ciphertext_entropy: float
+    top_key_length_candidates: list[KeyLengthCandidate]
+    key_candidates: list[XorKeyCandidate]
+    hint: str
+    error: str
+    error_type: str
+
+
+class NumpyFunctionSimilarityResult(TypedDict, total=False):
+    ok: bool
+    func_a: str
+    func_b: str
+    method: str
+    score: float
+    interpretation: str
+    bytes_a: int
+    bytes_b: int
+    hint: str
+    error: str
+    error_type: str
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -198,6 +246,150 @@ def _block_entropies(arr, block_size: int, step: int):
         ent_out[c0:c0 + c] = -np.sum(p * logp, axis=1)
 
     return starts, ent_out
+
+
+# --- XOR key recovery helpers -------------------------------------------------
+
+# Statistical analysis is capped at this many bytes — key detection and recovery
+# need only a representative prefix, and the IoC scan is O(N) per candidate length.
+_XOR_MAX_ANALYZE = 2 * 1024 * 1024  # 2 MB
+# Validation window: a recovered key is scored by decrypting up to this many
+# bytes. Large enough that a wrong (over-long) key cannot fake a good score.
+_XOR_VALIDATE = 4096
+# Assumed dominant-plaintext byte for each named assumption.
+_XOR_ASSUMPTIONS: dict[str, int] = {"null": 0x00, "space": 0x20, "0xff": 0xFF}
+
+
+def _divisors(x: int) -> set[int]:
+    return {i for i in range(1, x + 1) if x % i == 0}
+
+
+def _xor_candidate_lengths(arr, cap: int) -> tuple[list[int], list[KeyLengthCandidate]]:
+    """Index-of-coincidence key-length detection.
+
+    IoC (rate of equal bytes at distance k) peaks at *every multiple* of the
+    true key length with near-equal height, so the maximum is an unreliable
+    pick. Instead the candidate set is the GCD of the detected peaks (the
+    fundamental period) and the strongest peak, expanded to their divisors,
+    plus {1,2,3}. This stays small — no spurious long lengths that would
+    overfit the validation window.
+    """
+    n = arr.size
+    rates = np.empty(cap, dtype=np.float64)
+    for k in range(1, cap + 1):
+        rates[k - 1] = np.count_nonzero(arr[:-k] == arr[k:]) / (n - k)
+    ks = np.arange(1, cap + 1)
+    baseline = float(np.median(rates))
+    peak = float(rates.max())
+    thr = baseline + 0.4 * (peak - baseline)
+    peaks = ks[rates >= thr].tolist()
+
+    cands: set[int] = {1, 2, 3}
+    if peaks:
+        cands |= _divisors(reduce(gcd, peaks))
+        cands |= _divisors(int(ks[int(np.argmax(rates))]))
+    cand_list = sorted(c for c in cands if 1 <= c <= cap)
+
+    order = np.argsort(rates)[::-1][:3]
+    top = [
+        {"key_length": int(ks[i]), "ioc_rate": round(float(rates[i]), 5)}
+        for i in order
+    ]
+    return cand_list, top
+
+
+def _recover_xor_key(arr, key_len: int, assumed_byte: int):
+    """Per-column frequency analysis: key[pos] = most_common_cipher_byte ^ assumed."""
+    key = np.empty(key_len, dtype=np.uint8)
+    for pos in range(key_len):
+        col = arr[pos::key_len]
+        key[pos] = (int(np.argmax(np.bincount(col, minlength=256))) ^ assumed_byte) & 0xFF
+    return key
+
+
+# --- Function similarity helpers ---------------------------------------------
+
+# np.correlate is O(La*Lb); cap function bytes for the NCC method to stay fast.
+_NCC_MAX_BYTES = 8192
+
+
+def _byte_hist_vec(data: bytes):
+    return np.bincount(np.frombuffer(data, dtype=np.uint8), minlength=256).astype(np.float64)
+
+
+def _byte_entropy_vec(data: bytes):
+    """EMBER-style joint byte-entropy histogram (16 entropy rows × 16 nibble cols).
+
+    Slides a window over the data; for each window computes the upper-nibble
+    histogram and its entropy, quantizes the entropy to one of 16 rows, and
+    accumulates the nibble histogram into that row. Returns a flat 256-vector.
+    """
+    arr = np.frombuffer(data, dtype=np.uint8)
+    n = arr.size
+    window = min(256, n)
+    if window < 1:
+        return np.zeros(256, dtype=np.float64)
+    step = max(1, window // 4)
+    acc = np.zeros((16, 16), dtype=np.float64)
+    count = 0
+    for s in range(0, n - window + 1, step):
+        block = arr[s:s + window]
+        c = np.bincount(block >> 4, minlength=16).astype(np.float64)
+        p = c / window
+        nz = p > 0
+        h = float(-np.sum(p[nz] * np.log2(p[nz])))  # 0..4 bits (16 bins)
+        hbin = min(int(h / 4.0 * 16), 15)
+        acc[hbin] += c
+        count += 1
+    if count == 0:
+        c = np.bincount(arr >> 4, minlength=16).astype(np.float64)
+        acc[0] += c
+    return acc.ravel()
+
+
+def _cosine(a, b) -> float:
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _ncc(da: bytes, db: bytes) -> float:
+    """Normalized cross-correlation peak — shift-invariant similarity in [0,1]."""
+    a = np.frombuffer(da, dtype=np.uint8).astype(np.float64)
+    b = np.frombuffer(db, dtype=np.uint8).astype(np.float64)
+    a = a - a.mean()
+    b = b - b.mean()
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    corr = np.correlate(a, b, mode="full")
+    return float(np.max(np.abs(corr)) / (na * nb))
+
+
+def _interpret_similarity(score: float) -> str:
+    if score >= 0.99:
+        return "identical"
+    if score >= 0.92:
+        return "very_similar"
+    if score >= 0.80:
+        return "similar"
+    return "dissimilar"
+
+
+def _read_func_bytes(spec: str) -> tuple[int, str, bytes]:
+    """Resolve a function spec (addr or name) and return (start_ea, name, bytes)."""
+    ea = parse_address(spec)
+    f = ida_funcs.get_func(ea)
+    if not f:
+        raise ValueError(f"No function at {spec} ({hex(ea)})")
+    data = ida_bytes.get_bytes(f.start_ea, f.end_ea - f.start_ea)
+    if not data:
+        raise ValueError(f"Could not read bytes for function at {hex(f.start_ea)}")
+    name = ida_funcs.get_func_name(f.start_ea) or hex(f.start_ea)
+    return f.start_ea, name, data
 
 
 # ============================================================================
@@ -522,3 +714,270 @@ if NUMPY_AVAILABLE:
             return {"ok": False, **tool_error(e, f"numpy_byte_histogram at {addr}")}
         except Exception as e:
             return {"ok": False, **tool_error(e, f"numpy_byte_histogram at {addr}")}
+
+    @tool
+    @idasync
+    @tool_timeout(120.0)
+    def numpy_xor_key_recovery(
+        addr: Annotated[str, "Start address (hex or symbol) of the XOR-obfuscated region"],
+        size: Annotated[int, "Number of bytes to analyze (statistical analysis capped at 2 MB)"],
+        max_key_length: Annotated[
+            int, "Maximum XOR key length to consider (default: 32)"
+        ] = 32,
+        assumed_plaintext: Annotated[
+            str,
+            "Dominant plaintext byte assumption: 'auto' (try null/space/0xff and "
+            "rank), 'null' (binary/struct padding), 'space' (ASCII text), or '0xff'.",
+        ] = "auto",
+        top_candidates: Annotated[
+            int, "Number of ranked key candidates to return (default: 5)"
+        ] = 5,
+    ) -> NumpyXorResult:
+        """Recover a repeating-XOR key from an obfuscated region via statistics.
+
+        Two-stage classical attack, fully vectorized:
+
+        1. **Key-length detection** — index of coincidence (rate of equal bytes
+           at each distance k). Because IoC peaks at every multiple of the true
+           length, the candidate lengths are taken from the GCD of the detected
+           peaks and their divisors (the fundamental period), never an arbitrary
+           maximum.
+        2. **Key-byte recovery** — for each candidate length, the most common
+           byte in each key-aligned column is assumed to be the dominant
+           plaintext byte XOR the key byte. Each candidate is then validated by
+           decrypting a 4 KB window and scoring it (printable-ASCII ratio for
+           text, null-run ratio for binary, plus entropy reduction).
+
+        Candidates are ranked by that composite score, ties broken toward the
+        shortest key. Note a single-byte XOR does not change entropy at all (it
+        is a byte permutation), so the printable/null signal — not entropy — is
+        what identifies it. The ``key`` and ``key ^ 0x20`` solutions are
+        genuinely ambiguous for some data; inspect ``sample_decrypted_ascii`` of
+        the top candidates to confirm which plaintext assumption is right.
+
+        Typical use — an obfuscated C2 string or config blob:
+            numpy_xor_key_recovery(addr='0x140089000', size=0x400)
+
+        See also: numpy_byte_histogram (is this even XOR? look for a dominant
+        byte), yara_scan_builtin_crypto (known crypto constants).
+
+        Profile: analysis
+        """
+        try:
+            if max_key_length < 1:
+                return {"ok": False, "error": "max_key_length must be >= 1"}
+            analyze = min(size, _XOR_MAX_ANALYZE)
+            ea, data, _trunc = _read_region(addr, analyze)
+            arr = np.frombuffer(data, dtype=np.uint8)
+            n = arr.size
+            if n < 16:
+                return {
+                    "ok": False,
+                    "error": "Region too small for XOR analysis (need >= 16 bytes).",
+                }
+
+            cap = max(1, min(max_key_length, 64, n // 4))
+            cand_lengths, top_lengths = _xor_candidate_lengths(arr, cap)
+
+            if assumed_plaintext == "auto":
+                assumptions = ["null", "space", "0xff"]
+            elif assumed_plaintext in _XOR_ASSUMPTIONS:
+                assumptions = [assumed_plaintext]
+            else:
+                return {
+                    "ok": False,
+                    "error": f"Unknown assumed_plaintext: {assumed_plaintext!r} "
+                             "(use auto | null | space | 0xff).",
+                }
+
+            cipher_entropy = np_entropy(data)
+            vlen = min(n, _XOR_VALIDATE)
+            vwin = arr[:vlen]
+
+            cands: list[XorKeyCandidate] = []
+            for L in cand_lengths:
+                if L > n // 2:
+                    continue
+                for asm in assumptions:
+                    P = _XOR_ASSUMPTIONS[asm]
+                    key = _recover_xor_key(arr, L, P)
+                    dec = (vwin ^ np.resize(key, vlen)).astype(np.uint8)
+                    de = np_entropy(dec.tobytes())
+                    printable = float(np.count_nonzero((dec >= 0x20) & (dec < 0x7F)) / vlen)
+                    null_ratio = float(np.count_nonzero(dec == 0) / vlen)
+                    reduction = max(0.0, cipher_entropy - de)
+                    score = max(printable, 1.2 * null_ratio) + 0.5 * reduction
+                    if score > 2.4 and (printable > 0.85 or null_ratio > 0.5):
+                        conf = "high"
+                    elif score > 1.2:
+                        conf = "medium"
+                    else:
+                        conf = "low"
+                    dec_bytes = dec.tobytes()
+                    cands.append({
+                        "key_hex": " ".join(f"0x{b:02x}" for b in key.tolist()),
+                        "key_length": int(L),
+                        "assumed_plaintext": asm,
+                        "plaintext_entropy_after": round(de, 4),
+                        "entropy_reduction": round(reduction, 4),
+                        "printable_ratio": round(printable, 3),
+                        "null_ratio": round(null_ratio, 3),
+                        "sample_decrypted_hex": dec_bytes[:64].hex(" ", 1),
+                        "sample_decrypted_ascii": dec_bytes[:64].decode("ascii", errors="replace"),
+                        "confidence": conf,
+                        "_score": round(score, 4),  # internal sort key, popped below
+                    })
+
+            # Pick the winner with the verified near-tie rule (within 0.02 of the
+            # best score, prefer the shortest key — a longer key that ties only
+            # because it is the true key repeated should not outrank the
+            # fundamental). Rank the remainder by score.
+            if cands:
+                smax = max(c["_score"] for c in cands)
+                best = min(
+                    (c for c in cands if c["_score"] >= smax - 0.02),
+                    key=lambda c: c["key_length"],
+                )
+                rest = sorted(
+                    (c for c in cands if c is not best),
+                    key=lambda c: c["_score"],
+                    reverse=True,
+                )
+                cands = [best] + rest
+            for c in cands:
+                c.pop("_score", None)
+            cands = cands[:max(1, top_candidates)]
+
+            result: NumpyXorResult = {
+                "ok": True,
+                "addr": hex(ea),
+                "size_analyzed": n,
+                "ciphertext_entropy": round(cipher_entropy, 4),
+                "top_key_length_candidates": top_lengths,
+                "key_candidates": cands,
+            }
+            if size > _XOR_MAX_ANALYZE:
+                result["analysis_capped"] = True
+
+            best = cands[0] if cands else None
+            if best and best["confidence"] != "low":
+                result["hint"] = (
+                    f"Best candidate: {best['key_length']}-byte key "
+                    f"({best['confidence']} confidence, assumed plaintext "
+                    f"'{best['assumed_plaintext']}'). Key = {best['key_hex']}. "
+                    "Verify via sample_decrypted_ascii, then decrypt with get_bytes + XOR."
+                )
+            else:
+                result["hint"] = (
+                    "No high-confidence key found — the region may use multi-layer "
+                    "or non-XOR encryption, or a key longer than max_key_length. "
+                    "Run numpy_byte_histogram first to confirm a XOR-like distribution."
+                )
+            return result
+        except ValueError as e:
+            return {"ok": False, **tool_error(e, f"numpy_xor_key_recovery at {addr}")}
+        except Exception as e:
+            return {"ok": False, **tool_error(e, f"numpy_xor_key_recovery at {addr}")}
+
+    @tool
+    @idasync
+    @tool_timeout(60.0)
+    def numpy_function_similarity(
+        func_a: Annotated[str, "First function (address or name)"],
+        func_b: Annotated[str, "Second function (address or name)"],
+        method: Annotated[
+            str,
+            "Comparison method: 'byte_histogram' (256-bucket cosine, default), "
+            "'byte_entropy_histogram' (EMBER 16×16 joint), or 'ncc' "
+            "(shift-invariant normalized cross-correlation).",
+        ] = "byte_histogram",
+        min_bytes: Annotated[
+            int, "Minimum function size for a reliable comparison (default: 32)"
+        ] = 32,
+    ) -> NumpyFunctionSimilarityResult:
+        """Bytecode-level similarity between two functions.
+
+        Complements ``find_similar_functions`` (which uses semantic CFG/feature
+        similarity) by comparing the raw bytes — catching clones that semantic
+        features miss, e.g. the same routine compiled into two binaries, or a
+        function duplicated under different names. Score is 0.0 (unrelated) to
+        1.0 (identical bytes).
+
+        Methods:
+        - ``byte_histogram`` — cosine of 256-bucket frequency vectors. Fast,
+          format-independent, works on stripped binaries. The proven baseline.
+        - ``byte_entropy_histogram`` — EMBER-style 16×16 joint histogram; more
+          discriminative for telling apart structurally-similar functions.
+        - ``ncc`` — normalized cross-correlation; shift-invariant, best when two
+          functions differ only by alignment/padding (slowest).
+
+        Interpretation: ≥0.99 identical · ≥0.92 very_similar · ≥0.80 similar.
+
+        See also: find_similar_functions (semantic search across the IDB),
+        diff_functions (decompiled-output diff), get_function_hash (exact match).
+
+        Profile: analysis
+        """
+        try:
+            _ea_a, name_a, da = _read_func_bytes(func_a)
+            _ea_b, name_b, db = _read_func_bytes(func_b)
+            if len(da) < min_bytes or len(db) < min_bytes:
+                return {
+                    "ok": False,
+                    "func_a": name_a,
+                    "func_b": name_b,
+                    "bytes_a": len(da),
+                    "bytes_b": len(db),
+                    "error": (
+                        f"Function too small for reliable byte similarity "
+                        f"(min {min_bytes} bytes; got {len(da)} and {len(db)}). "
+                        "Use diff_functions or get_function_hash instead."
+                    ),
+                }
+
+            m = method.lower().strip()
+            if m == "byte_histogram":
+                score = _cosine(_byte_hist_vec(da), _byte_hist_vec(db))
+            elif m == "byte_entropy_histogram":
+                score = _cosine(_byte_entropy_vec(da), _byte_entropy_vec(db))
+            elif m == "ncc":
+                score = _ncc(da[:_NCC_MAX_BYTES], db[:_NCC_MAX_BYTES])
+            else:
+                return {
+                    "ok": False,
+                    "error": f"Unknown method: {method!r} "
+                             "(use byte_histogram | byte_entropy_histogram | ncc).",
+                }
+
+            score = min(1.0, max(0.0, score))
+            interp = _interpret_similarity(score)
+            result: NumpyFunctionSimilarityResult = {
+                "ok": True,
+                "func_a": name_a,
+                "func_b": name_b,
+                "method": m,
+                "score": round(score, 4),
+                "interpretation": interp,
+                "bytes_a": len(da),
+                "bytes_b": len(db),
+            }
+            if interp == "identical":
+                result["hint"] = (
+                    "Byte profiles are identical — almost certainly the same "
+                    "function (clone, duplicated, or statically linked twice)."
+                )
+            elif interp in ("very_similar", "similar"):
+                result["hint"] = (
+                    "Closely related — same algorithm or a recompiled/patched "
+                    "variant. Confirm with diff_functions on the decompiled output."
+                )
+            else:
+                result["hint"] = (
+                    "Byte profiles differ substantially — probably unrelated. "
+                    "Try method='ncc' if they may differ only by alignment/padding."
+                )
+            return result
+        except ValueError as e:
+            return {"ok": False, **tool_error(e, "numpy_function_similarity")}
+        except Exception as e:
+            return {"ok": False, **tool_error(e, "numpy_function_similarity")}
