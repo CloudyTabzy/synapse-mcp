@@ -1162,6 +1162,61 @@ def idalib_open(
             "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
         }
     except Exception as e:
+        try:
+            ctx = sup.resolve_context_id()
+            return {"error": str(e), **sup.context_fields(ctx)}
+        except Exception:
+            return {"error": str(e)}
+
+
+@mcp.tool
+def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibCloseResult:
+    """Close a database worker and remove all context bindings targeting it."""
+    sup = _require_supervisor()
+    try:
+        if sup.close_session(session_id):
+            return {"success": True, "message": f"Session closed: {session_id}"}
+        return {"success": False, "error": f"Session not found: {session_id}"}
+    except Exception as e:
+        return {"error": f"Failed to close session: {e}"}
+
+
+@mcp.tool
+def idalib_switch(session_id: Annotated[str, "Session ID to bind to active context"]) -> IdalibSwitchResult:
+    """Bind the active idalib context to an existing database worker."""
+    sup = _require_supervisor()
+    try:
+        context_id = sup.resolve_context_id()
+        session = sup.resolve_session(session_id)
+        sup.bind_context(context_id, session.session_id)
+        return {
+            "success": True,
+            **sup.context_fields(context_id),
+            "session": session.to_dict(),
+            "message": f"Bound context to session: {session.session_id} ({session.filename})",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool
+def idalib_unbind() -> IdalibUnbindResult:
+    """Unbind the active idalib context from any database."""
+    sup = _require_supervisor()
+    try:
+        context_id = sup.resolve_context_id()
+        if sup.unbind_context(context_id):
+            return {
+                "success": True,
+                **sup.context_fields(context_id),
+                "message": "Context unbound successfully.",
+            }
+        return {
+            "success": False,
+            **sup.context_fields(context_id),
+            "error": "No bound session for this context.",
+        }
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -1384,6 +1439,89 @@ def idalib_warmup(
         return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
     except Exception as e:
         return {"ready": False, "error": str(e)}
+
+
+@mcp.tool
+def idalib_cleanup_zombies(
+    max_age_minutes: Annotated[Optional[int], "Kill ida.exe processes older than N minutes"] = 30,
+) -> dict:
+    """Find and kill orphan IDA processes not managed by this supervisor.
+    
+    Scans the system for ida.exe processes, excludes those that this
+    supervisor spawned (tracked workers), and terminates the rest.
+    Use after a crash or when the system runs out of memory from
+    stale GUI instances or orphaned workers.
+    """
+    sup = _require_supervisor()
+    supervisor_pids = set()
+    with sup._lock:
+        for s in sup.sessions.values():
+            if s.process is not None and s.process.pid is not None:
+                supervisor_pids.add(s.process.pid)
+            if s.pid is not None:
+                supervisor_pids.add(s.pid)
+        if sup._schema_worker is not None and sup._schema_worker.process is not None:
+            supervisor_pids.add(sup._schema_worker.process.pid)
+        if sup._schema_worker is not None and sup._schema_worker.pid is not None:
+            supervisor_pids.add(sup._schema_worker.pid)
+
+    killed = 0
+    errors = 0
+    cutoff = time.time() - max_age_minutes * 60
+
+    try:
+        import subprocess
+        raw = subprocess.check_output(
+            ["wmic", "process", "where", "name='ida.exe'", "get", "ProcessId,ProcessId"],
+            text=True, timeout=10,
+        )
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if not line or line == "ProcessId":
+                continue
+            parts = line.split()
+            for part in parts:
+                try:
+                    pid = int(part)
+                except ValueError:
+                    continue
+                if pid in supervisor_pids:
+                    continue
+                # Check process age via creation time
+                try:
+                    age_raw = subprocess.check_output(
+                        ["wmic", "process", "where", f"ProcessId={pid}", "get", "CreationDate"],
+                        text=True, timeout=5,
+                    )
+                    for aline in age_raw.strip().split("\n"):
+                        aline = aline.strip()
+                        if aline and aline != "CreationDate":
+                            import datetime
+                            try:
+                                created = datetime.datetime.strptime(aline[:14], "%Y%m%d%H%M%S")
+                                age_sec = time.time() - created.timestamp()
+                                if age_sec < max_age_minutes * 60:
+                                    continue  # too young to be zombie
+                            except ValueError:
+                                pass
+                            break
+                except Exception:
+                    pass
+                try:
+                    import os
+                    os.kill(pid, 9)
+                    killed += 1
+                except (OSError, PermissionError):
+                    errors += 1
+    except Exception:
+        # Fallback: use os.kill directly for supervisor-tracked cleanup
+        pass
+
+    return {
+        "killed": killed,
+        "errors": errors,
+        "remaining_managed": len(supervisor_pids),
+    }
 
 
 @mcp.resource("ida://databases")
