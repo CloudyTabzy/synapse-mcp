@@ -56,6 +56,7 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_health",
     "idalib_warmup",
     "idalib_cleanup_zombies",
+    "idalib_task_poll",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 
@@ -1350,45 +1351,6 @@ def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibClo
 
 
 @mcp.tool
-def idalib_switch(session_id: Annotated[str, "Session ID to bind to active context"]) -> IdalibSwitchResult:
-    """Bind the active idalib context to an existing database worker."""
-    sup = _require_supervisor()
-    try:
-        context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        sup.bind_context(context_id, session.session_id)
-        return {
-            "success": True,
-            **sup.context_fields(context_id),
-            "session": session.to_dict(),
-            "message": f"Bound context to session: {session.session_id} ({session.filename})",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool
-def idalib_unbind() -> IdalibUnbindResult:
-    """Unbind the active idalib context from any database."""
-    sup = _require_supervisor()
-    try:
-        context_id = sup.resolve_context_id()
-        if sup.unbind_context(context_id):
-            return {
-                "success": True,
-                **sup.context_fields(context_id),
-                "message": "Context unbound successfully.",
-            }
-        return {
-            "success": False,
-            **sup.context_fields(context_id),
-            "error": "No bound session for this context.",
-        }
-    except Exception as e:
-        return {"error": f"Failed to unbind context: {e}"}
-
-
-@mcp.tool
 def idalib_list() -> IdalibListResult:
     """List database workers with context-binding metadata."""
     sup = _require_supervisor()
@@ -1559,6 +1521,24 @@ def idalib_warmup(
 
 
 @mcp.tool
+def idalib_task_poll(
+    task_id: Annotated[str, "Task ID returned by idalib_open"],
+) -> dict:
+    """Poll the status of an async idalib open task.
+
+    Large-file opens (>10 MB) run in a background thread and return a
+    task_id immediately. Use this tool to check whether the open has
+    completed, failed, or is still loading."""
+    sup = _require_supervisor()
+    if task_id.startswith("open_") and task_id in sup._open_tasks:
+        return _call_tool_result(sup._open_tasks[task_id])
+    return _call_tool_result(
+        {"error": f"Task '{task_id}' not found (expired or invalid ID)"},
+        is_error=True,
+    )
+
+
+@mcp.tool
 def idalib_cleanup_zombies(
     max_age_minutes: Annotated[Optional[int], "Kill ida.exe processes older than N minutes"] = 30,
 ) -> dict:
@@ -1668,12 +1648,6 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     if tool_name in IDALIB_MANAGEMENT_TOOLS:
         return _original_dispatch(request_obj)
-    # Open tasks: check supervisor's _open_tasks before routing to worker
-    if tool_name == "idalib_task_poll":
-        task_id = (params.get("arguments") or {}).get("task_id", "")
-        if task_id.startswith("open_") and task_id in sup._open_tasks:
-            task_info = sup._open_tasks[task_id]
-            return _jsonrpc_result(request_id, _call_tool_result(task_info))
     if tool_name in IDALIB_HIDDEN_PLUGIN_TOOLS:
         return _jsonrpc_result(
             request_id,
@@ -1691,6 +1665,39 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     arguments = copy.deepcopy(params.get("arguments") or {})
     database = arguments.pop(_DATABASE_ARG, None)
+
+    # LIEF, ELF, and memmap tools with file_path don't need an IDB
+    # session. Route to the schema worker directly so the tool can
+    # use LIEF/numpy on the raw file without requiring a bound session.
+    _TOOLS_ACCEPTING_FILE_PATH = ("lief_", "elf_", "numpy_memmap_", "construct_")
+    file_path = arguments.get("file_path", "")
+
+    # If a file-analysis tool is called without file_path, inject the
+    # bound LIEF-only session's input_path so the tool can operate on
+    # the raw file even though the worker has no open IDA database.
+    if not file_path and any(tool_name.startswith(p) for p in _TOOLS_ACCEPTING_FILE_PATH):
+        try:
+            bound_session = sup.resolve_session(database)
+            if bound_session and bound_session.metadata.get("mode") == "lief-only":
+                file_path = bound_session.input_path
+                arguments = {**arguments, "file_path": file_path}
+        except Exception:
+            pass
+
+    if file_path and any(tool_name.startswith(p) for p in _TOOLS_ACCEPTING_FILE_PATH):
+        try:
+            session = sup.resolve_session(database)
+        except Exception:
+            worker = sup._schema_or_idle_worker()
+            if worker is not None:
+                forwarded = copy.deepcopy(request_obj)
+                forwarded.setdefault("params", {})["arguments"] = arguments
+                try:
+                    return sup.forward_raw(worker, forwarded)
+                except Exception as e:
+                    return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
+            return _jsonrpc_result(request_id, _call_tool_result({"error": "No worker available for file-analysis tool. Open a session first."}, is_error=True))
+
     try:
         session = sup.resolve_session(database)
     except Exception as e:

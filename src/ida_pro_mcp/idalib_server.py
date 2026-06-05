@@ -161,10 +161,21 @@ def _install_context_activation_hooks() -> None:
 
     original_tools_call = MCP_SERVER.registry.methods["tools/call"]
 
+    _FILE_TOOL_PREFIXES = ("lief_", "elf_", "numpy_memmap_", "construct_")
+    _STATUS_TOOLS = ("lief_status", "elf_status", "construct_status")
+
     def tools_call_with_context(
         name: str, arguments: Optional[dict] = None, _meta: Optional[dict] = None
     ) -> dict:
         if name not in IDALIB_MANAGEMENT_TOOLS:
+            # File-analysis tools with an explicit file_path don't need a bound
+            # IDA session — they operate on the raw file directly. Status probes
+            # also work without a session.
+            has_file_path = bool((arguments or {}).get("file_path"))
+            if name in _STATUS_TOOLS or (
+                has_file_path and any(name.startswith(p) for p in _FILE_TOOL_PREFIXES)
+            ):
+                return original_tools_call(name, arguments, _meta)
             try:
                 manager = get_session_manager()
                 context_id = _resolve_effective_context_id()

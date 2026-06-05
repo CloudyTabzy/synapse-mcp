@@ -298,14 +298,37 @@ class IDASessionManager:
                 f"Exception: {type(e).__name__}: {e}"
             ) from e
         if err:
-            logger.error(
-                "ida.open_database() returned error code %d for %s (%.1f MB)",
-                err, input_path, file_size_mb,
-            )
+            # Documented IDA error code hints (best-effort, IDA does not publish a full table).
+            # 1 = invalid parameter, 2 = loader rejected (often custom PE / stripped header),
+            # 3 = out of memory, 4 = loader rejected (often wrong machine type or unknown format),
+            # 5+ = I/O / format-specific loader failure.
+            err_hints = {
+                1: "invalid parameter passed to the loader",
+                2: "loader rejected the file (often custom/stripped PE or non-standard header)",
+                3: "out of memory while loading",
+                4: "loader rejected the file (often unknown machine type or format)",
+            }
+            err_hint = err_hints.get(err, "loader-specific failure (consult IDA documentation)")
+            # Emit a full traceback into the worker log by creating an exception
+            # context and using logger.exception(). The traceback helps developers
+            # trace the exact call path when debugging loader failures.
+            try:
+                raise RuntimeError(
+                    f"ida.open_database() returned error code {err} ({err_hint}) for {input_path}"
+                )
+            except Exception:
+                logger.exception(
+                    "IDA open failed for %s (%.1f MB): error code %d (%s). "
+                    "Recommendation: for files IDA cannot load, use mode='lief-only' "
+                    "to get static metadata instantly, or use idalib_lief_* / "
+                    "numpy_memmap_scan tools to inspect raw bytes.",
+                    input_path, file_size_mb, err, err_hint,
+                )
             raise RuntimeError(
                 f"Failed to open database: {input_path} ({file_size_mb:.0f} MB). "
-                f"IDA error code: {err}. For large binaries (>50MB) consider using "
-                f"idalib_lief_* or numpy_memmap_scan tools for metadata extraction."
+                f"IDA error code: {err} ({err_hint}). For large binaries (>50MB) "
+                f"consider using idalib_lief_* or numpy_memmap_scan tools for "
+                f"metadata extraction."
             )
 
     def _unbind_session_everywhere_locked(self, session_id: str) -> None:

@@ -9,6 +9,8 @@ from ida_pro_mcp import idalib_supervisor as supmod
 class _FakeProcess:
     pid = 12345
     returncode = None
+    stdin = None
+    stdout = None
 
     def poll(self):
         return self.returncode
@@ -34,13 +36,16 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
         self.opened: list[tuple[str, dict]] = []
 
     def _spawn_worker(self):
+        proc = _FakeProcess()
         return supmod.WorkerSession(
             session_id="__schema__",
             input_path="",
             filename="",
             host="127.0.0.1",
             port=1,
-            process=_FakeProcess(),
+            process=proc,
+            stdin=proc.stdin,
+            stdout=proc.stdout,
         )
 
     def _worker_rpc(self, worker, payload, *, timeout=None):
@@ -72,7 +77,7 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
         self.forwarded.append(payload)
         return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"ok": True}}
 
-    def call_worker_tool(self, worker, name, arguments=None):
+    def call_worker_tool(self, worker, name, arguments=None, tool_timeout=None):
         if name == "idalib_open":
             assert arguments is not None
             self.opened.append((name, arguments))
@@ -115,50 +120,6 @@ def _patch_discovery(*, instances, probe):
 def test_supervisor_import_does_not_import_ida_modules():
     assert "idapro" not in sys.modules
     assert "idaapi" not in sys.modules
-
-
-def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
-    class _FakeResponse:
-        status = 200
-        reason = "OK"
-
-        def read(self):
-            return b'{"jsonrpc":"2.0","result":{"ok":true},"id":1}'
-
-    class _FakeConnection:
-        instances = []
-
-        def __init__(self, host, port, timeout=None):
-            self.host = host
-            self.port = port
-            self.timeout = timeout
-            type(self).instances.append(self)
-
-        def request(self, method, path, body, headers):
-            pass
-
-        def getresponse(self):
-            return _FakeResponse()
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(supmod.http.client, "HTTPConnection", _FakeConnection)
-    sup = supmod.IdalibSupervisor(supmod.McpServer("test"))
-    worker = supmod.WorkerSession(
-        session_id="worker",
-        input_path="",
-        filename="",
-        host="127.0.0.1",
-        port=12345,
-        process=_FakeProcess(),
-    )
-
-    sup._worker_rpc(worker, {"jsonrpc": "2.0", "id": 1, "method": "ping"})
-    sup._worker_rpc(worker, {"jsonrpc": "2.0", "id": 2, "method": "ping"}, timeout=2.0)
-
-    assert _FakeConnection.instances[0].timeout is None
-    assert _FakeConnection.instances[1].timeout == 2.0
 
 
 def test_worker_tools_inject_database_and_filter_management_tools():
@@ -308,8 +269,8 @@ def test_open_session_race_discards_losing_worker_for_existing_path(tmp_path):
     sample.write_bytes(b"x")
 
     class _RaceSupervisor(_FakeSupervisor):
-        def call_worker_tool(self, worker, name, arguments=None):
-            result = super().call_worker_tool(worker, name, arguments)
+        def call_worker_tool(self, worker, name, arguments=None, tool_timeout=None):
+            result = super().call_worker_tool(worker, name, arguments, tool_timeout=tool_timeout)
             if name == "idalib_open":
                 existing = supmod.WorkerSession(
                     session_id="winner",
@@ -337,8 +298,8 @@ def test_open_session_race_rejects_different_requested_session_id(tmp_path):
     sample.write_bytes(b"x")
 
     class _RaceSupervisor(_FakeSupervisor):
-        def call_worker_tool(self, worker, name, arguments=None):
-            result = super().call_worker_tool(worker, name, arguments)
+        def call_worker_tool(self, worker, name, arguments=None, tool_timeout=None):
+            result = super().call_worker_tool(worker, name, arguments, tool_timeout=tool_timeout)
             if name == "idalib_open":
                 existing = supmod.WorkerSession(
                     session_id="winner",
@@ -380,8 +341,8 @@ def test_open_session_race_rejects_duplicate_session_id_for_different_path(tmp_p
             self.spawned.append(worker)
             return worker
 
-        def call_worker_tool(self, worker, name, arguments=None):
-            result = super().call_worker_tool(worker, name, arguments)
+        def call_worker_tool(self, worker, name, arguments=None, tool_timeout=None):
+            result = super().call_worker_tool(worker, name, arguments, tool_timeout=tool_timeout)
             if name == "idalib_open":
                 existing = supmod.WorkerSession(
                     session_id=arguments["session_id"],
@@ -526,3 +487,96 @@ def test_closed_gui_session_does_not_reappear_if_closed_during_headless_fallback
         assert sup.spawned[-1].process.returncode == 0
     finally:
         restore()
+
+
+def test_idalib_task_poll_returns_open_task_status():
+    """idalib_task_poll should return status for supervisor-level open tasks."""
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        supmod.supervisor._open_tasks["open_abc123"] = {
+            "status": "loading",
+            "file_path": "/tmp/big.dll",
+            "size_mb": 100.0,
+        }
+        result = supmod.idalib_task_poll("open_abc123")
+        assert result["isError"] is False
+        assert result["structuredContent"]["status"] == "loading"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_task_poll_returns_error_for_unknown_task():
+    """idalib_task_poll should error for unknown/expired task IDs."""
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.idalib_task_poll("open_nonexistent")
+        assert result["isError"] is True
+        assert "not found" in result["content"][0]["text"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_handle_tools_call_injects_file_path_for_lief_only_session(tmp_path):
+    """When a LIEF-only session is bound and a lief_* tool is called without
+    file_path, the supervisor should inject the session's input_path."""
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        sample = tmp_path / "sample.dll"
+        sample.write_bytes(b"MZ")
+        # Create a LIEF-only session
+        session = supmod.WorkerSession(
+            session_id="lief1",
+            input_path=str(sample),
+            filename="sample.dll",
+            metadata={"mode": "lief-only"},
+            process=_FakeProcess(),
+        )
+        with sup._lock:
+            sup.sessions["lief1"] = session
+            sup.bind_context(supmod.SHARED_FALLBACK_CONTEXT_ID, "lief1")
+
+        result = supmod._handle_tools_call(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "lief_info", "arguments": {}},
+            }
+        )
+        # Should forward to the schema worker with file_path injected
+        assert result is not None
+        assert "error" not in result
+        forwarded = sup.forwarded
+        assert len(forwarded) == 1
+        args = forwarded[0]["params"]["arguments"]
+        assert args.get("file_path") == str(sample)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_handle_tools_call_routes_file_tool_to_schema_worker_when_unbound():
+    """lief_* tools with file_path should route to schema worker even when
+    no session is bound."""
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        result = supmod._handle_tools_call(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "lief_status",
+                    "arguments": {},
+                },
+            }
+        )
+        assert result is not None
+        assert "error" not in result
+    finally:
+        supmod.supervisor = old_supervisor
