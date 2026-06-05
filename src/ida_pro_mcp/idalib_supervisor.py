@@ -1180,6 +1180,10 @@ def idalib_open(
     except Exception:
         file_size_mb = 0.0
 
+    # Auto-scale open timeout for large binaries (2 sec per MB, max 15 min)
+    if open_timeout_sec is None:
+        open_timeout_sec = min(120 + file_size_mb * 2, 900)
+
     # LIEF-only mode — return metadata + register lightweight session
     if actual_mode == "lief-only":
         info: dict[str, Any] = {"format": "unknown", "sections": []}

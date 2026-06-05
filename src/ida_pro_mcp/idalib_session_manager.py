@@ -6,6 +6,7 @@ Each session represents an opened binary with its own IDA database instance.
 
 import uuid
 import os
+import tempfile
 import threading
 import logging
 from pathlib import Path
@@ -100,13 +101,14 @@ class IDASessionManager:
 
             # Open the database
             logger.info(f"Opening database: {input_path} (session: {session_id})")
-            self._activate_database_path(str(input_path), run_auto_analysis)
+            idb_path = self._activate_database_path(str(input_path), run_auto_analysis)
 
             # Create session object
             session = IDASession(
                 session_id=session_id,
                 input_path=input_path,
                 is_analyzing=run_auto_analysis,
+                metadata={"idb_path": idb_path},
             )
 
             self._sessions[session_id] = session
@@ -149,6 +151,10 @@ class IDASessionManager:
             # Remove session
             del self._sessions[session_id]
             self._unbind_session_everywhere_locked(session_id)
+
+            # Clean up temp IDB files if the database was written to temp
+            self._cleanup_session_temp_files(session)
+
             logger.info(f"Session closed: {session_id}")
             return True
 
@@ -272,11 +278,62 @@ class IDASessionManager:
         session = self._sessions.get(session_id)
         if session is None:
             raise ValueError(f"Session not found: {session_id}")
-        self._activate_database_path(str(session.input_path), run_auto_analysis=False)
+        idb_path = self._activate_database_path(str(session.input_path), run_auto_analysis=False)
+        # Update idb_path in metadata if re-opening created a new temp file
+        if idb_path:
+            session.metadata["idb_path"] = idb_path
         self._active_session_id = session_id
         logger.info("Activated session %s (%s)", session_id, session.input_path.name)
 
-    def _activate_database_path(self, input_path: str, run_auto_analysis: bool) -> None:
+    def _get_writable_idb_path(self, input_path: str) -> str:
+        """Return a writable path for the IDA database file.
+
+        If the source directory is not writable (e.g., Program Files),
+        redirect to %TEMP% with a unique name to avoid collisions.
+        """
+        source_dir = Path(input_path).parent
+        stem = Path(input_path).stem
+        if os.access(str(source_dir), os.W_OK):
+            return str(source_dir / f"{stem}.i64")
+        tmp_dir = Path(tempfile.gettempdir())
+        unique = uuid.uuid4().hex[:8]
+        return str(tmp_dir / f"idalib_{unique}_{stem}.i64")
+
+    def _cleanup_stale_sidecars(self, idb_path: str) -> None:
+        """Remove stale IDA sidecar files before opening a database.
+
+        IDA creates .id0, .id1, .nam, .til alongside the IDB. If a previous
+        open was interrupted, these can corrupt subsequent opens.
+        """
+        base = Path(idb_path).with_suffix("")
+        for ext in (".id0", ".id1", ".id2", ".nam", ".til"):
+            stale = base.with_suffix(ext)
+            if stale.exists():
+                try:
+                    stale.unlink()
+                    logger.debug("Removed stale sidecar: %s", stale)
+                except OSError as e:
+                    logger.warning("Could not remove stale sidecar %s: %s", stale, e)
+
+    def _cleanup_session_temp_files(self, session: IDASession) -> None:
+        """Delete temp IDB and sidecars if the session wrote to temp."""
+        idb_path = session.metadata.get("idb_path")
+        if not idb_path:
+            return
+        tmp_dir = str(Path(tempfile.gettempdir()))
+        if not str(idb_path).startswith(tmp_dir):
+            return
+        base = Path(idb_path).with_suffix("")
+        for ext in (".i64", ".id0", ".id1", ".id2", ".nam", ".til"):
+            f = base.with_suffix(ext)
+            if f.exists():
+                try:
+                    f.unlink()
+                    logger.debug("Cleaned up temp file: %s", f)
+                except OSError:
+                    pass
+
+    def _activate_database_path(self, input_path: str, run_auto_analysis: bool) -> str:
         if self._active_session_id is not None:
             logger.debug("Closing active database before opening %s", input_path)
             idapro.close_database()
@@ -288,27 +345,50 @@ class IDASessionManager:
         except OSError:
             pass
 
-        logger.info("Opening database: %s (%.1f MB)", input_path, file_size_mb)
+        idb_path = self._get_writable_idb_path(input_path)
+        self._cleanup_stale_sidecars(idb_path)
+
+        # -o: redirect IDB output to writable path
+        # -Opdb:off: disable PDB symbol loading (prevents headless hang on missing PDBs)
+        args = f'-o"{idb_path}" -Opdb:off'
+
+        logger.info(
+            "Opening database: %s (%.1f MB) -> IDB: %s",
+            input_path, file_size_mb, idb_path,
+        )
         try:
-            err = idapro.open_database(input_path, run_auto_analysis=run_auto_analysis)
+            err = idapro.open_database(
+                input_path, run_auto_analysis=run_auto_analysis, args=args
+            )
         except Exception as e:
-            logger.exception("ida.open_database() raised exception for %s (%.1f MB)", input_path, file_size_mb)
+            logger.exception(
+                "ida.open_database() raised exception for %s (%.1f MB)",
+                input_path, file_size_mb,
+            )
             raise RuntimeError(
                 f"IDA open_database() crashed for {input_path} ({file_size_mb:.0f} MB). "
                 f"Exception: {type(e).__name__}: {e}"
             ) from e
         if err:
             # Documented IDA error code hints (best-effort, IDA does not publish a full table).
-            # 1 = invalid parameter, 2 = loader rejected (often custom PE / stripped header),
+            # 1 = invalid parameter, 2 = ambiguous (loader rejected OR permission denied),
             # 3 = out of memory, 4 = loader rejected (often wrong machine type or unknown format),
             # 5+ = I/O / format-specific loader failure.
-            err_hints = {
-                1: "invalid parameter passed to the loader",
-                2: "loader rejected the file (often custom/stripped PE or non-standard header)",
-                3: "out of memory while loading",
-                4: "loader rejected the file (often unknown machine type or format)",
-            }
-            err_hint = err_hints.get(err, "loader-specific failure (consult IDA documentation)")
+            source_dir = Path(input_path).parent
+            if err == 2 and not os.access(str(source_dir), os.W_OK):
+                err_hint = (
+                    "cannot write IDB to source directory (permission denied). "
+                    "The output was redirected to a temp path, but the loader may "
+                    "still have failed. Try opening from a writable location or use mode='lief-only'"
+                )
+            else:
+                err_hints = {
+                    1: "invalid parameter passed to the loader",
+                    2: "loader rejected the file (often custom/stripped PE or non-standard header)",
+                    3: "out of memory while loading",
+                    4: "loader rejected the file (often unknown machine type or format)",
+                }
+                err_hint = err_hints.get(err, "loader-specific failure (consult IDA documentation)")
             # Emit a full traceback into the worker log by creating an exception
             # context and using logger.exception(). The traceback helps developers
             # trace the exact call path when debugging loader failures.
@@ -330,6 +410,7 @@ class IDASessionManager:
                 f"consider using idalib_lief_* or numpy_memmap_scan tools for "
                 f"metadata extraction."
             )
+        return idb_path
 
     def _unbind_session_everywhere_locked(self, session_id: str) -> None:
         stale_contexts = [
