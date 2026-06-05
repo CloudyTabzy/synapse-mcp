@@ -395,9 +395,10 @@ def _install_tools_call_patch() -> None:
                     alt = ("Use `find_regex(pattern=...)` with a narrow pattern instead. "
                            "On smaller binaries (use `server_health` to check), "
                            "this tool is safe for text search.")
+                func_str = (f"{_core._FUNC_COUNT_CACHE // 1000}K functions" 
+                             if _core._FUNC_COUNT_CACHE > 0 else "a very large binary")
                 error_msg = (
-                    f"`{name}` cannot run on this binary (class: {_core._BINARY_CLASS}, "
-                    f"{_core._FUNC_COUNT_CACHE} functions). "
+                    f"`{name}` cannot run on this binary ({func_str}). "
                     f"IDA's main thread is non-interruptible and this operation "
                     f"would block or crash the HTTP plugin. {alt}"
                 )
