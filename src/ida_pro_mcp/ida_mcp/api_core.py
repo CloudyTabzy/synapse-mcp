@@ -496,19 +496,25 @@ def _build_health_payload() -> dict:
     except Exception:
         seg_count = 0
 
-    # Skip enumerative calls when auto-analysis is still running — they
-    # can block the main thread on very large binaries while the function
-    # table is being built.
+    # get_func_qty() may block during auto-analysis on very large
+    # binaries — skip it while analysis is running. classify by
+    # binary_mb alone in that case.
     try:
         if _is_auto_analysis_running():
             func_count = 0
-            binary_bytes = 0
         else:
             func_count = ida_funcs.get_func_qty()
-            binary_bytes = ida_nalt.retrieve_input_file_size()
     except Exception:
         func_count = 0
-        binary_bytes = 0
+
+    # retrieve_input_file_size() is a fast metadata read — always safe.
+    try:
+        binary_bytes = ida_nalt.retrieve_input_file_size()
+    except Exception:
+        try:
+            binary_bytes = idaapi.inf_get_max_ea() - idaapi.inf_get_min_ea()
+        except Exception:
+            binary_bytes = 0
 
     # String count is enumerative — skip on large binaries; the
     # strings_cache already tracks this reliably.
