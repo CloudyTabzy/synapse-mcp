@@ -46,6 +46,7 @@ from .utils import (
     parse_address,
     paginate,
     pattern_filter,
+    summary_stats,
 )
 
 
@@ -104,6 +105,7 @@ class FunctionQueryPage(TypedDict, total=False):
     data: list[FunctionQueryRow]
     next_offset: int | None
     total: int
+    summary: dict
     error: str | None
 
 
@@ -1048,7 +1050,11 @@ def func_query(
             filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
 
         page = paginate(filtered, offset, count)
+        # Summarize the size distribution before stripping the numeric size_int.
+        size_summary = summary_stats(page["data"], "size_int", label_field="name")
         page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        if size_summary is not None:
+            page["summary"] = {"size": size_summary}
         results.append(page)
 
     return results

@@ -260,6 +260,21 @@ def test_func_query_filters():
 
 
 @test()
+def test_func_query_size_summary():
+    """A non-empty func_query page carries a size summary; size_int stays hidden."""
+    result = func_query({})
+    page = result[0]
+    if not page["data"]:
+        skip_test("no functions in fixture")
+    assert "summary" in page, "page should include a size summary"
+    s = page["summary"]["size"]
+    for key in ("count", "mean", "median", "min", "max", "p25", "p75", "p95"):
+        assert key in s, f"summary missing {key}"
+    assert s["min"] <= s["max"]
+    assert "size_int" not in page["data"][0]
+
+
+@test()
 def test_list_globals_returns_non_empty_results_for_all_query():
     """list_globals('*') returns at least one global item."""
     page = list_globals({"filter": "*", "offset": 0, "count": 50})[0]

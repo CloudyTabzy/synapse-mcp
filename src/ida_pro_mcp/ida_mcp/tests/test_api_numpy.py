@@ -17,6 +17,8 @@ try:
             numpy_function_similarity,
             numpy_opcode_histogram,
             numpy_memmap_scan,
+            numpy_binary_similarity,
+            numpy_value_scan,
         )
 except ImportError:
     NUMPY_AVAILABLE = False
@@ -462,3 +464,94 @@ def test_memmap_scan_missing_file():
     result = numpy_memmap_scan("/no/such/file_xyz.bin", "90 90")
     assert result.get("ok") is False
     assert "not found" in result.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# numpy_binary_similarity
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_binary_similarity_self_identical():
+    """A file compared to itself scores ~1.0 / identical (both methods)."""
+    _require_numpy()
+    path = _fixture_path()
+    if path is None:
+        skip_test("input file not on disk")
+    for method in ("byte_histogram", "byte_entropy_histogram"):
+        result = numpy_binary_similarity(path, path, method=method)
+        assert result.get("ok") is True, result
+        assert result["score"] >= 0.99, f"{method}: {result['score']}"
+        assert result["interpretation"] in ("identical", "very_similar")
+        assert result["size_a"] == result["size_b"]
+
+
+@test()
+def test_binary_similarity_defaults_to_idb():
+    """Omitting both paths uses the active IDB source file for both."""
+    _require_numpy()
+    path = _fixture_path()
+    if path is None:
+        skip_test("input file not on disk")
+    result = numpy_binary_similarity()
+    assert result.get("ok") is True, result
+    assert result["score"] >= 0.99
+
+
+@test()
+def test_binary_similarity_missing_file():
+    """A non-existent path returns a structured error."""
+    _require_numpy()
+    path = _fixture_path()
+    if path is None:
+        skip_test("input file not on disk")
+    result = numpy_binary_similarity(path, "/no/such/file_xyz.bin")
+    assert result.get("ok") is False
+    assert "not found" in result.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# numpy_value_scan
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_value_scan_basic():
+    """value_scan interprets a region as u8 and classifies it."""
+    _require_numpy()
+    addr, size = _first_code_region(4096)
+    result = numpy_value_scan(addr, size, dtype="u8")
+    assert result.get("ok") is True, result
+    assert result["dtype"] == "u8"
+    assert result["value_count"] == size // 8
+    assert result["bytes_analyzed"] == (size // 8) * 8
+    assert 0.0 <= result["pointer_candidate_ratio"] <= 1.0
+    assert result["classification"] in (
+        "pointer_table", "counter_or_sequence", "constant",
+        "mostly_zero_padding", "mixed_data",
+    )
+    assert isinstance(result["sample_values"], list) and result["sample_values"]
+
+
+@test()
+def test_value_scan_bad_dtype():
+    """An unknown dtype returns a structured error."""
+    _require_numpy()
+    addr, size = _first_code_region(4096)
+    result = numpy_value_scan(addr, size, dtype="bogus")
+    assert result.get("ok") is False
+    assert "dtype" in result.get("error", "").lower()
+
+
+@test()
+def test_value_scan_endian_and_float():
+    """Big-endian and float dtypes are accepted and reported."""
+    _require_numpy()
+    addr, size = _first_code_region(4096)
+    r_be = numpy_value_scan(addr, size, dtype="u4", endian="big")
+    assert r_be.get("ok") is True
+    assert r_be["endian"] == "big"
+    r_f = numpy_value_scan(addr, size, dtype="f8")
+    assert r_f.get("ok") is True
+    # Float dtype has no pointer ratio.
+    assert "pointer_candidate_ratio" not in r_f

@@ -40,6 +40,7 @@ import ida_ua
 import idaapi
 import idautils
 
+from . import compat
 from .rpc import tool
 from .sync import idasync, tool_timeout
 from .utils import parse_address, tool_error
@@ -210,6 +211,46 @@ class NumpyMemmapScanResult(TypedDict, total=False):
     match_count: int
     matches: list[MemmapMatch]
     truncated: bool
+    hint: str
+    error: str
+    error_type: str
+
+
+class NumpyBinarySimilarityResult(TypedDict, total=False):
+    ok: bool
+    file_a: str
+    file_b: str
+    method: str
+    score: float
+    interpretation: str
+    size_a: int
+    size_b: int
+    entropy_a: float
+    entropy_b: float
+    sampled: bool
+    hint: str
+    error: str
+    error_type: str
+
+
+class NumpyValueScanResult(TypedDict, total=False):
+    ok: bool
+    addr: str
+    dtype: str
+    endian: str
+    value_count: int
+    bytes_analyzed: int
+    unique_values: int
+    zero_ratio: float
+    min_value: str
+    max_value: str
+    pointer_candidate_ratio: float
+    pointer_target_image_range: list[str]
+    classification: str
+    is_monotonic_increasing: bool
+    longest_constant_run: int
+    sample_values: list[str]
+    interpretation: str
     hint: str
     error: str
     error_type: str
@@ -519,6 +560,50 @@ def _longest_fixed_run(mask: list[bool]) -> tuple[int, int]:
         else:
             run = 0
     return best_off, best_len
+
+
+# --- Whole-file similarity helpers -------------------------------------------
+
+# Cap for the byte-histogram pass and the (heavier) byte-entropy pass. The flat
+# histogram is cheap so its cap is generous; the sliding-window entropy histogram
+# is sampled from a smaller prefix to stay fast on large files.
+_SIM_HIST_CAP = 64 * 1024 * 1024
+_SIM_ENTROPY_CAP = 16 * 1024 * 1024
+
+
+def _read_file_prefix(path: str, cap: int) -> tuple[bytes, bool]:
+    """Read up to `cap` bytes from a file. Returns (data, sampled)."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        data = fh.read(cap)
+    return data, size > cap
+
+
+# --- Typed value-scan helpers ------------------------------------------------
+
+# Accepted dtype codes → (numpy base code, item size, is_integer).
+_VALUE_DTYPES: dict[str, tuple[str, int, bool]] = {
+    "u1": ("u1", 1, True), "u2": ("u2", 2, True), "u4": ("u4", 4, True), "u8": ("u8", 8, True),
+    "i1": ("i1", 1, True), "i2": ("i2", 2, True), "i4": ("i4", 4, True), "i8": ("i8", 8, True),
+    "f4": ("f4", 4, False), "f8": ("f8", 8, False),
+}
+
+
+def _image_ea_range() -> tuple[int, int]:
+    """Return (min_ea, max_ea) of the loaded database, version-safe."""
+    return compat.inf_get_min_ea(), compat.inf_get_max_ea()
+
+
+def _longest_run_len(arr) -> int:
+    """Length of the longest run of equal consecutive values in a 1-D array."""
+    if arr.size == 0:
+        return 0
+    # Boundaries where the value changes.
+    change = np.nonzero(np.diff(arr))[0]
+    if change.size == 0:
+        return int(arr.size)
+    bounds = np.concatenate(([-1], change, [arr.size - 1]))
+    return int(np.max(np.diff(bounds)))
 
 
 # ============================================================================
@@ -1366,3 +1451,235 @@ if NUMPY_AVAILABLE:
             return {"ok": False, **tool_error(e, "numpy_memmap_scan")}
         except Exception as e:
             return {"ok": False, **tool_error(e, "numpy_memmap_scan")}
+
+    @tool
+    @idasync
+    @tool_timeout(120.0)
+    def numpy_binary_similarity(
+        file_a: Annotated[str, "First binary file path. Empty = the active IDB's source file."] = "",
+        file_b: Annotated[str, "Second binary file path. Empty = the active IDB's source file."] = "",
+        method: Annotated[
+            str,
+            "Comparison: 'byte_histogram' (256-bucket cosine, default) or "
+            "'byte_entropy_histogram' (EMBER 16×16 joint — more discriminative).",
+        ] = "byte_histogram",
+    ) -> NumpyBinarySimilarityResult:
+        """Whole-file byte-distribution similarity between two binaries.
+
+        Compares two files on disk by their byte statistics — the proven EMBER
+        feature representation. The per-function ``numpy_function_similarity``
+        answers "are these two functions the same?"; this answers "are these two
+        *files* variants of each other?":
+
+        - Is a dropped/unpacked payload a variant of the parent sample?
+        - Are two sibling DLLs in an install dir built from the same code?
+        - Did a binary's byte profile change between versions?
+
+        Either path may be omitted to use the active IDB's source file, so you
+        can compare the binary you are analyzing against any file on disk without
+        loading it into IDA. Score is 0.0 (unrelated) to 1.0 (identical
+        distribution).
+
+        Note: a high score means similar byte *distributions*, not identical code
+        — packing/encryption raises entropy of both files and can inflate the
+        score. Cross-check with entropy_a/entropy_b and, for code, with
+        numpy_function_similarity on specific functions.
+
+        See also: numpy_function_similarity (per-function), lief_rich_header
+        (compiler fingerprint), lief_compare_to_idb (packed image vs source).
+
+        Profile: analysis
+        """
+        try:
+            pa = file_a or (idaapi.get_input_file_path() or "")
+            pb = file_b or (idaapi.get_input_file_path() or "")
+            if not pa or not pb:
+                return {"ok": False, "error": "Need two file paths (or an active IDB source file)."}
+            for p in (pa, pb):
+                if not os.path.isfile(p):
+                    return {"ok": False, "error": f"File not found: {p}"}
+
+            m = method.lower().strip()
+            if m == "byte_histogram":
+                da, sa = _read_file_prefix(pa, _SIM_HIST_CAP)
+                db, sb = _read_file_prefix(pb, _SIM_HIST_CAP)
+                score = _cosine(_byte_hist_vec(da), _byte_hist_vec(db))
+            elif m == "byte_entropy_histogram":
+                da, sa = _read_file_prefix(pa, _SIM_ENTROPY_CAP)
+                db, sb = _read_file_prefix(pb, _SIM_ENTROPY_CAP)
+                score = _cosine(_byte_entropy_vec(da), _byte_entropy_vec(db))
+            else:
+                return {
+                    "ok": False,
+                    "error": f"Unknown method: {method!r} "
+                             "(use byte_histogram | byte_entropy_histogram).",
+                }
+
+            score = min(1.0, max(0.0, score))
+            interp = _interpret_similarity(score)
+            result: NumpyBinarySimilarityResult = {
+                "ok": True,
+                "file_a": pa,
+                "file_b": pb,
+                "method": m,
+                "score": round(score, 4),
+                "interpretation": interp,
+                "size_a": os.path.getsize(pa),
+                "size_b": os.path.getsize(pb),
+                "entropy_a": round(np_entropy(da), 4),
+                "entropy_b": round(np_entropy(db), 4),
+            }
+            if sa or sb:
+                result["sampled"] = True
+            if interp in ("identical", "very_similar"):
+                result["hint"] = (
+                    "Byte distributions are very close — likely the same family or "
+                    "a minor variant. Confirm with numpy_function_similarity on a "
+                    "couple of key functions, since packing alone can inflate this."
+                )
+            elif interp == "similar":
+                result["hint"] = "Related distributions — possibly the same toolchain or partial code reuse."
+            else:
+                result["hint"] = "Distributions differ — probably unrelated files."
+            return result
+        except ValueError as e:
+            return {"ok": False, **tool_error(e, "numpy_binary_similarity")}
+        except Exception as e:
+            return {"ok": False, **tool_error(e, "numpy_binary_similarity")}
+
+    @tool
+    @idasync
+    @tool_timeout(60.0)
+    def numpy_value_scan(
+        addr: Annotated[str, "Start address (hex or symbol) of the data region"],
+        size: Annotated[int, "Number of bytes to interpret"],
+        dtype: Annotated[
+            str,
+            "Element type: u1/u2/u4/u8 (unsigned), i1/i2/i4/i8 (signed), f4/f8 "
+            "(float). Default: u8 (64-bit — good for pointer tables).",
+        ] = "u8",
+        endian: Annotated[str, "Byte order: 'little' (default) or 'big'"] = "little",
+        max_samples: Annotated[int, "How many leading values to echo back (default: 16)"] = 16,
+    ) -> NumpyValueScanResult:
+        """Interpret a raw region as a typed array and detect its structure.
+
+        Where cstruct/construct parse *named* structs, this answers "what *is*
+        this untyped blob?" — invaluable on regions IDA has not analyzed
+        (decrypted/unpacked memory, an unknown data table). It reads the bytes as
+        an array of the chosen integer/float type and classifies it:
+
+        - **pointer_table** — most values fall inside the loaded image's address
+          range (vtables, import-resolver tables, jump tables, relocation arrays).
+        - **counter/sequence** — strictly increasing values.
+        - **constant** — all values equal (zero-fill, padding).
+        - **mixed_data** — none of the above.
+
+        Reports the value distribution, the fraction of pointer-like values, the
+        longest constant run, and a few sample values, so you can decide whether
+        to apply a pointer/struct type in IDA.
+
+        Typical use — after decrypting a packed section, check a suspicious table:
+            numpy_value_scan(addr='0x1400a0000', size=0x200, dtype='u8')
+
+        See also: find_vtable_candidates / dump_vtable (IDA-analysis-based vtable
+        detection), cstruct_parse_at_address (named-struct parsing).
+
+        Profile: analysis
+        """
+        try:
+            spec = _VALUE_DTYPES.get(dtype.lower().strip())
+            if spec is None:
+                return {
+                    "ok": False,
+                    "error": f"Unknown dtype {dtype!r} (use u1/u2/u4/u8/i1/i2/i4/i8/f4/f8).",
+                }
+            code, itemsize, is_int = spec
+            prefix = "<" if endian.lower().startswith("l") else ">"
+
+            ea, data, _trunc = _read_region(addr, size)
+            usable = (len(data) // itemsize) * itemsize
+            if usable < itemsize:
+                return {"ok": False, "error": f"Region smaller than one {dtype} element."}
+            arr = np.frombuffer(data[:usable], dtype=prefix + code)
+            count = int(arr.size)
+
+            uniq = np.unique(arr)
+            zero_ratio = float(np.count_nonzero(arr == 0) / count)
+            longest_const = _longest_run_len(arr)
+
+            classification = "mixed_data"
+            pointer_ratio = 0.0
+            ptr_range: list[str] = []
+            is_monotonic = False
+
+            if is_int:
+                min_ea, max_ea = _image_ea_range()
+                ptr_range = [hex(min_ea), hex(max_ea)]
+                as_u = arr.astype(np.uint64, copy=False) if "u" in code else arr.astype(np.int64).astype(np.uint64, copy=False)
+                in_range = int(np.count_nonzero((as_u >= min_ea) & (as_u < max_ea)))
+                pointer_ratio = round(in_range / count, 4)
+                if count >= 2:
+                    is_monotonic = bool(np.all(np.diff(arr.astype(np.int64)) > 0))
+
+                if uniq.size == 1:
+                    classification = "constant"
+                elif itemsize in (4, 8) and pointer_ratio >= 0.6:
+                    classification = "pointer_table"
+                elif is_monotonic:
+                    classification = "counter_or_sequence"
+                elif zero_ratio > 0.8:
+                    classification = "mostly_zero_padding"
+            else:
+                if uniq.size == 1:
+                    classification = "constant"
+
+            def _fmt(v) -> str:
+                return hex(int(v)) if is_int else repr(float(v))
+
+            result: NumpyValueScanResult = {
+                "ok": True,
+                "addr": hex(ea),
+                "dtype": dtype,
+                "endian": "little" if prefix == "<" else "big",
+                "value_count": count,
+                "bytes_analyzed": usable,
+                "unique_values": int(uniq.size),
+                "zero_ratio": round(zero_ratio, 4),
+                "min_value": _fmt(arr.min()),
+                "max_value": _fmt(arr.max()),
+                "classification": classification,
+                "is_monotonic_increasing": is_monotonic,
+                "longest_constant_run": longest_const,
+                "sample_values": [_fmt(v) for v in arr[:max(1, max_samples)].tolist()],
+            }
+            if is_int:
+                result["pointer_candidate_ratio"] = pointer_ratio
+                result["pointer_target_image_range"] = ptr_range
+
+            if classification == "pointer_table":
+                result["interpretation"] = (
+                    f"{int(pointer_ratio * 100)}% of {dtype} values point into the "
+                    "image — likely a pointer/vtable/jump table. Consider applying a "
+                    "pointer-array type in IDA, or dump_vtable if it is a vtable."
+                )
+                result["hint"] = "Cross-check with find_vtable_candidates / dump_vtable."
+            elif classification == "counter_or_sequence":
+                result["interpretation"] = "Strictly increasing values — an index/offset table or counter."
+                result["hint"] = "Could be an RVA table or sorted key array."
+            elif classification == "constant":
+                result["interpretation"] = f"All values equal ({_fmt(arr[0])}) — zero-fill or padding."
+                result["hint"] = "Likely uninitialized/aligned space; skip."
+            elif classification == "mostly_zero_padding":
+                result["interpretation"] = f"Mostly zero ({int(zero_ratio * 100)}%) — sparse table or padding."
+                result["hint"] = "Sparse data; inspect the non-zero entries."
+            else:
+                result["interpretation"] = (
+                    f"No strong structure as {dtype}. Try a different dtype/endian, "
+                    "or numpy_byte_histogram to characterize it."
+                )
+                result["hint"] = "If this looks like code, use disasm instead."
+            return result
+        except ValueError as e:
+            return {"ok": False, **tool_error(e, f"numpy_value_scan at {addr}")}
+        except Exception as e:
+            return {"ok": False, **tool_error(e, f"numpy_value_scan at {addr}")}
