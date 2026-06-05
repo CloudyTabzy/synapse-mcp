@@ -121,6 +121,35 @@ def test_elf_dwarf_functions_result_shape():
     assert isinstance(result.get("functions"), list)
 
 
+@test(binary="typed_fixture.elf")
+def test_elf_dwarf_functions_recover_real_types():
+    """Regression guard: DWARF type resolution must produce real type names,
+    not 'void' for everything (the get_DIE_from_attribute API bug). The typed
+    fixture has hundreds of subprograms with pointer/struct parameters."""
+    _require_elf()
+    result = elf_dwarf_functions(limit=0)
+    if not result.get("has_dwarf"):
+        skip_test("fixture has no DWARF info")
+    funcs = result.get("functions") or []
+    if not funcs:
+        skip_test("fixture has no DWARF subprograms with low_pc")
+    # At least one function must carry a concrete (non-void) type somewhere —
+    # a return type or a parameter type. If every type is 'void', the type
+    # resolver is broken.
+    concrete = False
+    for fn in funcs:
+        if fn.get("return_type") not in ("void", "", None):
+            concrete = True
+            break
+        for p in fn.get("params", []):
+            if p.get("ty") not in ("void", "", None):
+                concrete = True
+                break
+        if concrete:
+            break
+    assert concrete, "all DWARF types resolved to 'void' — type resolver is broken"
+
+
 @test(binary="crackme03.elf")
 def test_elf_dwarf_functions_filter():
     """filter substring works without crashing."""

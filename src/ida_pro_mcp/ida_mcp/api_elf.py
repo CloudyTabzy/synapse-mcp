@@ -208,10 +208,13 @@ class ElfSyncDwarfResult(TypedDict, total=False):
     has_dwarf: bool
     proposed_count: int
     applied_count: int
+    applied_types_count: int
     skipped_count: int
     not_found_count: int
+    rebase_delta: str
     changes: list[ElfSyncChange]
     dry_run: bool
+    note: str
     error: str
     error_type: str
 
@@ -906,9 +909,32 @@ if ELFTOOLS_AVAILABLE:
                     }
 
                 dwarf = elffile.get_dwarf_info()
+
+                # DWARF low_pc is a link-time address. Map it to the IDA
+                # effective address: ida_ea = dw_low - elf_link_base + ida_base.
+                # For non-PIE (ET_EXEC) the delta is 0; for PIE (ET_DYN, the
+                # modern Linux default) IDA rebases and the delta is non-zero.
+                elf_link_base = 0
+                try:
+                    loads = [seg["p_vaddr"] for seg in elffile.iter_segments()
+                             if seg["p_type"] == "PT_LOAD"]
+                    if loads:
+                        elf_link_base = min(loads)
+                except Exception:
+                    pass
+                try:
+                    ida_base = idaapi.get_imagebase()
+                except Exception:
+                    ida_base = elf_link_base
+                rebase_delta = ida_base - elf_link_base
+
+                do_names = apply in ("names", "both")
+                do_types = apply in ("types", "both")
+
                 changes: list[ElfSyncChange] = []
                 proposed = 0
                 applied = 0
+                applied_types = 0
                 skipped = 0
                 not_found = 0
 
@@ -926,7 +952,7 @@ if ELFTOOLS_AVAILABLE:
                         dw_low = die.attributes["DW_AT_low_pc"].value
 
                         proposed += 1
-                        ida_ea = dw_low
+                        ida_ea = dw_low + rebase_delta
 
                         func = idaapi.get_func(ida_ea)
                         if func is None:
@@ -954,28 +980,58 @@ if ELFTOOLS_AVAILABLE:
                             "kind": "function",
                         })
 
-                        if is_auto and not dry_run:
-                            try:
-                                if apply in ("names", "both"):
-                                    idc.set_name(fa, new_name, idc.SN_NOWARN)
+                        # --- name application (only auto-generated names) ---
+                        if is_auto and do_names:
+                            if dry_run:
                                 applied += 1
-                            except Exception:
-                                skipped += 1
-                        elif is_auto and dry_run:
-                            applied += 1
-                        else:
+                            else:
+                                try:
+                                    idc.set_name(fa, new_name, idc.SN_NOWARN)
+                                    applied += 1
+                                except Exception:
+                                    skipped += 1
+                        elif not is_auto:
                             skipped += 1
 
-                return {
+                        # --- type application (best-effort flat prototype) ---
+                        if do_types:
+                            ret = _resolve_dwarf_type_name(die, dwarf)
+                            params: list[str] = []
+                            for child in die.iter_children():
+                                if child.tag == "DW_TAG_formal_parameter":
+                                    params.append(_resolve_dwarf_type_name(child, dwarf))
+                                elif child.tag == "DW_TAG_unspecified_parameters":
+                                    params.append("...")
+                            proto = f"{ret} f({', '.join(params) if params else 'void'});"
+                            if dry_run:
+                                applied_types += 1
+                            else:
+                                try:
+                                    if idc.SetType(fa, proto):
+                                        applied_types += 1
+                                except Exception:
+                                    pass
+
+                result: ElfSyncDwarfResult = {
                     "ok": True,
                     "format": "ELF",
                     "has_dwarf": True,
                     "proposed_count": proposed,
                     "applied_count": applied,
+                    "applied_types_count": applied_types,
                     "skipped_count": skipped,
                     "not_found_count": not_found,
                     "changes": changes[:200],
                     "dry_run": dry_run,
                 }
+                if rebase_delta:
+                    result["rebase_delta"] = hex(rebase_delta)
+                if do_types:
+                    result["note"] = (
+                        "Type application is best-effort: prototypes referencing "
+                        "structs/typedefs not yet defined in the IDB will be skipped. "
+                        "Names are the primary, reliable output."
+                    )
+                return result
         except Exception as e:
             return {**tool_error(e), "ok": False}
