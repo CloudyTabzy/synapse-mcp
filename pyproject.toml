@@ -43,6 +43,7 @@ unicorn  = ["unicorn>=2.1.0"]
 # NumPy: ~20 MB prebuilt wheel. Powers vectorized numerical binary analysis
 # (entropy maps, byte distribution / chi-square). Included in 'all'.
 numpy    = ["numpy>=2.0.0"]
+elf      = ["pyelftools>=0.31"]
 # TOON: server-side token-efficient encoding for large list tool responses.
 # Installed into the MCP server's Python (not IDA's Python).
 # Install: pip install toon_format  OR  uv add toon_format
@@ -56,6 +57,7 @@ all      = [
     "networkx>=3.0",
     "unicorn>=2.1.0",
     "numpy>=2.0.0",
+    "pyelftools>=0.31",
 ]
 
 [dependency-groups]
