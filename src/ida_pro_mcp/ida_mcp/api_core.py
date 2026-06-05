@@ -1440,14 +1440,17 @@ def find_regex(
     background task when the binary is classified as very_large.
     """
     if _BINARY_CLASS == "very_large":
-        from .api_tasks import task_submit as _ts
-        tid = _ts(tool_name="find_regex", arguments=dict(
-            pattern=pattern, limit=limit, offset=offset,
-            search_strings=search_strings, search_names=search_names,
-            scan_raw=scan_raw,
-        ))
-        return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
-                "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
+        from .rpc import MCP_SERVER
+        guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
+        if guard is None or not guard.active:
+            from .api_tasks import task_submit as _ts
+            tid = _ts(tool_name="find_regex", arguments=dict(
+                pattern=pattern, limit=limit, offset=offset,
+                search_strings=search_strings, search_names=search_names,
+                scan_raw=scan_raw,
+            ))
+            return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
+                    "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
 
     if limit <= 0:
         limit = 50
@@ -1638,13 +1641,16 @@ def search_text(
     background task when the binary is classified as very_large.
     """
     if _BINARY_CLASS == "very_large":
-        from .api_tasks import task_submit as _ts
-        tid = _ts(tool_name="search_text", arguments=dict(
-            pattern=pattern, limit=limit, cursor=cursor, regex=regex,
-            case_sensitive=case_sensitive, include=include, code_only=code_only,
-        ))
-        return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
-                "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
+        from .rpc import MCP_SERVER
+        guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
+        if guard is None or not guard.active:
+            from .api_tasks import task_submit as _ts
+            tid = _ts(tool_name="search_text", arguments=dict(
+                pattern=pattern, limit=limit, cursor=cursor, regex=regex,
+                case_sensitive=case_sensitive, include=include, code_only=code_only,
+            ))
+            return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
+                    "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
 
     if limit <= 0:
         limit = 30
