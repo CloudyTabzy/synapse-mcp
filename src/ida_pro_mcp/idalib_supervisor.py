@@ -851,6 +851,8 @@ class IdalibSupervisor:
             backend="worker",
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
+            stdin=worker.stdin,
+            stdout=worker.stdout,
         )
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
