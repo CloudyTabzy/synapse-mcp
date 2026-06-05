@@ -5,6 +5,7 @@ Each session represents an opened binary with its own IDA database instance.
 """
 
 import uuid
+import os
 import threading
 import logging
 from pathlib import Path
@@ -281,8 +282,31 @@ class IDASessionManager:
             idapro.close_database()
             self._active_session_id = None
 
-        if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
-            raise RuntimeError(f"Failed to open database: {input_path}")
+        file_size_mb = 0.0
+        try:
+            file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        except OSError:
+            pass
+
+        logger.info("Opening database: %s (%.1f MB)", input_path, file_size_mb)
+        try:
+            err = idapro.open_database(input_path, run_auto_analysis=run_auto_analysis)
+        except Exception as e:
+            logger.exception("ida.open_database() raised exception for %s (%.1f MB)", input_path, file_size_mb)
+            raise RuntimeError(
+                f"IDA open_database() crashed for {input_path} ({file_size_mb:.0f} MB). "
+                f"Exception: {type(e).__name__}: {e}"
+            ) from e
+        if err:
+            logger.error(
+                "ida.open_database() returned error code %d for %s (%.1f MB)",
+                err, input_path, file_size_mb,
+            )
+            raise RuntimeError(
+                f"Failed to open database: {input_path} ({file_size_mb:.0f} MB). "
+                f"IDA error code: {err}. For large binaries (>50MB) consider using "
+                f"idalib_lief_* or numpy_memmap_scan tools for metadata extraction."
+            )
 
     def _unbind_session_everywhere_locked(self, session_id: str) -> None:
         stale_contexts = [

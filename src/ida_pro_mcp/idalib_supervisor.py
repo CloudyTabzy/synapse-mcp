@@ -271,6 +271,7 @@ class IdalibSupervisor:
         self._stop_event = Event()
         self._death_watcher: Thread | None = None
         self._bootstrap_completed = False
+        self._open_tasks: dict[str, dict[str, Any]] = {}
         if _IDLE_TIMEOUT_S > 0 or True:
             self._start_death_watcher()
 
@@ -399,12 +400,16 @@ class IdalibSupervisor:
         logger.info("Spawning idalib worker (IDADIR=%s)", env.get("IDADIR", "unset"))
         log_path = self._worker_log_path()
         stderr_file = open(log_path, "w") if log_path else None
+        # CREATE_NEW_PROCESS_GROUP isolates the worker in its own process group
+        # so force-killing the worker never crashes the parent daemon.
+        _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_file or subprocess.DEVNULL,
             env=env,
+            creationflags=_CREATE_NEW_PROCESS_GROUP,
         )
         if stderr_file:
             stderr_file.close()
@@ -1149,14 +1154,104 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
-    open_timeout_sec: Annotated[Optional[float], "Timeout in seconds for opening the database (default: 120, increase for large binaries)"] = None,
-) -> IdalibOpenResult:
-    """Open a binary in its own idalib worker process and bind it to this context."""
+    open_timeout_sec: Annotated[Optional[float], "Timeout in seconds (default: 120; increase for large binaries)"] = None,
+    mode: Annotated[Optional[str], "Open mode: 'full' (default, IDA load) or 'lief-only' (static metadata, instant)"] = None,
+) -> dict:
+    """Open a binary in its own idalib worker process and bind it to this context.
+
+    For binaries >10 MB, large_file_async is set — the binary opens in a
+    background worker and a task_id is returned immediately. Poll with
+    idalib_idalib_list() to check when the session appears.
+
+    Set mode='lief-only' to bypass IDA entirely. Returns LIEF metadata
+    instantly. All idalib_lief_* tools work against the file_path.
+    """
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
+    except Exception:
+        context_id = "shared:fallback"
+
+    actual_mode = (mode or "full").lower()
+    path = Path(input_path)
+    try:
+        file_size_mb = round(path.stat().st_size / (1024 * 1024), 2)
+    except Exception:
+        file_size_mb = 0.0
+
+    # LIEF-only mode — bypass IDA entirely
+    if actual_mode == "lief-only":
+        try:
+            import lief
+            binary = lief.parse(str(path))
+            info = {
+                "format": str(binary.format).replace("FORMAT.", "").lower() if binary else "unknown",
+                "image_base": hex(binary.optional_header.imagebase) if binary and hasattr(binary, "optional_header") and binary.optional_header else None,
+                "entry_point": hex(binary.optional_header.addressof_entrypoint) if binary and hasattr(binary, "optional_header") else None,
+                "sections": [],
+            }
+            if binary:
+                for sec in binary.sections:
+                    info["sections"].append({"name": sec.name, "virtual_size": sec.virtual_size, "entropy": round(sec.entropy, 2)})
+        except Exception:
+            info = {"format": "unknown", "note": "LIEF parse failed"}
+        return {
+            "success": True,
+            **sup.context_fields(context_id),
+            "mode": "lief-only",
+            "file_path": str(path),
+            "size_mb": file_size_mb,
+            "lief_metadata": info,
+            "message": f"LIEF-only session for {path.name} ({file_size_mb} MB). Use idalib_lief_* tools with file_path=...",
+        }
+
+    # Large file — async open with task tracking
+    _LARGE_FILE_THRESHOLD_MB = 10.0
+    if file_size_mb > _LARGE_FILE_THRESHOLD_MB:
+        task_id = f"open_{uuid.uuid4().hex[:8]}"
+        sup._open_tasks[task_id] = {
+            "status": "loading",
+            "file_path": str(path),
+            "size_mb": file_size_mb,
+            "started_at": time.time(),
+        }
+
+        def _open_worker_thread():
+            try:
+                session = sup.open_session(
+                    str(path),
+                    run_auto_analysis=run_auto_analysis,
+                    session_id=session_id,
+                    context_id=context_id,
+                    open_timeout=open_timeout_sec,
+                )
+                sup._open_tasks[task_id] = {
+                    "status": "done",
+                    "session_id": session.session_id,
+                    "filename": session.filename,
+                }
+            except Exception as exc:
+                sup._open_tasks[task_id] = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+
+        Thread(target=_open_worker_thread, daemon=True, name=f"open-{task_id}").start()
+        return {
+            "success": True,
+            "status": "loading",
+            "task_id": task_id,
+            "size_mb": file_size_mb,
+            "estimated_sec": min(file_size_mb * 2, 600),
+            **sup.context_fields(context_id),
+            "message": f"Large binary ({file_size_mb} MB) — opening in background. Poll with idalib_idalib_list() or check idalib_task_poll('{task_id}')",
+        }
+
+    # Small file — synchronous open
+    try:
         session = sup.open_session(
-            input_path,
+            str(path),
             run_auto_analysis=run_auto_analysis,
             session_id=session_id,
             context_id=context_id,
@@ -1170,8 +1265,7 @@ def idalib_open(
         }
     except Exception as e:
         try:
-            ctx = sup.resolve_context_id()
-            return {"error": str(e), **sup.context_fields(ctx)}
+            return {"error": str(e), **sup.context_fields(context_id)}
         except Exception:
             return {"error": str(e)}
 
@@ -1558,6 +1652,12 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     if tool_name in IDALIB_MANAGEMENT_TOOLS:
         return _original_dispatch(request_obj)
+    # Open tasks: check supervisor's _open_tasks before routing to worker
+    if tool_name == "idalib_task_poll":
+        task_id = (params.get("arguments") or {}).get("task_id", "")
+        if task_id.startswith("open_") and task_id in sup._open_tasks:
+            task_info = sup._open_tasks[task_id]
+            return _jsonrpc_result(request_id, _call_tool_result(task_info))
     if tool_name in IDALIB_HIDDEN_PLUGIN_TOOLS:
         return _jsonrpc_result(
             request_id,
