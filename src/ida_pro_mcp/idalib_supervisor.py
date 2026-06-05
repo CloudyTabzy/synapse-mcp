@@ -1179,29 +1179,45 @@ def idalib_open(
     except Exception:
         file_size_mb = 0.0
 
-    # LIEF-only mode — bypass IDA entirely
+    # LIEF-only mode — return metadata + register lightweight session
     if actual_mode == "lief-only":
+        info: dict[str, Any] = {"format": "unknown", "sections": []}
         try:
             import lief
             binary = lief.parse(str(path))
-            info = {
-                "format": str(binary.format).replace("FORMAT.", "").lower() if binary else "unknown",
-                "image_base": hex(binary.optional_header.imagebase) if binary and hasattr(binary, "optional_header") and binary.optional_header else None,
-                "entry_point": hex(binary.optional_header.addressof_entrypoint) if binary and hasattr(binary, "optional_header") else None,
-                "sections": [],
-            }
             if binary:
+                info["format"] = str(binary.format).replace("FORMAT.", "").lower()
+                if hasattr(binary, "optional_header") and binary.optional_header:
+                    info["image_base"] = hex(binary.optional_header.imagebase)
+                    info["entry_point"] = hex(binary.optional_header.addressof_entrypoint)
                 for sec in binary.sections:
                     info["sections"].append({"name": sec.name, "virtual_size": sec.virtual_size, "entropy": round(sec.entropy, 2)})
         except Exception:
-            info = {"format": "unknown", "note": "LIEF parse failed"}
+            pass
+        if session_id is None:
+            session_id = str(uuid.uuid4())[:8]
+        # Create a lightweight worker session backed by the schema worker
+        worker = sup._schema_or_idle_worker()
+        if worker is not None:
+            lief_session = WorkerSession(
+                session_id=session_id,
+                input_path=str(path),
+                filename=path.name,
+                metadata={"mode": "lief-only", "lief_metadata": info},
+                host=worker.host, port=worker.port,
+                process=worker.process, backend="worker",
+                owned=worker.owned, pid=worker.pid,
+                stdin=worker.stdin, stdout=worker.stdout,
+            )
+            with sup._lock:
+                sup.sessions[session_id] = lief_session
+                sup.path_to_session[sup._path_key(str(path))] = session_id
+                if context_id:
+                    sup.bind_context(context_id, session_id)
         return {
-            "success": True,
-            **sup.context_fields(context_id),
-            "mode": "lief-only",
-            "file_path": str(path),
-            "size_mb": file_size_mb,
-            "lief_metadata": info,
+            "success": True, **sup.context_fields(context_id),
+            "session": {"session_id": session_id, "filename": path.name, "mode": "lief-only"},
+            "size_mb": file_size_mb, "lief_metadata": info,
             "message": f"LIEF-only session for {path.name} ({file_size_mb} MB). Use idalib_lief_* tools with file_path=...",
         }
 
