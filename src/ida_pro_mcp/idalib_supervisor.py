@@ -842,6 +842,7 @@ class IdalibSupervisor:
         session_id: str | None = None,
         context_id: str | None = None,
         open_timeout: float | None = None,
+        processor: str | None = None,
     ) -> WorkerSession:
         resolved = self._normalize_input_path(input_path)
         requested_session_id = session_id
@@ -881,14 +882,17 @@ class IdalibSupervisor:
             worker = self._allocate_worker_locked()
 
         try:
+            open_args = {
+                "input_path": resolved,
+                "run_auto_analysis": run_auto_analysis,
+                "session_id": session_id,
+            }
+            if processor:
+                open_args["processor"] = processor
             opened = self.call_worker_tool(
                 worker,
                 "idalib_open",
-                {
-                    "input_path": resolved,
-                    "run_auto_analysis": run_auto_analysis,
-                    "session_id": session_id,
-                },
+                open_args,
                 tool_timeout=open_timeout,
             )
             if isinstance(opened, dict) and opened.get("error"):
@@ -1205,6 +1209,7 @@ def idalib_open(
     ] = None,
     open_timeout_sec: Annotated[Optional[float], "Timeout in seconds (default: 120; increase for large binaries)"] = None,
     mode: Annotated[Optional[str], "Open mode: 'full' (default, IDA load) or 'lief-only' (static metadata, instant)"] = None,
+    processor: Annotated[Optional[str], "IDA processor module short name (e.g. 'mipsr5900l', 'ppcvle', 'sh4l', 'tricore'). Auto-detected if omitted."] = None,
 ) -> dict:
     """Open a binary in its own idalib worker process and bind it to this context.
 
@@ -1222,7 +1227,34 @@ def idalib_open(
     For binaries >10 MB, the open runs in a background thread and a
     task_id is returned immediately. Poll with idalib_task_poll(task_id).
     Use idalib_cancel_task(task_id) to abort a long-running open.
+
+    PROCESSOR MODULES (use 'processor' param for raw binaries or when
+    auto-detection fails):
+    - x86/x64     : metapc (auto-detected for PE/ELF)
+    - ARM LE      : arm, aarch64
+    - ARM BE      : armb
+    - MIPS LE     : mipsl, mipsr5900l (PS2)
+    - MIPS BE     : mipsb
+    - PowerPC     : ppc, ppcvle (Wii/automotive)
+    - SuperH      : sh4l (Dreamcast)
+    - TriCore     : tricore (car ECUs)
+    - m68k        : m68k (Genesis/Amiga)
+    - 6502        : 6502 (NES/Atari)
+    - Z80         : z80 (Game Boy)
+    - Xtensa      : xtensa (ESP8266/ESP32)
+    - AVR         : avr (Arduino)
+    - RISC-V      : riscv, riscv64
+    - Hexagon     : hexagon (Qualcomm)
+    - SPU         : spu (PS3 Cell)
+    - V850/RH850  : v850, rh850 (Renesas auto)
+    - STM8        : stm8
+    - MSP430      : msp430
+    - TMS320C6    : tms320c6
+    - 8051        : i51
+    - Dalvik      : dalvik
+    - WebAssembly : wasm
     """
+
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
@@ -1306,6 +1338,7 @@ def idalib_open(
                     session_id=session_id,
                     context_id=context_id,
                     open_timeout=open_timeout_sec,
+                    processor=processor,
                 )
                 sup._open_tasks[task_id] = {
                     "status": "done",
@@ -1358,6 +1391,7 @@ def idalib_open(
             session_id=session_id,
             context_id=context_id,
             open_timeout=open_timeout_sec,
+            processor=processor,
         )
         return {
             "success": True,

@@ -3097,38 +3097,63 @@ if LIEF_AVAILABLE:
                 }
 
             rm = getattr(binary, "resources_manager", None)
-            if rm is None:
-                return {"ok": True, "format": fmt, "has_version_info": False, "strings": {}, "lang_codes": [], "anomalies": []}
-
-            rv = getattr(rm, "version", None)
+            rv = getattr(rm, "version", None) if rm is not None else None
             if rv is None:
                 return {"ok": True, "format": fmt, "has_version_info": False, "strings": {}, "lang_codes": [], "anomalies": []}
 
-            fixed = {}
-            if rv.has_fixed_file_info():
-                try:
-                    fixed = _decode_fixed_version(rv.fixed_file_info)
-                except Exception:
-                    pass
+            # LIEF 0.17 returns a *list* of ResourceVersion; older versions
+            # returned a single object. Normalize so the extraction handles both.
+            versions = rv if isinstance(rv, list) else [rv]
 
+            fixed: dict = {}
             strings: dict = {}
             lang_codes: list[str] = []
-            try:
-                sfi = rv.string_file_info
-                if sfi is not None:
-                    for lc in sfi.langcode_items:
-                        lang_codes.append(f"{lc.lang}-{lc.code_page}")
-                        for key, val in lc.items.items():
-                            strings.setdefault(key, str(val))
-            except Exception:
-                pass
+            for v in versions:
+                # --- fixed file info (VS_FIXEDFILEINFO) ---
+                if not fixed:
+                    ffi = getattr(v, "file_info", None)  # 0.17 name
+                    if ffi is None:
+                        # older API: has_fixed_file_info() + fixed_file_info
+                        try:
+                            checker = getattr(v, "has_fixed_file_info", None)
+                            if checker is None or checker():
+                                ffi = getattr(v, "fixed_file_info", None)
+                        except Exception:
+                            ffi = None
+                    if ffi is not None:
+                        fixed = _decode_fixed_version(ffi)
+
+                # --- string file info (CompanyName, OriginalFilename, ...) ---
+                sfi = getattr(v, "string_file_info", None)
+                if sfi is None:
+                    continue
+                children = getattr(sfi, "children", None)  # 0.17: ResourceStringTable list
+                if children is not None:
+                    for ch in children:
+                        k = getattr(ch, "key", None)
+                        if k:
+                            lang_codes.append(str(k))
+                        for e in getattr(ch, "entries", []) or []:
+                            ek = getattr(e, "key", None)
+                            ev = getattr(e, "value", None)
+                            if ek:
+                                strings.setdefault(str(ek), "" if ev is None else str(ev))
+                else:
+                    # older API: langcode_items[].items (dict)
+                    for lc in getattr(sfi, "langcode_items", []) or []:
+                        lang_codes.append(f"{getattr(lc, 'lang', '')}-{getattr(lc, 'code_page', '')}")
+                        try:
+                            for kk, vv in getattr(lc, "items", {}).items():
+                                strings.setdefault(str(kk), str(vv))
+                        except Exception:
+                            pass
 
             anomalies = _version_anomalies(strings, path)
 
             return {
                 "ok": True,
                 "format": fmt,
-                "has_version_info": True,
+                "has_version_info": bool(strings or fixed),
                 "fixed": fixed,
                 "strings": strings,
                 "lang_codes": lang_codes,
@@ -3207,9 +3232,7 @@ if LIEF_AVAILABLE:
                         req_level = "requireAdministrator"
                     elif "highestavailable" in ml:
                         req_level = "highestAvailable"
-                    elif "asInvoker" not in ml and "asinvoker" not in ml and "invoker" in ml:
-                        req_level = "asInvoker"
-                    if "asinvoker" in ml:
+                    elif "asinvoker" in ml:
                         req_level = "asInvoker"
             except Exception:
                 pass
@@ -3320,22 +3343,27 @@ if LIEF_AVAILABLE:
                 if hasattr(de, "filename"):
                     pdb_path = str(de.filename)
                     cn = de
-                    if hasattr(cn, "signature"):
+                    # Prefer the canonical GUID string ("xxxxxxxx-xxxx-...") over the
+                    # raw CodeView signature bytes.
+                    if getattr(cn, "guid", None):
+                        pdb_guid = str(cn.guid)
+                    elif hasattr(cn, "signature"):
                         sig = cn.signature
-                        sig_str = "-".join(f"{b:02X}" for b in sig) if isinstance(sig, (list, bytes)) else str(sig)
-                        pdb_guid = sig_str
-                    if hasattr(cn, "guid"):
-                        g = cn.guid
-                        g_str = "-".join(f"{b:02X}" for b in g) if isinstance(g, (list, bytes)) else str(g)
-                        pdb_guid = pdb_guid or g_str
+                        pdb_guid = (
+                            "".join(f"{b:02x}" for b in sig)
+                            if isinstance(sig, (list, bytes, bytearray))
+                            else str(sig)
+                        )
                     if hasattr(cn, "age"):
                         try:
                             pdb_age = int(cn.age)
                         except (TypeError, ValueError):
                             pass
 
+                    # Microsoft symbol-server key: GUID (no dashes, upper) + age (hex, no pad).
                     if pdb_guid and pdb_age is not None:
-                        sym_key = f"{pdb_guid}{pdb_age:X}"
+                        guid_key = pdb_guid.replace("-", "").upper()
+                        sym_key = f"{guid_key}{pdb_age:x}"
 
                     if pdb_path:
                         path_lower = pdb_path.lower()
@@ -3407,7 +3435,12 @@ if LIEF_AVAILABLE:
             if lc is None:
                 return {"ok": True, "format": fmt, "has_load_config": False}
 
-            ver = getattr(lc, "version", 0) or 0
+            # LoadConfig struct version (LIEF exposes major/minor, not a single 'version')
+            ver = 0
+            try:
+                ver = int(getattr(lc, "major_version", 0) or 0)
+            except Exception:
+                pass
 
             cookie: str | None = None
             try:
@@ -3419,7 +3452,13 @@ if LIEF_AVAILABLE:
 
             seh = 0
             try:
-                seh = int(getattr(lc, "number_of_se_handler_table_entries", 0) or 0)
+                # 0.17 attr is se_handler_count; older builds used the long name.
+                seh = int(
+                    getattr(lc, "se_handler_count", None)
+                    if getattr(lc, "se_handler_count", None) is not None
+                    else getattr(lc, "number_of_se_handler_table_entries", 0)
+                    or 0
+                )
             except Exception:
                 pass
 
@@ -3435,45 +3474,39 @@ if LIEF_AVAILABLE:
             except Exception:
                 pass
 
+            # Prefer LIEF's own decoded flag list (correct across versions);
+            # fall back to a manual decode with the *correct* IMAGE_GUARD bit
+            # values only if the decoded list is unavailable.
             guard_flags: list[str] = []
             try:
-                gf = getattr(lc, "guard_flags", None)
-                if gf is not None:
-                    raw = int(gf)
-                    if raw & 0x100:
-                        guard_flags.append("CF_INSTRUMENTED")
-                    if raw & 0x200:
-                        guard_flags.append("CFW_INSTRUMENTED")
-                    if raw & 0x400:
-                        guard_flags.append("CF_FUNCTION_TABLE_PRESENT")
-                    if raw & 0x800:
-                        guard_flags.append("CFW_FUNCTION_TABLE_PRESENT")
-                    if raw & 0x1000:
-                        guard_flags.append("CF_LONGJUMP_TABLE_PRESENT")
-                    if raw & 0x2000:
-                        guard_flags.append("CFW_LONGJUMP_TABLE_PRESENT")
-                    if raw & 0x10000:
-                        guard_flags.append("CF_EXPORT_SUPPRESSION_INFO_PRESENT")
-                    if raw & 0x20000:
-                        guard_flags.append("CET_SHADOW_STACK_PRESENT")
-                    if raw & 0x40000:
-                        guard_flags.append("RFG_PRESENT")
-                    if raw & 0x80000:
-                        guard_flags.append("CF_ENABLE_EXCEPTION_SUPPRESSION")
-                    if raw & 0x100000:
-                        guard_flags.append("EH_CONTINUATION_TABLE_PRESENT")
-                    if raw & 0x200000:
-                        guard_flags.append("MEMORY_VALIDATION_PRESENT")
-                    if raw & 0x400000:
-                        guard_flags.append("CFG_FAST_FAIL")
+                decoded = getattr(lc, "guard_cf_flags_list", None)
+                if decoded:
+                    guard_flags = [str(f).split(".")[-1] for f in decoded]
+                else:
+                    raw = int(getattr(lc, "guard_flags", 0) or 0)
+                    _IMAGE_GUARD_BITS = [
+                        (0x00000100, "CF_INSTRUMENTED"),
+                        (0x00000200, "CFW_INSTRUMENTED"),
+                        (0x00000400, "CF_FUNCTION_TABLE_PRESENT"),
+                        (0x00000800, "SECURITY_COOKIE_UNUSED"),
+                        (0x00001000, "PROTECT_DELAYLOAD_IAT"),
+                        (0x00002000, "DELAYLOAD_IAT_IN_ITS_OWN_SECTION"),
+                        (0x00004000, "CF_EXPORT_SUPPRESSION_INFO_PRESENT"),
+                        (0x00008000, "CF_ENABLE_EXPORT_SUPPRESSION"),
+                        (0x00010000, "CF_LONGJUMP_TABLE_PRESENT"),
+                        (0x00020000, "RF_INSTRUMENTED"),
+                        (0x00040000, "RF_ENABLE"),
+                        (0x00080000, "RF_STRICT"),
+                        (0x00400000, "EH_CONTINUATION_TABLE_PRESENT"),
+                        (0x00800000, "XFG_ENABLED"),
+                        (0x04000000, "CASTGUARD_PRESENT"),
+                    ]
+                    guard_flags = [name for bit, name in _IMAGE_GUARD_BITS if raw & bit]
             except Exception:
                 pass
 
-            cast_guard = False
-            try:
-                cast_guard = bool(getattr(lc, "cast_guard_present", False))
-            except Exception:
-                pass
+            # CastGuard has no dedicated LIEF attribute; detect it from the flags.
+            cast_guard = any("CASTGUARD" in f for f in guard_flags)
 
             return {
                 "ok": True,

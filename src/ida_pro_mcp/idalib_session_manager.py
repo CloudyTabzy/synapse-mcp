@@ -65,6 +65,7 @@ class IDASessionManager:
         input_path: Path | str,
         run_auto_analysis: bool = True,
         session_id: Optional[str] = None,
+        processor: Optional[str] = None,
     ) -> str:
         """Open a binary file and create a new session
 
@@ -101,7 +102,7 @@ class IDASessionManager:
 
             # Open the database
             logger.info(f"Opening database: {input_path} (session: {session_id})")
-            idb_path = self._activate_database_path(str(input_path), run_auto_analysis)
+            idb_path = self._activate_database_path(str(input_path), run_auto_analysis, processor=processor)
 
             # Create session object
             session = IDASession(
@@ -343,7 +344,7 @@ class IDASessionManager:
                 except OSError:
                     pass
 
-    def _activate_database_path(self, input_path: str, run_auto_analysis: bool) -> str:
+    def _activate_database_path(self, input_path: str, run_auto_analysis: bool, processor: Optional[str] = None) -> str:
         if self._active_session_id is not None:
             logger.debug("Closing active database before opening %s", input_path)
             idapro.close_database()
@@ -360,7 +361,10 @@ class IDASessionManager:
 
         # -o: redirect IDB output to writable path
         # -Opdb:off: disable PDB symbol loading (prevents headless hang on missing PDBs)
+        # -p<proc>: specify processor module for raw binaries or when auto-detection fails
         args = f'-o"{idb_path}" -Opdb:off'
+        if processor:
+            args += f' -p{processor}'
 
         logger.info(
             "Opening database: %s (%.1f MB) -> IDB: %s",

@@ -220,6 +220,7 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    processor: Annotated[Optional[str], "IDA processor module short name (e.g. 'mipsr5900l', 'ppcvle')"] = None,
 ) -> IdalibOpenResult:
     """Open a binary and bind it to the active idalib context policy."""
 
@@ -227,7 +228,7 @@ def idalib_open(
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
         opened_session_id = manager.open_binary(
-            Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id
+            Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id, processor=processor
         )
         session = manager.bind_context(context_id, opened_session_id, activate=True)
         return {

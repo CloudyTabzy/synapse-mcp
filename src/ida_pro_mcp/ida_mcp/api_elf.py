@@ -352,22 +352,55 @@ if ELFTOOLS_AVAILABLE:
     # E.2 — elf_dwarf_functions
     # -------------------------------------------------------------------
 
-    def _resolve_dwarf_type_name(die, dwarf) -> str:
-        """Follow a DW_AT_type reference to a readable type name."""
+    def _resolve_dwarf_type_name(die, dwarf, _depth: int = 0) -> str:
+        """Follow the DW_AT_type chain to a readable C-style type name.
+
+        Resolves pointer / const / volatile / array / typedef wrappers
+        recursively so a parameter shows e.g. ``const char *`` rather than the
+        bare tag ``pointer``. Falls back to ``void`` on any error.
+        """
+        if _depth > 12:
+            return "..."
         try:
-            attr = die.attributes.get("DW_AT_type")
-            if attr is None:
+            if "DW_AT_type" not in die.attributes:
                 return "void"
-            type_offset = attr.value + attr.cu.cu_offset if hasattr(attr, "cu") else attr.value
-            target = dwarf.get_DIE_from_attribute(attr, die.cu)
+            # pyelftools resolves a type reference via the DIE itself
+            # (die.get_DIE_from_attribute), not via DWARFInfo.
+            target = die.get_DIE_from_attribute("DW_AT_type")
             if target is None:
                 return "void"
             tag = target.tag
-            if "DW_AT_name" in target.attributes:
-                nm = target.attributes["DW_AT_name"].value
-                name_str = nm.decode("utf-8", errors="replace") if isinstance(nm, bytes) else str(nm)
-                return name_str if name_str else str(tag or "void")
-            return str(tag).split("_")[-1].lower() if tag else "void"
+
+            # Named leaf types: return the name (with a struct/union/enum prefix).
+            if tag in ("DW_TAG_base_type", "DW_TAG_typedef", "DW_TAG_structure_type",
+                       "DW_TAG_union_type", "DW_TAG_enumeration_type", "DW_TAG_class_type"):
+                nm = target.attributes.get("DW_AT_name")
+                prefix = {
+                    "DW_TAG_structure_type": "struct ",
+                    "DW_TAG_union_type": "union ",
+                    "DW_TAG_enumeration_type": "enum ",
+                }.get(tag, "")
+                if nm is not None:
+                    val = nm.value
+                    s = val.decode("utf-8", errors="replace") if isinstance(val, bytes) else str(val)
+                    if s:
+                        return prefix + s
+                return (prefix + "<anon>") if prefix else "void"
+
+            # Type wrappers — recurse into the referenced type.
+            if tag == "DW_TAG_pointer_type":
+                return _resolve_dwarf_type_name(target, dwarf, _depth + 1) + " *"
+            if tag == "DW_TAG_const_type":
+                return "const " + _resolve_dwarf_type_name(target, dwarf, _depth + 1)
+            if tag == "DW_TAG_volatile_type":
+                return "volatile " + _resolve_dwarf_type_name(target, dwarf, _depth + 1)
+            if tag == "DW_TAG_array_type":
+                return _resolve_dwarf_type_name(target, dwarf, _depth + 1) + "[]"
+
+            # Unknown wrapper with a further type reference — keep following it.
+            if "DW_AT_type" in target.attributes:
+                return _resolve_dwarf_type_name(target, dwarf, _depth + 1)
+            return str(tag).replace("DW_TAG_", "").replace("_type", "")
         except Exception:
             return "void"
 
