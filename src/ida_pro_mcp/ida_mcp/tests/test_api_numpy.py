@@ -15,6 +15,8 @@ try:
             numpy_byte_histogram,
             numpy_xor_key_recovery,
             numpy_function_similarity,
+            numpy_opcode_histogram,
+            numpy_memmap_scan,
         )
 except ImportError:
     NUMPY_AVAILABLE = False
@@ -332,3 +334,131 @@ def test_function_similarity_bad_method():
     result = numpy_function_similarity(hex(funcs[0]), hex(funcs[0]), method="bogus")
     assert result.get("ok") is False
     assert "method" in result.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# numpy_entropy_map column stats (D.3)
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_entropy_map_column_stats():
+    """include_column_stats returns per-offset variance summary."""
+    _require_numpy()
+    addr, size = _first_code_region(4096)
+    result = numpy_entropy_map(addr, size, block_size=256, include_column_stats=True)
+    assert result.get("ok") is True, result
+    cs = result.get("column_stats")
+    assert cs is not None, "column_stats missing"
+    assert "full_blocks" in cs
+    if cs.get("full_blocks", 0) >= 2:
+        assert 0 <= cs["near_constant_columns"] <= 256
+        assert cs["mean_column_variance"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# numpy_opcode_histogram
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_opcode_histogram_function():
+    """opcode_histogram profiles a real function with ratios + entropy."""
+    _require_numpy()
+    funcs = _two_functions(64)
+    if not funcs:
+        skip_test("no function >= 64 bytes")
+    result = numpy_opcode_histogram(hex(funcs[0]))
+    assert result.get("ok") is True, result
+    assert result["instruction_count"] >= 1
+    assert result["unique_mnemonics"] >= 1
+    assert result["distribution_entropy"] >= 0.0
+    assert result["mode"] == "function"
+    ratios = result["ratios"]
+    for key in ("branch", "call", "ret", "arith", "data_move", "stack", "nop"):
+        assert 0.0 <= ratios[key] <= 1.0
+    assert result["top_mnemonics"], "top_mnemonics should be non-empty"
+    assert result["top_mnemonics"][0]["count"] >= 1
+
+
+@test()
+def test_opcode_histogram_no_function_needs_size():
+    """Without a function and without size, a clear error is returned."""
+    _require_numpy()
+    # An address unlikely to be inside a defined function; if it happens to be,
+    # the call still succeeds — only assert the error branch when applicable.
+    result = numpy_opcode_histogram("0xffffffffff000000")
+    assert result.get("ok") is False
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# numpy_memmap_scan — exercised against the fixture file on disk
+# ---------------------------------------------------------------------------
+
+
+def _fixture_path():
+    import ida_nalt
+    p = ida_nalt.get_input_file_path() or ""
+    import os
+    return p if (p and os.path.isfile(p)) else None
+
+
+@test()
+def test_memmap_scan_finds_known_bytes():
+    """An exact pattern taken from the file's own bytes is found at its offset."""
+    _require_numpy()
+    path = _fixture_path()
+    if path is None:
+        skip_test("input file not on disk")
+    with open(path, "rb") as f:
+        head = f.read(64)
+    if len(head) < 8:
+        skip_test("file too small")
+    # Build an exact pattern from bytes at file offset 4 (skip magic to reduce
+    # accidental multiple matches) and confirm offset 4 is among the hits.
+    sample = head[4:10]
+    pattern = " ".join(f"{b:02x}" for b in sample)
+    result = numpy_memmap_scan(path, pattern, max_results=50)
+    assert result.get("ok") is True, result
+    offsets = [m["file_offset"] for m in result["matches"]]
+    assert 4 in offsets, f"expected offset 4 in {offsets}"
+
+
+@test()
+def test_memmap_scan_wildcard():
+    """A wildcard pattern is accepted and matches at least the seed location."""
+    _require_numpy()
+    path = _fixture_path()
+    if path is None:
+        skip_test("input file not on disk")
+    with open(path, "rb") as f:
+        head = f.read(16)
+    if len(head) < 8:
+        skip_test("file too small")
+    # first byte, wildcard, third byte ...
+    pattern = f"{head[0]:02x} ?? {head[2]:02x} {head[3]:02x}"
+    result = numpy_memmap_scan(path, pattern, max_results=50)
+    assert result.get("ok") is True, result
+    assert 0 in [m["file_offset"] for m in result["matches"]]
+
+
+@test()
+def test_memmap_scan_all_wildcards_rejected():
+    """A pattern with no fixed bytes is rejected."""
+    _require_numpy()
+    path = _fixture_path()
+    if path is None:
+        skip_test("input file not on disk")
+    result = numpy_memmap_scan(path, "?? ?? ??")
+    assert result.get("ok") is False
+    assert "wildcard" in result.get("error", "").lower()
+
+
+@test()
+def test_memmap_scan_missing_file():
+    """A non-existent path returns a structured error."""
+    _require_numpy()
+    result = numpy_memmap_scan("/no/such/file_xyz.bin", "90 90")
+    assert result.get("ok") is False
+    assert "not found" in result.get("error", "").lower()

@@ -23,7 +23,35 @@ from ..utils import (
     extract_function_strings,
     extract_function_constants,
     handle_large_output,
+    summary_stats,
 )
+
+
+@test()
+def test_summary_stats_basic():
+    """summary_stats returns correct aggregates + outlier labels."""
+    items = [
+        {"name": "a", "v": 1.0},
+        {"name": "b", "v": 2.0},
+        {"name": "c", "v": 3.0},
+        {"name": "d", "v": 4.0},
+    ]
+    s = summary_stats(items, "v", label_field="name")
+    assert s["count"] == 4
+    assert s["mean"] == 2.5
+    assert s["median"] == 2.5
+    assert s["min"] == 1.0 and s["min_at"] == "a"
+    assert s["max"] == 4.0 and s["max_at"] == "d"
+    assert s["p25"] == 1.75 and s["p75"] == 3.25
+
+
+@test()
+def test_summary_stats_empty_and_nonnumeric():
+    """No numeric values => None; non-numeric fields are skipped."""
+    assert summary_stats([], "v") is None
+    assert summary_stats([{"name": "a", "v": None}], "v") is None
+    s = summary_stats([{"name": "a", "v": 5}, {"name": "b", "v": "x"}], "v")
+    assert s is not None and s["count"] == 1 and s["mean"] == 5.0
 
 
 @test(binary="crackme03.elf")

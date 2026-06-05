@@ -28,12 +28,17 @@ Profile: analysis
 """
 
 import logging
+import mmap
+import os
 from functools import reduce
 from math import gcd
 from typing import Annotated, TypedDict
 
 import ida_bytes
 import ida_funcs
+import ida_ua
+import idaapi
+import idautils
 
 from .rpc import tool
 from .sync import idasync, tool_timeout
@@ -90,6 +95,7 @@ class NumpyEntropyMapResult(TypedDict, total=False):
     entropy_histogram: list[int]
     summary: dict
     contiguous_high_entropy_runs: list[EntropyRun]
+    column_stats: dict
     hint: str
     error: str
     error_type: str
@@ -162,6 +168,48 @@ class NumpyFunctionSimilarityResult(TypedDict, total=False):
     interpretation: str
     bytes_a: int
     bytes_b: int
+    hint: str
+    error: str
+    error_type: str
+
+
+class MnemonicHit(TypedDict):
+    mnemonic: str
+    count: int
+    ratio: float
+
+
+class NumpyOpcodeHistogramResult(TypedDict, total=False):
+    ok: bool
+    addr: str
+    mode: str
+    instruction_count: int
+    unique_mnemonics: int
+    distribution_entropy: float
+    top_mnemonics: list[MnemonicHit]
+    ratios: dict
+    anomalies: list[str]
+    hint: str
+    error: str
+    error_type: str
+
+
+class MemmapMatch(TypedDict, total=False):
+    file_offset: int
+    matched_hex: str
+    context_before_hex: str
+    context_after_hex: str
+
+
+class NumpyMemmapScanResult(TypedDict, total=False):
+    ok: bool
+    file_path: str
+    file_size: int
+    pattern: str
+    pattern_length: int
+    match_count: int
+    matches: list[MemmapMatch]
+    truncated: bool
     hint: str
     error: str
     error_type: str
@@ -392,6 +440,87 @@ def _read_func_bytes(spec: str) -> tuple[int, str, bytes]:
     return f.start_ea, name, data
 
 
+# --- Opcode histogram helpers -------------------------------------------------
+
+_OPC_BRANCH = frozenset({
+    "jmp", "je", "jne", "jz", "jnz", "jg", "jge", "jl", "jle", "ja", "jb",
+    "jae", "jbe", "jo", "jno", "js", "jns", "jc", "jnc", "jp", "jnp",
+    "loop", "loope", "loopne",
+})
+_OPC_CALL = frozenset({"call"})
+_OPC_RET = frozenset({"ret", "retn", "retf", "iret", "iretd"})
+_OPC_ARITH = frozenset({
+    "add", "sub", "mul", "imul", "div", "idiv", "inc", "dec", "neg", "sal",
+    "and", "or", "xor", "not", "shl", "shr", "sar", "rol", "ror", "adc", "sbb",
+})
+_OPC_DATA = frozenset({"mov", "movzx", "movsx", "movsxd", "lea", "movabs", "xchg"})
+_OPC_STACK = frozenset({"push", "pop", "pusha", "popa", "pushf", "popf", "pushfd", "popfd"})
+_OPC_NOP = frozenset({"nop", "fnop"})
+
+
+def _collect_mnemonics(start: int, end: int, func) -> list[str]:
+    """Collect lowercase instruction mnemonics over a function or raw range."""
+    mnems: list[str] = []
+    if func is not None:
+        for item_ea in idautils.FuncItems(func.start_ea):
+            insn = ida_ua.insn_t()
+            if ida_ua.decode_insn(insn, item_ea) > 0:
+                mnems.append(insn.get_canon_mnem().lower())
+        return mnems
+    cur = start
+    while cur < end and cur != idaapi.BADADDR:
+        insn = ida_ua.insn_t()
+        length = ida_ua.decode_insn(insn, cur)
+        if length <= 0:
+            break
+        mnems.append(insn.get_canon_mnem().lower())
+        cur += insn.size
+    return mnems
+
+
+# --- Memmap pattern-scan helpers ---------------------------------------------
+
+
+def _parse_byte_pattern(pattern_hex: str) -> tuple[bytes, list[bool]]:
+    """Parse an IDA-style hex pattern into (bytes, fixed_mask).
+
+    Accepts space-separated hex bytes with '??' or '?' wildcards, e.g.
+    "48 8B 05 ?? ?? ?? ??". fixed_mask[i] is True for a concrete byte.
+    """
+    tokens = pattern_hex.replace(",", " ").split()
+    if not tokens:
+        raise ValueError("Empty pattern")
+    pat = bytearray()
+    mask: list[bool] = []
+    for tok in tokens:
+        if tok in ("??", "?", "*"):
+            pat.append(0)
+            mask.append(False)
+        else:
+            try:
+                pat.append(int(tok, 16) & 0xFF)
+            except ValueError:
+                raise ValueError(f"Invalid pattern token: {tok!r}")
+            mask.append(True)
+    return bytes(pat), mask
+
+
+def _longest_fixed_run(mask: list[bool]) -> tuple[int, int]:
+    """Return (offset, length) of the longest run of fixed (non-wildcard) bytes."""
+    best_off = best_len = 0
+    cur_off = run = 0
+    for i, fixed in enumerate(mask):
+        if fixed:
+            if run == 0:
+                cur_off = i
+            run += 1
+            if run > best_len:
+                best_len, best_off = run, cur_off
+        else:
+            run = 0
+    return best_off, best_len
+
+
 # ============================================================================
 # Status probe — always registered, even without numpy
 # ============================================================================
@@ -434,6 +563,12 @@ if NUMPY_AVAILABLE:
         threshold: Annotated[
             float, "Entropy (bits/byte) at/above which a block is 'high entropy' (default: 7.0)"
         ] = 7.0,
+        include_column_stats: Annotated[
+            bool,
+            "Also report per-byte-offset variance across non-overlapping blocks "
+            "(reveals fixed/aligned columns — repeating headers, struct fields). "
+            "Default: false.",
+        ] = False,
     ) -> NumpyEntropyMapResult:
         """Block-level Shannon entropy heatmap of a memory region.
 
@@ -540,6 +675,28 @@ if NUMPY_AVAILABLE:
             }
             if truncated:
                 result["truncated"] = True
+
+            # Optional per-byte-offset variance across non-overlapping blocks.
+            # Columns with near-zero variance are fixed positions across every
+            # block — repeating headers, alignment padding, or struct fields.
+            if include_column_stats:
+                n_full = arr.size // block_size
+                if n_full >= 2:
+                    mat = arr[:n_full * block_size].reshape(n_full, block_size).astype(np.float64)
+                    col_var = mat.var(axis=0)
+                    near_const = int(np.count_nonzero(col_var < 1.0))
+                    result["column_stats"] = {
+                        "full_blocks": int(n_full),
+                        "near_constant_columns": near_const,
+                        "near_constant_ratio": round(near_const / block_size, 4),
+                        "mean_column_variance": round(float(col_var.mean()), 4),
+                        "max_column_variance": round(float(col_var.max()), 4),
+                    }
+                else:
+                    result["column_stats"] = {
+                        "full_blocks": int(n_full),
+                        "note": "Need >= 2 full blocks for column variance.",
+                    }
 
             if total_blocks <= _MAX_BLOCKS_INLINE:
                 blocks: list[EntropyBlock] = []
@@ -981,3 +1138,231 @@ if NUMPY_AVAILABLE:
             return {"ok": False, **tool_error(e, "numpy_function_similarity")}
         except Exception as e:
             return {"ok": False, **tool_error(e, "numpy_function_similarity")}
+
+    @tool
+    @idasync
+    @tool_timeout(60.0)
+    def numpy_opcode_histogram(
+        addr: Annotated[str, "Function address/name, or start of a raw range (with size)"],
+        size: Annotated[
+            int,
+            "0 = treat addr as a function (default). >0 = decode this many bytes "
+            "as a raw instruction range.",
+        ] = 0,
+        top_n: Annotated[int, "Number of most-frequent mnemonics to return (default: 20)"] = 20,
+    ) -> NumpyOpcodeHistogramResult:
+        """Instruction mnemonic frequency profile of a function or range.
+
+        Surfaces obfuscation/profiling signals that no other tool exposes
+        directly:
+        - ``ratios`` — branch / call / ret / arith / data_move / stack / nop
+          fractions of all instructions.
+        - ``distribution_entropy`` — Shannon entropy (bits) of the mnemonic
+          distribution. Low diversity (a few opcodes dominating) is typical of
+          junk-instruction obfuscation or unrolled stubs; high diversity is
+          typical of normal compiled code.
+        - ``anomalies`` — heuristic flags (high nop ratio, low diversity, a
+          single dominant mnemonic).
+
+        Use it to triage whether a function is real code worth decompiling or a
+        junk/obfuscation stub, without paying for a full decompile.
+
+        See also: find_similar_functions (semantic similarity),
+        numpy_function_similarity (byte-level), analyze_function (full analysis).
+
+        Profile: analysis
+        """
+        try:
+            ea = parse_address(addr)
+            func = ida_funcs.get_func(ea)
+            mode = "function"
+            if size > 0:
+                mode = "range"
+                mnems = _collect_mnemonics(ea, ea + size, None)
+            elif func is not None:
+                mnems = _collect_mnemonics(func.start_ea, func.end_ea, func)
+            else:
+                return {
+                    "ok": False,
+                    "error": f"No function at {addr}. Pass size>0 to scan a raw range.",
+                }
+
+            total = len(mnems)
+            if total == 0:
+                return {"ok": False, "error": "No instructions decoded in the target."}
+
+            counts: dict[str, int] = {}
+            for m in mnems:
+                counts[m] = counts.get(m, 0) + 1
+
+            # Distribution entropy over the mnemonic frequency vector.
+            cvals = np.array(list(counts.values()), dtype=np.float64)
+            p = cvals / total
+            dist_entropy = float(-np.sum(p * np.log2(p)))
+
+            def _grp(group) -> int:
+                return sum(counts.get(m, 0) for m in group)
+
+            ratios = {
+                "branch": round(_grp(_OPC_BRANCH) / total, 4),
+                "call": round(_grp(_OPC_CALL) / total, 4),
+                "ret": round(_grp(_OPC_RET) / total, 4),
+                "arith": round(_grp(_OPC_ARITH) / total, 4),
+                "data_move": round(_grp(_OPC_DATA) / total, 4),
+                "stack": round(_grp(_OPC_STACK) / total, 4),
+                "nop": round(_grp(_OPC_NOP) / total, 4),
+            }
+
+            ordered = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+            top_mnemonics: list[MnemonicHit] = [
+                {"mnemonic": m, "count": c, "ratio": round(c / total, 4)}
+                for m, c in ordered[:max(1, top_n)]
+            ]
+
+            anomalies: list[str] = []
+            if ratios["nop"] > 0.15:
+                anomalies.append(
+                    f"High nop ratio ({ratios['nop']}) — junk/padding or anti-disassembly."
+                )
+            if total >= 20 and dist_entropy < 1.5:
+                anomalies.append(
+                    f"Low mnemonic diversity (entropy {round(dist_entropy, 2)}) — "
+                    "repetitive/unrolled or obfuscated code."
+                )
+            if top_mnemonics and top_mnemonics[0]["ratio"] > 0.5:
+                anomalies.append(
+                    f"Single mnemonic '{top_mnemonics[0]['mnemonic']}' dominates "
+                    f"({top_mnemonics[0]['ratio']}) — likely a stub or junk filler."
+                )
+
+            result: NumpyOpcodeHistogramResult = {
+                "ok": True,
+                "addr": hex(func.start_ea if (func is not None and size <= 0) else ea),
+                "mode": mode,
+                "instruction_count": total,
+                "unique_mnemonics": len(counts),
+                "distribution_entropy": round(dist_entropy, 4),
+                "top_mnemonics": top_mnemonics,
+                "ratios": ratios,
+                "anomalies": anomalies,
+            }
+            if anomalies:
+                result["hint"] = (
+                    "Anomalies detected — this may be junk/obfuscation rather than "
+                    "real logic; verify with disasm before investing in decompilation."
+                )
+            else:
+                result["hint"] = (
+                    "Mnemonic profile looks like normal compiled code "
+                    f"(diversity entropy {round(dist_entropy, 2)})."
+                )
+            return result
+        except ValueError as e:
+            return {"ok": False, **tool_error(e, f"numpy_opcode_histogram at {addr}")}
+        except Exception as e:
+            return {"ok": False, **tool_error(e, f"numpy_opcode_histogram at {addr}")}
+
+    @tool
+    @tool_timeout(60.0)
+    def numpy_memmap_scan(
+        file_path: Annotated[str, "Path to the file to scan (read via memory map)"],
+        pattern_hex: Annotated[
+            str,
+            "Byte pattern in IDA style with '??' wildcards, e.g. '48 8B 05 ?? ?? ?? ??'. "
+            "A fully fixed pattern works as an exact byte search.",
+        ],
+        max_results: Annotated[int, "Maximum matches to return (default: 100)"] = 100,
+        context_bytes: Annotated[
+            int, "Bytes of surrounding context (hex) to include per match (default: 16)"
+        ] = 16,
+    ) -> NumpyMemmapScanResult:
+        """Memory-mapped byte-pattern search over a file on disk.
+
+        Scans a file (any size — memory-mapped, constant RAM) for a byte pattern
+        with optional ``??`` wildcards. Unlike IDA's find_bytes (which only sees
+        the loaded IDB), this works on files not loaded into IDA and on files too
+        large to hold in memory — e.g. a 200 MB sibling DLL.
+
+        Anchors on the longest fixed run in the pattern (fast C-level substring
+        search), then verifies the full masked pattern at each hit with a
+        vectorized comparison. Not IDA-bound, so it does not run on the IDA
+        main thread.
+
+        See also: find_bytes (loaded IDB), find_dll_by_purpose (keyword search
+        across many DLLs), lief_strings (raw string extraction).
+
+        Profile: analysis
+        """
+        try:
+            if not os.path.isfile(file_path):
+                return {"ok": False, "error": f"File not found: {file_path}"}
+            pat, mask = _parse_byte_pattern(pattern_hex)
+            plen = len(pat)
+            if not any(mask):
+                return {
+                    "ok": False,
+                    "error": "Pattern is all wildcards — provide at least one fixed byte.",
+                }
+
+            run_off, run_len = _longest_fixed_run(mask)
+            anchor = bytes(pat[run_off:run_off + run_len])
+            pat_arr = np.frombuffer(pat, dtype=np.uint8)
+            mask_arr = np.array(mask, dtype=bool)
+
+            matches: list[MemmapMatch] = []
+            truncated = False
+            file_size = os.path.getsize(file_path)
+
+            with open(file_path, "rb") as fh:
+                if file_size == 0:
+                    return {
+                        "ok": True, "file_path": file_path, "file_size": 0,
+                        "pattern": pattern_hex, "pattern_length": plen,
+                        "match_count": 0, "matches": [],
+                    }
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    pos = 0
+                    while True:
+                        idx = mm.find(anchor, pos)
+                        if idx < 0:
+                            break
+                        start = idx - run_off
+                        if start >= 0 and start + plen <= file_size:
+                            window = np.frombuffer(mm[start:start + plen], dtype=np.uint8)
+                            if bool(np.all((window == pat_arr) | ~mask_arr)):
+                                cb = max(0, start - context_bytes)
+                                ca = min(file_size, start + plen + context_bytes)
+                                matches.append({
+                                    "file_offset": int(start),
+                                    "matched_hex": bytes(mm[start:start + plen]).hex(" ", 1),
+                                    "context_before_hex": bytes(mm[cb:start]).hex(" ", 1),
+                                    "context_after_hex": bytes(mm[start + plen:ca]).hex(" ", 1),
+                                })
+                                if len(matches) >= max_results:
+                                    truncated = True
+                                    break
+                        pos = idx + 1
+                finally:
+                    mm.close()
+
+            result: NumpyMemmapScanResult = {
+                "ok": True,
+                "file_path": file_path,
+                "file_size": file_size,
+                "pattern": pattern_hex,
+                "pattern_length": plen,
+                "match_count": len(matches),
+                "matches": matches,
+            }
+            if truncated:
+                result["truncated"] = True
+                result["hint"] = (
+                    f"Stopped at max_results={max_results}; more matches may exist. "
+                    "Raise max_results or narrow the pattern."
+                )
+            return result
+        except ValueError as e:
+            return {"ok": False, **tool_error(e, "numpy_memmap_scan")}
+        except Exception as e:
+            return {"ok": False, **tool_error(e, "numpy_memmap_scan")}

@@ -806,6 +806,70 @@ def normalize_dict_list(
         return [{}]
 
 
+def summary_stats(
+    items: list[dict],
+    field: str,
+    label_field: str = "name",
+) -> dict | None:
+    """Compute summary statistics over one numeric field of a list of dicts.
+
+    Returns mean/median/stdev/min/max plus the p25/p75/p95 percentiles, and the
+    ``label_field`` value of the min and max items (so an agent sees *which* entry
+    is the outlier without scanning the whole list). Returns None when there are
+    no usable numeric values.
+
+    Pure Python on purpose: the lists here are short (sections, a page of
+    functions), so a numpy dependency would add nothing. Used to pre-aggregate
+    bulk tool results so agents don't manually scan hundreds of rows.
+    """
+    pairs = [
+        (float(it[field]), it.get(label_field))
+        for it in items
+        if isinstance(it.get(field), (int, float))
+    ]
+    if not pairs:
+        return None
+
+    values = [v for v, _ in pairs]
+    n = len(values)
+    ordered = sorted(values)
+    mean = sum(values) / n
+
+    def _pct(p: float) -> float:
+        # Linear-interpolation percentile (matches numpy's default 'linear').
+        if n == 1:
+            return ordered[0]
+        rank = p / 100.0 * (n - 1)
+        lo = int(rank)
+        frac = rank - lo
+        if lo + 1 < n:
+            return ordered[lo] + frac * (ordered[lo + 1] - ordered[lo])
+        return ordered[lo]
+
+    if n > 1:
+        variance = sum((v - mean) ** 2 for v in values) / n
+        stdev = variance ** 0.5
+    else:
+        stdev = 0.0
+
+    min_v, min_label = min(pairs, key=lambda x: x[0])
+    max_v, max_label = max(pairs, key=lambda x: x[0])
+
+    return {
+        "count": n,
+        "mean": round(mean, 4),
+        "median": round(_pct(50), 4),
+        "stdev": round(stdev, 4),
+        "min": round(min_v, 4),
+        "min_at": min_label,
+        "max": round(max_v, 4),
+        "max_at": max_label,
+        "p25": round(_pct(25), 4),
+        "p75": round(_pct(75), 4),
+        "p95": round(_pct(95), 4),
+    }
+
+
 def looks_like_address(s: str) -> bool:
     """Check if string looks like an address (0x prefix or all hex chars)"""
     if s.startswith("0x") or s.startswith("0X"):

@@ -51,6 +51,7 @@ from .utils import (
     AnalyzeBatchQuery,
     tool_error,
     item_error,
+    summary_stats,
 )
 from . import compat
 
@@ -298,6 +299,7 @@ class BulkHashPage(TypedDict, total=False):
     data: list[FunctionHashResult]
     total: int
     next_offset: int | None
+    summary: dict
     error: str
     error_type: str
 
@@ -2931,7 +2933,11 @@ def get_bulk_function_hashes(
                 )
 
         next_off = offset + count if offset + count < total else None
-        return {"data": data, "total": total, "next_offset": next_off}
+        result: dict = {"data": data, "total": total, "next_offset": next_off}
+        stats = summary_stats(data, "instruction_count", label_field="name")
+        if stats is not None:
+            result["summary"] = {"instruction_count": stats}
+        return result
     except Exception as e:
         return tool_error(e, context="get_bulk_function_hashes")
 

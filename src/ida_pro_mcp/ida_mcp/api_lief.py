@@ -23,7 +23,7 @@ import idautils
 
 from .rpc import tool, unsafe
 from .sync import idasync
-from .utils import tool_error, item_error, normalize_list_input
+from .utils import tool_error, item_error, normalize_list_input, summary_stats
 
 # ---------------------------------------------------------------------------
 # Optional imports
@@ -417,6 +417,7 @@ class LiefSectionsResult(TypedDict, total=False):
     format: str
     sections: list[LiefSectionEntry]
     total: int
+    summary: dict
     error: str
     error_type: str
     hint: str
@@ -1115,7 +1116,13 @@ if LIEF_AVAILABLE:
                         pass
                 entries.append(entry)
 
-            return {"ok": True, "format": fmt, "sections": entries, "total": len(entries)}
+            result: LiefSectionsResult = {
+                "ok": True, "format": fmt, "sections": entries, "total": len(entries),
+            }
+            ent_summary = summary_stats(entries, "entropy", label_field="name")
+            if ent_summary is not None:
+                result["summary"] = {"entropy": ent_summary}
+            return result
         except Exception as e:
             return {**tool_error(e), "ok": False}
 
