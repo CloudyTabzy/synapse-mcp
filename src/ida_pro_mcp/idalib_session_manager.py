@@ -285,6 +285,16 @@ class IDASessionManager:
         self._active_session_id = session_id
         logger.info("Activated session %s (%s)", session_id, session.input_path.name)
 
+    def _is_directory_writable(self, path: Path) -> bool:
+        """Actually test-write a file — os.access is unreliable on Windows."""
+        try:
+            test_file = path / f".idalib_write_test_{uuid.uuid4().hex[:8]}"
+            test_file.write_text("test", encoding="utf-8")
+            test_file.unlink()
+            return True
+        except (OSError, PermissionError):
+            return False
+
     def _get_writable_idb_path(self, input_path: str) -> str:
         """Return a writable path for the IDA database file.
 
@@ -293,7 +303,7 @@ class IDASessionManager:
         """
         source_dir = Path(input_path).parent
         stem = Path(input_path).stem
-        if os.access(str(source_dir), os.W_OK):
+        if self._is_directory_writable(source_dir):
             return str(source_dir / f"{stem}.i64")
         tmp_dir = Path(tempfile.gettempdir())
         unique = uuid.uuid4().hex[:8]
@@ -375,7 +385,7 @@ class IDASessionManager:
             # 3 = out of memory, 4 = loader rejected (often wrong machine type or unknown format),
             # 5+ = I/O / format-specific loader failure.
             source_dir = Path(input_path).parent
-            if err == 2 and not os.access(str(source_dir), os.W_OK):
+            if err == 2 and not self._is_directory_writable(source_dir):
                 err_hint = (
                     "cannot write IDB to source directory (permission denied). "
                     "The output was redirected to a temp path, but the loader may "
