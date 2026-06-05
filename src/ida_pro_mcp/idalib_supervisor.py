@@ -216,6 +216,8 @@ class WorkerSession:
     pid: int | None = None
     stdin: Any | None = None  # subprocess.PIPE for stdio workers
     stdout: Any | None = None
+    _rpc_request_id: int = 0
+    _rpc_response_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -592,14 +594,22 @@ class IdalibSupervisor:
     ) -> dict[str, Any]:
         """Send a JSON-RPC request to a worker via its stdio pipe and return the response.
 
-        Writes the full JSON payload followed by a newline to the worker's stdin,
-        then reads the response line from its stdout. The stdio MCP transport
-        writes one JSON-RPC message per line.
+        Correlates responses by request ID so out-of-order or stale buffered
+        responses do not get consumed by the wrong call.
         """
         if worker.process is None or worker.process.poll() is not None:
             raise RuntimeError("Worker process is not running")
         if worker.stdin is None or worker.stdout is None:
             raise RuntimeError("Worker stdio pipes not available")
+
+        worker._rpc_request_id += 1
+        request_id = worker._rpc_request_id
+        payload = {**payload, "id": request_id}
+
+        # Check cache first (stale response from previous call)
+        cached = worker._rpc_response_cache.pop(request_id, None)
+        if cached is not None:
+            return cached
 
         body = json.dumps(payload)
         deadline = time.monotonic() + (timeout or 60.0)
@@ -609,7 +619,6 @@ class IdalibSupervisor:
         except BrokenPipeError as e:
             raise RuntimeError("Worker process closed stdin") from e
 
-        collected = ""
         while time.monotonic() < deadline:
             try:
                 line = worker.stdout.readline()
@@ -617,16 +626,25 @@ class IdalibSupervisor:
                 raise RuntimeError(f"Failed to read from worker: {e}") from e
             if not line:
                 raise RuntimeError("Worker process closed stdout")
-            collected += line.decode("utf-8")
-            stripped = collected.strip()
-            if stripped and stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    return json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue  # partial JSON — wait for more data
-            # Check if we've accumulated too much without finding a JSON object
-            if len(collected) > 1_000_000:
-                raise RuntimeError("Worker response exceeded 1MB without producing valid JSON")
+            text = line.decode("utf-8").strip()
+            if not text or not text.startswith("{"):
+                continue
+            try:
+                msg = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            # Skip notifications (no id field)
+            msg_id = msg.get("id")
+            if msg_id is None:
+                continue
+
+            if msg_id == request_id:
+                return msg
+
+            # Stale response for a different request — cache it
+            worker._rpc_response_cache[msg_id] = msg
+
         raise TimeoutError(f"Worker RPC timed out after {(timeout or 60.0)}s")
 
     def forward_raw(self, worker: WorkerSession, request_obj: dict[str, Any]) -> dict[str, Any]:
@@ -1180,9 +1198,9 @@ def idalib_open(
     except Exception:
         file_size_mb = 0.0
 
-    # Auto-scale open timeout for large binaries (2 sec per MB, max 15 min)
+    # Auto-scale open timeout for large binaries (5 sec per MB, max 60 min)
     if open_timeout_sec is None:
-        open_timeout_sec = min(120 + file_size_mb * 2, 900)
+        open_timeout_sec = min(300 + file_size_mb * 5, 3600)
 
     # LIEF-only mode — return metadata + register lightweight session
     if actual_mode == "lief-only":
