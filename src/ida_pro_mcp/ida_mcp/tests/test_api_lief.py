@@ -26,6 +26,11 @@ try:
             lief_pe_overlay,
             lief_guard_functions,
             lief_compare_to_idb,
+            lief_imphash,
+            lief_version_info,
+            lief_resources,
+            lief_debug_directory,
+            lief_load_config,
             hybrid_lief_checksec_exploit_assess,
             hybrid_lief_yara_section_scan,
         )
@@ -455,3 +460,92 @@ def test_hybrid_yara_section_scan_match_structure():
         assert "section" in entry
         assert "entropy" in entry
         assert isinstance(entry.get("rules_matched"), list)
+
+
+# ---------------------------------------------------------------------------
+# lief_imphash
+# ---------------------------------------------------------------------------
+
+
+@test(binary="crackme03.elf")
+def test_lief_imphash_non_pe():
+    """ELF binary returns ok=False with wrong_format error — imphash is PE-only."""
+    _require_lief()
+    result = lief_imphash()
+    assert result.get("ok") is False
+    assert result.get("error_type") == "wrong_format"
+    assert result.get("format") == "ELF"
+
+
+# ---------------------------------------------------------------------------
+# lief_version_info
+# ---------------------------------------------------------------------------
+
+
+@test(binary="crackme03.elf")
+def test_lief_version_info_non_pe():
+    """ELF binary returns ok=False — version info is PE-only."""
+    _require_lief()
+    result = lief_version_info()
+    assert result.get("ok") is False
+    assert result.get("format") == "ELF"
+
+
+@test(binary="crackme03.elf")
+def test_lief_version_info_result_shape():
+    """Even on failure, result dict has expected top-level keys."""
+    _require_lief()
+    result = lief_version_info()
+    assert "ok" in result
+    assert "format" in result
+
+
+# ---------------------------------------------------------------------------
+# lief_resources
+# ---------------------------------------------------------------------------
+
+
+@test(binary="crackme03.elf")
+def test_lief_resources_non_pe():
+    """ELF binary returns ok=False — resources are PE-only."""
+    _require_lief()
+    result = lief_resources()
+    assert result.get("ok") is False
+    assert result.get("format") == "ELF"
+
+
+@test(binary="crackme03.elf")
+def test_lief_resources_result_has_keys():
+    """Even on failure, result dict has expected top-level keys."""
+    _require_lief()
+    result = lief_resources()
+    assert "ok" in result
+    assert "format" in result
+
+
+# ---------------------------------------------------------------------------
+# lief_debug_directory
+# ---------------------------------------------------------------------------
+
+
+@test(binary="crackme03.elf")
+def test_lief_debug_directory_non_pe():
+    """ELF binary returns ok=False — debug directory is PE-only."""
+    _require_lief()
+    result = lief_debug_directory()
+    assert result.get("ok") is False
+    assert result.get("format") == "ELF"
+
+
+# ---------------------------------------------------------------------------
+# lief_load_config
+# ---------------------------------------------------------------------------
+
+
+@test(binary="crackme03.elf")
+def test_lief_load_config_non_pe():
+    """ELF binary returns ok=False — load config is PE-only."""
+    _require_lief()
+    result = lief_load_config()
+    assert result.get("ok") is False
+    assert result.get("format") == "ELF"

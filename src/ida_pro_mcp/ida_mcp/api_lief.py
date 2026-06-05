@@ -166,6 +166,48 @@ def _entropy(data: bytes) -> float:
     return round(h, 4)
 
 
+# Win32 RT_* resource type IDs → readable names (for the resource tree walk).
+_RT_TYPES: dict[int, str] = {
+    1: "CURSOR", 2: "BITMAP", 3: "ICON", 4: "MENU", 5: "DIALOG", 6: "STRING",
+    7: "FONTDIR", 8: "FONT", 9: "ACCELERATOR", 10: "RCDATA", 11: "MESSAGETABLE",
+    12: "GROUP_CURSOR", 14: "GROUP_ICON", 16: "VERSION", 17: "DLGINCLUDE",
+    19: "PLUGPLAY", 20: "VXD", 21: "ANICURSOR", 22: "ANIICON", 23: "HTML",
+    24: "MANIFEST",
+}
+
+
+def _decode_fixed_version(ffi) -> dict:
+    """Decode a LIEF fixed_file_info_t into readable version/type/os strings."""
+    def _ver(ms: int, ls: int) -> str:
+        return f"{(ms >> 16) & 0xFFFF}.{ms & 0xFFFF}.{(ls >> 16) & 0xFFFF}.{ls & 0xFFFF}"
+    out: dict = {}
+    try:
+        out["file_version"] = _ver(ffi.file_version_ms, ffi.file_version_ls)
+        out["product_version"] = _ver(ffi.product_version_ms, ffi.product_version_ls)
+        out["file_type"] = str(ffi.file_type).split(".")[-1]
+        out["file_os"] = str(ffi.file_os).split(".")[-1]
+    except Exception:
+        pass
+    return out
+
+
+def _version_anomalies(strings: dict, path: str) -> list[str]:
+    """Heuristic tells from version strings (impersonation / name mismatch)."""
+    anomalies: list[str] = []
+    orig = (strings.get("OriginalFilename") or "").strip()
+    if orig and path:
+        disk = os.path.basename(path)
+        # Compare extension-stripped (e.g. OriginalFilename 'kernel32' vs 'kernel32.dll').
+        on = orig.lower().rsplit(".", 1)[0]
+        dn = disk.lower().rsplit(".", 1)[0]
+        if on and dn and on != dn:
+            anomalies.append(
+                f"OriginalFilename '{orig}' differs from on-disk name '{disk}' "
+                "— possible renamed/masquerading binary."
+            )
+    return anomalies
+
+
 def _extract_strings(
     data: bytes,
     offset_base: int,
@@ -622,6 +664,102 @@ class LiefGuardResult(TypedDict, total=False):
     error: str
     error_type: str
     hint: str
+
+
+class LiefImphashResult(TypedDict, total=False):
+    ok: bool
+    format: str
+    imphash: str
+    import_count: int
+    library_count: int
+    note: str
+    error: str
+    error_type: str
+    hint: str
+
+
+class LiefFixedVersion(TypedDict, total=False):
+    file_version: str
+    product_version: str
+    file_type: str
+    file_os: str
+
+
+class LiefVersionInfoResult(TypedDict, total=False):
+    ok: bool
+    format: str
+    has_version_info: bool
+    fixed: LiefFixedVersion
+    strings: dict
+    lang_codes: list[str]
+    anomalies: list[str]
+    error: str
+    error_type: str
+
+
+class LiefResourceType(TypedDict, total=False):
+    type: str
+    count: int
+    total_size: int
+
+
+class LiefSuspiciousResource(TypedDict, total=False):
+    type: str
+    id: str
+    size: int
+    entropy: float
+    filetype_guess: str
+
+
+class LiefResourcesResult(TypedDict, total=False):
+    ok: bool
+    format: str
+    has_resources: bool
+    resource_types: list[LiefResourceType]
+    manifest: str
+    requested_execution_level: str
+    icon_count: int
+    suspicious: list[LiefSuspiciousResource]
+    note: str
+    error: str
+    error_type: str
+
+
+class LiefDebugEntry(TypedDict, total=False):
+    type: str
+    timestamp: int
+    pdb_path: str
+    pdb_guid: str
+    pdb_age: int
+
+
+class LiefDebugResult(TypedDict, total=False):
+    ok: bool
+    format: str
+    has_debug: bool
+    entries: list[LiefDebugEntry]
+    symbol_server_key: str
+    is_reproducible_build: bool
+    leaked_paths: list[str]
+    error: str
+    error_type: str
+
+
+class LiefLoadConfigResult(TypedDict, total=False):
+    ok: bool
+    format: str
+    has_load_config: bool
+    version: int
+    security_cookie: str
+    se_handler_count: int
+    guard_flags: list[str]
+    guard_cf_function_count: int
+    guard_address_taken_iat_count: int
+    guard_long_jump_target_count: int
+    guard_eh_continuation_count: int
+    cast_guard_present: bool
+    error: str
+    error_type: str
 
 
 class LiefEntryPointDiff(TypedDict):
@@ -2865,6 +3003,491 @@ if LIEF_AVAILABLE:
                 "skipped_count": skipped,
                 "not_found_count": not_found,
                 "changes": changes,
+            }
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # I.1 — lief_imphash
+    # -----------------------------------------------------------------------
+
+    @tool
+    @idasync
+    def lief_imphash(
+        file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
+    ) -> LiefImphashResult:
+        """Compute the import-table hash (imphash) for malware family clustering.
+
+        imphash is the MD5 of the normalized PE import table — the de-facto
+        malware-triage clustering hash (FireEye-origin). PE only.
+
+        An empty-imports imphash is the MD5 of an empty string and is not
+        discriminative — pair with ``lief_iat_resolve`` for packed binaries
+        that resolve imports at runtime."""
+        try:
+            path = _resolve_lief_path(file_path)
+            binary = _lief.parse(path)
+            if binary is None:
+                return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
+            fmt = _format_name(binary)
+            if not isinstance(binary, _lief.PE.Binary):
+                return {
+                    "ok": False,
+                    "format": fmt,
+                    "error": "imphash is only available for PE binaries",
+                    "error_type": "wrong_format",
+                    "hint": "Use lief_imports to inspect the import table for ELF/Mach-O/COFF.",
+                }
+
+            imphash = _lief.PE.get_imphash(binary, _lief.PE.IMPHASH_MODE.PEFILE)
+            imp_count = 0
+            lib_count = 0
+            for imp in binary.imports:
+                lib_count += 1
+                imp_count += len(imp.entries)
+
+            note = ""
+            if imp_count == 0:
+                note = (
+                    "0 imports — imphash is the MD5 of an empty string and "
+                    "is not discriminative. The binary may resolve imports "
+                    "at runtime (packed). Pair with lief_iat_resolve()."
+                )
+
+            return {
+                "ok": True,
+                "format": fmt,
+                "imphash": imphash,
+                "import_count": imp_count,
+                "library_count": lib_count,
+                "note": note,
+            }
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # I.2 — lief_version_info
+    # -----------------------------------------------------------------------
+
+    @tool
+    @idasync
+    def lief_version_info(
+        file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
+    ) -> LiefVersionInfoResult:
+        """Extract VS_VERSIONINFO (fixed + string fields) from PE resources.
+
+        Version strings are a top malware-triage signal: fake
+        ``CompanyName: 'Microsoft Corporation'``, mismatched
+        ``OriginalFilename``, and anomalous product names.
+
+        PE only. Returns anomalies heuristics (e.g. OriginalFilename vs
+        on-disk name mismatch)."""
+        try:
+            path = _resolve_lief_path(file_path)
+            binary = _lief.parse(path)
+            if binary is None:
+                return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
+            fmt = _format_name(binary)
+            if not isinstance(binary, _lief.PE.Binary):
+                return {
+                    "ok": False,
+                    "format": fmt,
+                    "error": "version info is only available for PE binaries",
+                    "error_type": "wrong_format",
+                }
+
+            rm = getattr(binary, "resources_manager", None)
+            if rm is None:
+                return {"ok": True, "format": fmt, "has_version_info": False, "strings": {}, "lang_codes": [], "anomalies": []}
+
+            rv = getattr(rm, "version", None)
+            if rv is None:
+                return {"ok": True, "format": fmt, "has_version_info": False, "strings": {}, "lang_codes": [], "anomalies": []}
+
+            fixed = {}
+            if rv.has_fixed_file_info():
+                try:
+                    fixed = _decode_fixed_version(rv.fixed_file_info)
+                except Exception:
+                    pass
+
+            strings: dict = {}
+            lang_codes: list[str] = []
+            try:
+                sfi = rv.string_file_info
+                if sfi is not None:
+                    for lc in sfi.langcode_items:
+                        lang_codes.append(f"{lc.lang}-{lc.code_page}")
+                        for key, val in lc.items.items():
+                            strings.setdefault(key, str(val))
+            except Exception:
+                pass
+
+            anomalies = _version_anomalies(strings, path)
+
+            return {
+                "ok": True,
+                "format": fmt,
+                "has_version_info": True,
+                "fixed": fixed,
+                "strings": strings,
+                "lang_codes": lang_codes,
+                "anomalies": anomalies,
+            }
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # I.3 — lief_resources
+    # -----------------------------------------------------------------------
+
+    @tool
+    @idasync
+    def lief_resources(
+        file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
+        max_extract_bytes: Annotated[int, "Max bytes per resource for entropy/filetype inspection (0 = skip)"] = 0,
+    ) -> LiefResourcesResult:
+        """Enumerate PE resource types, decode manifest XML, and flag
+        suspicious (high-entropy / oversized) resources that may be embedded
+        payloads.
+
+        PE only. ``requested_execution_level`` from the manifest reveals UAC
+        elevation intent — a real malware-triage signal."""
+        try:
+            path = _resolve_lief_path(file_path)
+            binary = _lief.parse(path)
+            if binary is None:
+                return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
+            fmt = _format_name(binary)
+            if not isinstance(binary, _lief.PE.Binary):
+                return {
+                    "ok": False,
+                    "format": fmt,
+                    "error": "resource enumeration is only available for PE binaries",
+                    "error_type": "wrong_format",
+                }
+
+            rm = getattr(binary, "resources_manager", None)
+            if rm is None:
+                return {"ok": True, "format": fmt, "has_resources": False, "resource_types": [], "icon_count": 0, "suspicious": []}
+
+            type_counts: dict[str, int] = {}
+            type_sizes: dict[str, int] = {}
+            icon_count = 0
+
+            try:
+                for res_node in binary.resources:
+                    rtype_id = res_node.id
+                    rtype_label = _RT_TYPES.get(rtype_id, f"RT_{rtype_id}")
+                    type_counts.setdefault(rtype_label, 0)
+                    type_sizes.setdefault(rtype_label, 0)
+                    for child1 in res_node.childs:
+                        for child2 in child1.childs:
+                            type_counts[rtype_label] += 1
+                            sz = len(child2.content)
+                            type_sizes[rtype_label] = type_sizes.get(rtype_label, 0) + sz
+                            if rtype_label in ("GROUP_ICON", "ICON"):
+                                icon_count += 1
+            except Exception:
+                pass
+
+            resource_types: list[LiefResourceType] = [
+                {"type": t, "count": type_counts[t], "total_size": type_sizes.get(t, 0)}
+                for t in sorted(type_counts)
+            ]
+
+            manifest: str | None = None
+            req_level: str | None = None
+            try:
+                raw = rm.manifest
+                if raw:
+                    manifest = str(raw)
+                    ml = manifest.lower()
+                    if "requireadministrator" in ml:
+                        req_level = "requireAdministrator"
+                    elif "highestavailable" in ml:
+                        req_level = "highestAvailable"
+                    elif "asInvoker" not in ml and "asinvoker" not in ml and "invoker" in ml:
+                        req_level = "asInvoker"
+                    if "asinvoker" in ml:
+                        req_level = "asInvoker"
+            except Exception:
+                pass
+
+            suspicious: list[LiefSuspiciousResource] = []
+            if max_extract_bytes > 0:
+                try:
+                    ft_guess_fn = None
+                    try:
+                        from .api_filetype import _filetype_guess_bytes
+                        ft_guess_fn = _filetype_guess_bytes
+                    except Exception:
+                        pass
+                    for res_node in binary.resources:
+                        rtype_id = res_node.id
+                        rtype_label = _RT_TYPES.get(rtype_id, f"RT_{rtype_id}")
+                        if rtype_label in ("CURSOR", "BITMAP", "ICON", "GROUP_ICON", "MANIFEST", "VERSION"):
+                            continue
+                        for child1 in res_node.childs:
+                            for child2 in child1.childs:
+                                sz = len(child2.content)
+                                if sz < 1024:
+                                    continue
+                                sample = child2.content[:min(max_extract_bytes, sz)]
+                                ent = _entropy(sample)
+                                if ent < 5.0 and sz < 16384:
+                                    continue
+                                ft_guess: str | None = None
+                                if ft_guess_fn:
+                                    try:
+                                        g = ft_guess_fn(sample)
+                                        if g and g.get("extension"):
+                                            ft_guess = g["extension"]
+                                    except Exception:
+                                        pass
+                                suspicious.append({
+                                    "type": rtype_label,
+                                    "id": str(child2.id),
+                                    "size": sz,
+                                    "entropy": ent,
+                                    "filetype_guess": ft_guess or "",
+                                })
+                        if len(suspicious) >= 50:
+                            break
+                except Exception:
+                    pass
+
+            return {
+                "ok": True,
+                "format": fmt,
+                "has_resources": True,
+                "resource_types": resource_types,
+                "manifest": manifest or "",
+                "requested_execution_level": req_level or "",
+                "icon_count": icon_count,
+                "suspicious": suspicious,
+            }
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # I.4 — lief_debug_directory
+    # -----------------------------------------------------------------------
+
+    @tool
+    @idasync
+    def lief_debug_directory(
+        file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
+    ) -> LiefDebugResult:
+        """Read the PE debug directory: CodeView PDB path/GUID/age,
+        REPRO (reproducible build), POGO, and VC_FEATURE entries.
+
+        The CodeView entry embeds the PDB path + GUID — links a binary to its
+        symbol file for attribution and symbol-server lookup. PDB paths
+        routinely leak dev usernames and internal project names.
+
+        PE only."""
+        try:
+            path = _resolve_lief_path(file_path)
+            binary = _lief.parse(path)
+            if binary is None:
+                return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
+            fmt = _format_name(binary)
+            if not isinstance(binary, _lief.PE.Binary):
+                return {
+                    "ok": False,
+                    "format": fmt,
+                    "error": "debug directory is only available for PE binaries",
+                    "error_type": "wrong_format",
+                }
+
+            debug_entries = getattr(binary, "debug", []) or []
+            if not debug_entries:
+                return {"ok": True, "format": fmt, "has_debug": False, "entries": [], "is_reproducible_build": False, "leaked_paths": []}
+
+            entries: list[LiefDebugEntry] = []
+            sym_key = ""
+            has_repro = False
+            leaked: list[str] = []
+
+            for de in debug_entries:
+                entry_type = str(de.type).split(".")[-1] if hasattr(de, "type") else "UNKNOWN"
+                ts = getattr(de, "timestamp", 0) or 0
+                pdb_path: str | None = None
+                pdb_guid: str | None = None
+                pdb_age: int | None = None
+
+                if hasattr(de, "filename"):
+                    pdb_path = str(de.filename)
+                    cn = de
+                    if hasattr(cn, "signature"):
+                        sig = cn.signature
+                        sig_str = "-".join(f"{b:02X}" for b in sig) if isinstance(sig, (list, bytes)) else str(sig)
+                        pdb_guid = sig_str
+                    if hasattr(cn, "guid"):
+                        g = cn.guid
+                        g_str = "-".join(f"{b:02X}" for b in g) if isinstance(g, (list, bytes)) else str(g)
+                        pdb_guid = pdb_guid or g_str
+                    if hasattr(cn, "age"):
+                        try:
+                            pdb_age = int(cn.age)
+                        except (TypeError, ValueError):
+                            pass
+
+                    if pdb_guid and pdb_age is not None:
+                        sym_key = f"{pdb_guid}{pdb_age:X}"
+
+                    if pdb_path:
+                        path_lower = pdb_path.lower()
+                        for part in path_lower.replace("\\", "/").split("/"):
+                            part_stripped = part.strip()
+                            if not part_stripped:
+                                continue
+                            if part_stripped in ("debug", "pdb", "symbols", "release", "x86", "x64", "obj", "bin"):
+                                continue
+                            if any(c in part_stripped for c in ("users", "home", "documents")):
+                                leaked.append(part_stripped)
+
+                entries.append({
+                    "type": entry_type,
+                    "timestamp": ts,
+                    "pdb_path": pdb_path or "",
+                    "pdb_guid": pdb_guid or "",
+                    "pdb_age": pdb_age,
+                })
+
+                if hasattr(de, "type"):
+                    ts_str = str(de.type)
+                    if "REPRO" in ts_str:
+                        has_repro = True
+
+            return {
+                "ok": True,
+                "format": fmt,
+                "has_debug": True,
+                "entries": entries,
+                "symbol_server_key": sym_key,
+                "is_reproducible_build": has_repro,
+                "leaked_paths": leaked,
+            }
+        except Exception as e:
+            return {**tool_error(e), "ok": False}
+
+    # -----------------------------------------------------------------------
+    # I.5 — lief_load_config
+    # -----------------------------------------------------------------------
+
+    @tool
+    @idasync
+    def lief_load_config(
+        file_path: Annotated[str, "Path to binary file; empty string uses the IDB source file"] = "",
+    ) -> LiefLoadConfigResult:
+        """Read the PE Load Configuration directory — the full security posture.
+
+        Exposes /GS stack cookie VA, SafeSEH table size, decoded CFG GuardFlags,
+        guard function/IAT/long-jump/EH counts, and CastGuard presence.
+
+        PE only. Complements ``lief_guard_functions`` (which reads the actual
+        CFG guard table entries)."""
+        try:
+            path = _resolve_lief_path(file_path)
+            binary = _lief.parse(path)
+            if binary is None:
+                return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
+            fmt = _format_name(binary)
+            if not isinstance(binary, _lief.PE.Binary):
+                return {
+                    "ok": False,
+                    "format": fmt,
+                    "error": "load config is only available for PE binaries",
+                    "error_type": "wrong_format",
+                }
+
+            lc = getattr(binary, "load_configuration", None)
+            if lc is None:
+                return {"ok": True, "format": fmt, "has_load_config": False}
+
+            ver = getattr(lc, "version", 0) or 0
+
+            cookie: str | None = None
+            try:
+                v = getattr(lc, "security_cookie", None)
+                if v is not None and int(v) != 0:
+                    cookie = hex(v)
+            except Exception:
+                pass
+
+            seh = 0
+            try:
+                seh = int(getattr(lc, "number_of_se_handler_table_entries", 0) or 0)
+            except Exception:
+                pass
+
+            cf_count = 0
+            iat_count = 0
+            lj_count = 0
+            eh_count = 0
+            try:
+                cf_count = int(getattr(lc, "guard_cf_function_count", 0) or 0)
+                iat_count = int(getattr(lc, "guard_address_taken_iat_entry_count", 0) or 0)
+                lj_count = int(getattr(lc, "guard_long_jump_target_count", 0) or 0)
+                eh_count = int(getattr(lc, "guard_eh_continuation_count", 0) or 0)
+            except Exception:
+                pass
+
+            guard_flags: list[str] = []
+            try:
+                gf = getattr(lc, "guard_flags", None)
+                if gf is not None:
+                    raw = int(gf)
+                    if raw & 0x100:
+                        guard_flags.append("CF_INSTRUMENTED")
+                    if raw & 0x200:
+                        guard_flags.append("CFW_INSTRUMENTED")
+                    if raw & 0x400:
+                        guard_flags.append("CF_FUNCTION_TABLE_PRESENT")
+                    if raw & 0x800:
+                        guard_flags.append("CFW_FUNCTION_TABLE_PRESENT")
+                    if raw & 0x1000:
+                        guard_flags.append("CF_LONGJUMP_TABLE_PRESENT")
+                    if raw & 0x2000:
+                        guard_flags.append("CFW_LONGJUMP_TABLE_PRESENT")
+                    if raw & 0x10000:
+                        guard_flags.append("CF_EXPORT_SUPPRESSION_INFO_PRESENT")
+                    if raw & 0x20000:
+                        guard_flags.append("CET_SHADOW_STACK_PRESENT")
+                    if raw & 0x40000:
+                        guard_flags.append("RFG_PRESENT")
+                    if raw & 0x80000:
+                        guard_flags.append("CF_ENABLE_EXCEPTION_SUPPRESSION")
+                    if raw & 0x100000:
+                        guard_flags.append("EH_CONTINUATION_TABLE_PRESENT")
+                    if raw & 0x200000:
+                        guard_flags.append("MEMORY_VALIDATION_PRESENT")
+                    if raw & 0x400000:
+                        guard_flags.append("CFG_FAST_FAIL")
+            except Exception:
+                pass
+
+            cast_guard = False
+            try:
+                cast_guard = bool(getattr(lc, "cast_guard_present", False))
+            except Exception:
+                pass
+
+            return {
+                "ok": True,
+                "format": fmt,
+                "has_load_config": True,
+                "version": ver,
+                "security_cookie": cookie or "",
+                "se_handler_count": seh,
+                "guard_flags": guard_flags,
+                "guard_cf_function_count": cf_count,
+                "guard_address_taken_iat_count": iat_count,
+                "guard_long_jump_target_count": lj_count,
+                "guard_eh_continuation_count": eh_count,
+                "cast_guard_present": cast_guard,
             }
         except Exception as e:
             return {**tool_error(e), "ok": False}
