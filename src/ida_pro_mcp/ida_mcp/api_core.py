@@ -1460,24 +1460,11 @@ def find_regex(
     search_text (disassembly/comment search), entity_query (full catalog),
     list_strings (simple string dump).
 
-    LATENCY: Linear in string count. On very_large binaries (95K+ functions), use
-    task_submit or narrow patterns (max 20 chars). This tool auto-redirects to a
-    background task when the binary is classified as very_large.
+    LATENCY: Linear in string count. On very_large binaries (95K+ functions), this
+    tool auto-routes to a background task (see rpc.py tools/call handler).
+    Use task_submit manually on large (not very_large) binaries, or narrow
+    patterns (max 20 chars).
     """
-    if _BINARY_CLASS == "very_large" or (not _BINARY_CLASS_INITIALIZED and _ensure_binary_class() is None and _BINARY_CLASS == "very_large"):
-        from .rpc import MCP_SERVER
-        guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
-        if not getattr(guard, "active", False):
-            from .api_tasks import task_submit as _ts
-            tid = _ts(tool_name="find_regex", arguments=dict(
-                pattern=pattern, limit=limit, offset=offset,
-                search_strings=search_strings, search_names=search_names,
-                scan_raw=scan_raw,
-            ))
-            return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
-                    "_meta": {"ida_mcp": {"async_submit": True}},
-                    "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
-
     if limit <= 0:
         limit = 50
     if limit > 500:
@@ -1485,8 +1472,6 @@ def find_regex(
 
     try:
         regex = re.compile(pattern, re.IGNORECASE)
-
-    # ... (find_regex body continues)
     except re.error as e:
         return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"Invalid regex: {e}"}
 
@@ -1665,22 +1650,9 @@ def search_text(
     insn_query (instruction pattern search).
 
     LATENCY: Linear in binary size. On very_large binaries (95K+ functions), this
-    will time out — use find_regex with short patterns instead. Auto-routes to a
-    background task when the binary is classified as very_large.
+    tool auto-routes to a background task (see rpc.py tools/call handler).
+    Use find_regex with short patterns on large (not very_large) binaries.
     """
-    if _BINARY_CLASS == "very_large" or (not _BINARY_CLASS_INITIALIZED and _ensure_binary_class() is None and _BINARY_CLASS == "very_large"):
-        from .rpc import MCP_SERVER
-        guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
-        if not getattr(guard, "active", False):
-            from .api_tasks import task_submit as _ts
-            tid = _ts(tool_name="search_text", arguments=dict(
-                pattern=pattern, limit=limit, cursor=cursor, regex=regex,
-                case_sensitive=case_sensitive, include=include, code_only=code_only,
-            ))
-            return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
-                    "_meta": {"ida_mcp": {"async_submit": True}},
-                    "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
-
     if limit <= 0:
         limit = 30
     if limit > 500:

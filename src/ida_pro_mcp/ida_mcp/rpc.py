@@ -372,6 +372,33 @@ def _install_tools_call_patch() -> None:
                 except Exception:
                     pass  # fall through to synchronous execution
 
+        # === auto-async for very_large binaries: find_regex and search_text
+        # must never run synchronously on binaries with 95K+ functions.
+        # Uses the same _reentry guard as the prefer_async path above so
+        # the task worker can re-dispatch synchronously. ===
+        if (name in ("find_regex", "search_text")
+                and not getattr(_reentry, "active", False)):
+            from . import api_core as _core
+            if not _core._BINARY_CLASS_INITIALIZED:
+                _core._ensure_binary_class()
+            if _core._BINARY_CLASS == "very_large":
+                task_submit_fn = MCP_SERVER.tools.methods.get("task_submit")
+                if task_submit_fn is not None:
+                    try:
+                        result = task_submit_fn(tool_name=name, arguments=arguments or {})
+                        if result.get("task_id"):
+                            return {
+                                "structuredContent": result,
+                                "content": [{
+                                    "type": "text",
+                                    "text": json.dumps(result, separators=(",", ":")),
+                                }],
+                                "isError": False,
+                                "_meta": {"ida_mcp": {"async_submit": True}},
+                            }
+                    except Exception:
+                        pass
+
         response = original(name, arguments, _meta)
 
         if response.get("isError"):
