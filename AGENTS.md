@@ -648,6 +648,72 @@ python -m py_compile src/ida_pro_mcp/ida_mcp/api_*.py
 
 ---
 
+## idalib Headless Mode
+
+**What it is:** A mode where an MCP server runs without the IDA Pro GUI, using `idalib` (the IDA SDK library). Each binary gets its own isolated worker process. If a worker crashes, it doesn't affect other binaries or the server.
+
+**How to enable:**
+
+In Kilo, add to `~/.config/kilo/kilo.jsonc`:
+
+```jsonc
+{
+  "mcp": {
+    "idalib": {
+      "type": "local",
+      "command": ["uv", "run", "idalib-mcp", "--stdio"],
+      "enabled": true,
+      "timeout": 600000
+    }
+  }
+}
+```
+
+Toggle on/off via Kilo's TUI: `Ctrl+P` → `/mcps` → toggle the idalib server.
+
+**Without Kilo (standalone):**
+```bash
+uv run idalib-mcp --stdio path/to/binary.exe
+```
+
+This starts the supervisor as an MCP stdio server, spawns a worker, and opens the binary.
+
+**Agent workflow:**
+
+| Step | Agent says | What happens |
+|---|---|---|
+| 1 | "Open `game.dll` for analysis" | Agent calls `idalib_idalib_open(input_path="...")` |
+| 2 | "What imports does it have?" | Agent calls `idalib_imports()` |
+| 3 | "Find callers of CreateFileW" | Agent calls `idalib_find_callers_of_import(name="CreateFileW")` |
+| 4 | "Close it and open `app.exe`" | Agent calls `idalib_close()` then `idalib_open(...)` |
+
+**Architecture:**
+
+```
+Agent ←MCP stdio→ Supervisor (idalib_supervisor.py) ←stdio pipes→ Worker 1 (game.dll)
+                                                      ←stdio pipes→ Worker 2 (app.exe)
+```
+
+- Workers communicate via **stdio pipes** (no HTTP server, no ports, no firewall issues)
+- Supervisor auto-discovers schemas via a **bootstrap worker** at startup
+- **Death watcher** polls workers every 5s; dead workers are cleaned up immediately
+- **Idle timeout** kills workers untouched for 30 min (config: `IDA_MCP_IDALIB_IDLE_TIMEOUT_SEC`)
+- **Max workers** defaults to 4 (config: `--max-workers` or `IDA_MCP_MAX_WORKERS`)
+- **Stderr captured** to `%TEMP%/idalib-worker-logs/` for debugging worker crashes
+- GUI fallback: if a binary is already open in IDA's GUI, the supervisor routes to it instead of spawning a headless worker
+
+**When to use headless vs GUI mode:**
+
+| Scenario | GUI plugin | Headless idalib |
+|---|---|---|
+| Interactive RE with visual analysis | ✅ Preferred | ❌ No GUI |
+| Automated batch analysis | ❌ | ✅ Preferred |
+| 300MB+ binaries that stress the GUI | ❌ May freeze | ✅ Process isolation |
+| Running 4+ binaries simultaneously | ❌ One at a time | ✅ Up to 8 workers |
+| CI/CD / server environments | ❌ | ✅ No display needed |
+
+---
+
 ## Environment notes
 
 - Python 3.11+ required (server and plugin side)
