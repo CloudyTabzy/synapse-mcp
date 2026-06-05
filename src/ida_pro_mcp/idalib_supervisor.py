@@ -55,6 +55,7 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_save",
     "idalib_health",
     "idalib_warmup",
+    "idalib_cleanup_zombies",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 
@@ -626,13 +627,14 @@ class IdalibSupervisor:
         return self._worker_rpc(worker, request_obj)
 
     def call_worker_tool(
-        self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None
+        self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None,
+        tool_timeout: float | None = None,
     ) -> Any:
         """Call a tool on a worker and return the structured content."""
         self._touch_worker(worker)
         # For GUI-backend workers, use the old HTTP path
         if worker.backend == "gui":
-            return self._gui_call_worker_tool(worker, name, arguments)
+            return self._gui_call_worker_tool(worker, name, arguments, tool_timeout=tool_timeout)
         response = self._worker_rpc(
             worker,
             {
@@ -641,6 +643,7 @@ class IdalibSupervisor:
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments or {}},
             },
+            timeout=tool_timeout,
         )
         if "error" in response:
             raise RuntimeError(response["error"].get("message", "Unknown worker error"))
@@ -784,6 +787,7 @@ class IdalibSupervisor:
         run_auto_analysis: bool = True,
         session_id: str | None = None,
         context_id: str | None = None,
+        open_timeout: float | None = None,
     ) -> WorkerSession:
         resolved = self._normalize_input_path(input_path)
         requested_session_id = session_id
@@ -831,6 +835,7 @@ class IdalibSupervisor:
                     "run_auto_analysis": run_auto_analysis,
                     "session_id": session_id,
                 },
+                tool_timeout=open_timeout,
             )
             if isinstance(opened, dict) and opened.get("error"):
                 raise RuntimeError(str(opened["error"]))
@@ -1144,6 +1149,7 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    open_timeout_sec: Annotated[Optional[float], "Timeout in seconds for opening the database (default: 120, increase for large binaries)"] = None,
 ) -> IdalibOpenResult:
     """Open a binary in its own idalib worker process and bind it to this context."""
     sup = _require_supervisor()
@@ -1154,6 +1160,7 @@ def idalib_open(
             run_auto_analysis=run_auto_analysis,
             session_id=session_id,
             context_id=context_id,
+            open_timeout=open_timeout_sec,
         )
         return {
             "success": True,
