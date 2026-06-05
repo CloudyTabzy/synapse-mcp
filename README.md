@@ -1,8 +1,8 @@
 # Synapse MCP
 
-> **One MCP server. Eleven analysis engines. 300+ tools. Zero configuration overhead.**
+> **One MCP server. Twelve analysis engines. 300+ tools. Zero configuration overhead.**
 
-A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: eleven distinct engines and over three hundred tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
+A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: twelve distinct engines and over three hundred tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
 
 Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NumPy charts the entropy landscape to pinpoint the encrypted regions, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Unicorn emulates the decryption stub concretely and patches the cleartext back into the IDB, Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all ten engines at once.
 
@@ -17,7 +17,8 @@ This is not a monolithic "powerhouse" that blasts every capability into memory r
 | 📦 Construct Format Parsing | `pip install construct` | 10 |
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
-| 🔍 LIEF Binary Analysis | `pip install lief` | 19 |
+| 🔍 LIEF Binary Analysis | `pip install lief` | 24 |
+| 🐘 ELF/DWARF Debug Info (pyelftools) | `pip install pyelftools>=0.31` | 6 |
 | 🎯 YARA Signature Scanning | `pip install yara-python` | 11 |
 | 🕸️ NetworkX Graph Metrics | `pip install networkx>=3.0` | 24 |
 | 🔢 NumPy Numerical Analysis | `pip install numpy>=2.0.0` | 9 |
@@ -132,7 +133,8 @@ Install optional analysis engines? (space=toggle, enter=confirm):
 [✓] Construct — declarative binary format parsing
 [✓] cstruct   — C-syntax struct/enum parsing
 [✓] filetype  — magic-byte file type identification
-[✓] lief      — binary format analysis, checksec, signatures
+[✓] lief      — binary format analysis, checksec, signatures, imphash, version info, debug dir, load config
+[✓] elf       — ELF/DWARF debug info: functions, line info, types, IDB sync (pyelftools, pure-Python)
 [✓] yara      — signature scanning, threat detection, IDB annotation
 ```
 
@@ -145,6 +147,7 @@ construct_status   → {"ok": true, "available": true, ...}
 cstruct_status     → {"ok": true, "available": true, ...}
 filetype_status    → {"ok": true, "available": true, ...}
 lief_status        → {"ok": true, "available": true, "version": "0.17.x", ...}
+elf_status         → {"ok": true, "available": true, "version": "0.31", ...}
 yara_status        → {"ok": true, "available": true, ...}
 nx_status          → {"ok": true, "available": true, ...}
 ```
@@ -179,6 +182,7 @@ flowchart TB
         L[filetype<br/>Magic Bytes]
         M[LIEF<br/>Binary Analysis]
         N[YARA<br/>Signature Scanning]
+        O[pyelftools<br/>ELF/DWARF]
         N2[NetworkX<br/>Graph Metrics]
         N3[Unicorn<br/>Concrete Emulation]
     end
@@ -201,6 +205,7 @@ flowchart TB
     F -.-> L
     F -.-> M
     F -.-> N
+    F -.-> O
     F -.-> N2
     F -.-> N3
     F -- "socket IPC\n(plain dicts)" --> I2
@@ -215,43 +220,50 @@ flowchart TB
 
 ## 🎯 Capability Matrix
 
-| Capability | Triton | Miasm | Angr | Unicorn | Construct | cstruct | filetype | LIEF | Native |
+| Capability | Triton | Miasm | Angr | Unicorn | Construct | cstruct | filetype | LIEF | pyelftools | Native |
 |-----------|:------:|:-----:|:----:|:-------:|:---------:|:-------:|:--------:|:----:|:------:|
-| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Concrete CPU emulation** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Decrypt stub execution (no debugger)** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Stackstring recovery** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **API-hash import resolution** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Shellcode syscall sandbox** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dynamic execution trace / loop detect | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ |
-| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
-| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Call-graph analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| CFG metrics / dominators | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Community detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Graph diff / ROP gadget graph | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Concrete CPU emulation** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Decrypt stub execution (no debugger)** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Stackstring recovery** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **API-hash import resolution** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Shellcode syscall sandbox** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dynamic execution trace / loop detect | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ | ⚪ |
+| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Imphash / malware family clustering | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| PE version info / resource analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| PDB path / GUID / symbol-server key | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| LoadConfig / GuardFlags / CastGuard | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| **DWARF function/type/line recovery** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| **DWARF → IDB name sync** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| **GNU symbol versioning** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Call-graph analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| CFG metrics / dominators | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Community detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Graph diff / ROP gadget graph | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
 
 ---
 
@@ -434,9 +446,14 @@ Requires: `pip install lief`
 
 | Tool | What it does |
 |------|-------------|
+| `lief_imphash` ⭐ | MD5 of normalized import table — the de-facto malware-family clustering hash (FireEye-origin, PEFILE mode) |
+| `lief_version_info` ⭐ | VS_VERSIONINFO fixed + string fields; CompanyName impersonation, OriginalFilename mismatch heuristics |
+| `lief_resources` ⭐ | Resource type/size enumeration, manifest XML decode (UAC requestedExecutionLevel), suspicious RCDATA detection (entropy + filetype guess) |
 | `lief_tls_callbacks` ⭐ | TLS callback addresses + IDA names — common anti-debug entry point |
 | `lief_verify_signature` ⭐ | Full Authenticode verification: cert chain, authentihash compare, countersignature timestamp |
 | `lief_rich_header` ⭐ | Decode Rich Header: VS component IDs, build numbers, compiler-version guess, SHA-256 fingerprint |
+| `lief_debug_directory` ⭐ | CodeView PDB path/GUID/age — symbol-server key, REPRO detection, dev-username leakage heuristics |
+| `lief_load_config` | Full LoadConfig: /GS cookie, SafeSEH, CFG GuardFlags decoded, CF/IAT/long-jump/EH counts, CastGuard |
 | `lief_pe_overlay` ⭐ | Detect/extract data after the last section: entropy, magic-byte type, packer/SFX notes |
 | `lief_guard_functions` ⭐ | CFG guard table (all protected indirect-call targets), longjump + EH continuation targets |
 
@@ -461,6 +478,34 @@ Requires: `pip install lief`
 | `hybrid_lief_yara_section_scan` | Scan each section independently with YARA rules; returns entropy + permissions per section |
 | `hybrid_lief_checksec_exploit_assess` | One-call exploit-surface rating: checksec + CFG + signature + overlay → HIGH/MEDIUM/LOW |
 | `hybrid_lief_sync_symbols` | Import LIEF export/dynamic/DWARF symbol names into the IDA database (dry_run=true by default) |
+
+### 🐘 pyelftools — ELF/DWARF Debug Info (`elf_*`, `hybrid_elf_*`)
+Requires: `pip install pyelftools>=0.31` (pure-Python, ~1 MB, zero native deps)
+
+Fills the gap LIEF's free tier cannot: **DWARF debug information** (function names, types, line numbers, locals). LIEF's DWARF/PDB support is locked behind the commercial **LIEF Extended** tier — pyelftools recovers it for free. Reads the source ELF file, not the IDB. DWARF 2–5 supported.
+
+**Status probe** (always available, even without pyelftools installed):
+
+| Tool | What it does |
+|------|-------------|
+| `elf_status` | Probe pyelftools availability, version, and DWARF subsystem status |
+
+**Core ELF analysis:**
+
+| Tool | What it does |
+|------|-------------|
+| `elf_symbols` | Read .symtab + .dynsym with type/bind/visibility/section + GNU symbol versioning |
+| `elf_dwarf_functions` ⭐ | Recover function inventory from .debug_info: name, low/high PC, return + parameter types, decl file:line |
+| `elf_dwarf_line_info` | Address → source file:line mapping (or all lines for a named function) from .debug_line |
+| `elf_dwarf_types` | Struct/union/enum/typedef layouts with member names, byte offsets, and types from DWARF DIEs |
+
+**IDA bridge:**
+
+| Tool | What it does |
+|------|-------------|
+| `hybrid_elf_sync_dwarf_to_idb` ⭐ | Apply DWARF-recovered function names into the IDA database — rename sub_* stubs, dry_run=True by default. The ELF analogue of `hybrid_lief_sync_symbols` |
+
+**Why pyelftools and not X:** pefile is fully superseded by LIEF (Tier 1 covers imphash/resources/version-info for free). pdbparse is GPL-licensed, stale, and IDA loads PDBs natively — the PDB path/GUID we want is free from `lief_debug_directory`. dotnetfile (.NET metadata) is deferred for a later phase.
 
 ### 🕸️ NetworkX — Graph Metrics (`nx_*`) 🧪 Needs More Testing
 Requires: `pip install networkx>=3.0`

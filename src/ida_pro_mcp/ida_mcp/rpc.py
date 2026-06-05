@@ -69,6 +69,7 @@ _TOOL_MODULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("construct_", "formats"),
     ("cstruct_", "formats"),
     ("filetype_", "formats"),
+    ("elf_", "formats"),
     ("nx_", "recon"),
     ("flirt_", "recon"),
     ("sig_", "recon"),
@@ -230,7 +231,7 @@ def get_tool_group(name: str) -> str:
     if name.startswith("hybrid_"):
         if any(x in name for x in ("triton", "miasm", "angr")):
             return "symbolic"
-        if any(x in name for x in ("lief", "yara", "construct", "cstruct")):
+        if any(x in name for x in ("lief", "yara", "construct", "cstruct", "elf")):
             return "formats"
         return "core"
     if name.startswith("workflow_"):

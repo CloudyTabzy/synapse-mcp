@@ -604,6 +604,12 @@ OPTIONAL_PACKAGES = {
         "display": "NumPy   — entropy maps, byte histograms, XOR recovery, similarity",
         "min_version": "2.0.0",
     },
+    "elf": {
+        "pip_name": "pyelftools",
+        "import_name": "elftools",
+        "display": "pyelftools — ELF/DWARF: symbols, functions, line info, types, IDB sync",
+        "min_version": "0.31",
+    },
 }
 
 
