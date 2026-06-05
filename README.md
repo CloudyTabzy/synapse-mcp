@@ -1,10 +1,10 @@
 # Synapse MCP
 
-> **One MCP server. Ten analysis engines. 260+ tools. Zero configuration overhead.**
+> **One MCP server. Eleven analysis engines. 300+ tools. Zero configuration overhead.**
 
-A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: ten distinct engines and over two hundred and sixty tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
+A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: eleven distinct engines and over three hundred tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
 
-Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Unicorn emulates the decryption stub concretely and patches the cleartext back into the IDB, Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all ten engines at once.
+Drop a packed PE onto IDA and the *static* synapses ignite first — LIEF maps the headers, YARA scans for signatures, NumPy charts the entropy landscape to pinpoint the encrypted regions, NetworkX traces the call graph — giving the agent a structural blueprint without ever loading a symbolic solver. Hit an encrypted VM stub and the system dynamically bridges to the *heavy* synapses: Unicorn emulates the decryption stub concretely and patches the cleartext back into the IDB, Triton builds path constraints, Miasm lifts the obfuscated IR, and angr explores the reachable state space. When the puzzle is solved, those pathways fade back to idle. The agent never carries the cognitive weight of all ten engines at once.
 
 This is not a monolithic "powerhouse" that blasts every capability into memory regardless of need. It is a digital nervous system: situational, adaptive, and ruthlessly efficient. Lazy profiles route each signal to the right synapse, so the context window stays clean for thinking — not cataloging.
 
@@ -20,6 +20,7 @@ This is not a monolithic "powerhouse" that blasts every capability into memory r
 | 🔍 LIEF Binary Analysis | `pip install lief` | 19 |
 | 🎯 YARA Signature Scanning | `pip install yara-python` | 11 |
 | 🕸️ NetworkX Graph Metrics | `pip install networkx>=3.0` | 24 |
+| 🔢 NumPy Numerical Analysis | `pip install numpy>=2.0.0` | 9 |
 | 🛡️ Native IDA (core + recon + hybrid) | Built-in | 124 |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
@@ -536,6 +537,42 @@ workflow_unicorn_decrypt_analyze(decrypt_stub=0x148C000, encrypted_start=0x14930
   → 12 functions defined, entropy delta −2.73
 ```
 
+### 🔢 NumPy — Numerical Analysis (`numpy_*`)
+Requires: `pip install numpy>=2.0.0` (included in `--install-deps all`)
+
+> **Why it matters:** a single per-section entropy value tells you a `.text` is "high entropy" — it does **not** tell you *where* inside the encrypted blob the recoverable code islands are. NumPy operates on the large, agent-chosen byte regions where vectorization is a real win, turning "this section is packed" into "these byte ranges are encrypted, these gaps are code." The pure-Python entropy/similarity helpers elsewhere in the plugin run on tiny inputs and are deliberately left alone — NumPy's value here is **additive**, not a retrofit.
+
+**Status probe** (always available, even without numpy installed):
+
+| Tool | What it does |
+|------|-------------|
+| `numpy_status` | Probe NumPy availability and version |
+
+**Region analysis:**
+
+| Tool | What it does |
+|------|-------------|
+| `numpy_entropy_map` ⭐ | Block-level Shannon entropy heatmap with contiguous high-entropy run detection — pinpoints encrypted/packed segments inside a section without dumping tens of thousands of rows. Optional per-byte-offset column variance for fixed-field detection |
+| `numpy_byte_histogram` | 256-bucket byte distribution + chi-square uniformity test — distinguishes AES/stream-cipher output from XOR obfuscation from plaintext/code in one call |
+| `numpy_xor_key_recovery` ⭐ | Repeating-XOR key recovery: index-of-coincidence key-length detection (GCD-of-peaks) + per-column frequency analysis, validated by a printable / null-run / entropy composite. Handles single-byte through multi-byte keys on text and binary plaintext |
+| `numpy_value_scan` | Interpret a raw/decrypted region as a typed `u1`–`u8` / `i*` / `f*` array and classify it — pointer_table (values land in the image range), counter_or_sequence, constant, mixed_data — for triaging blobs IDA hasn't typed |
+
+**Similarity & profiling:**
+
+| Tool | What it does |
+|------|-------------|
+| `numpy_function_similarity` | Bytecode-level cosine / EMBER byte-entropy / NCC similarity between two functions — complements the semantic `find_similar_functions` by catching byte-level clones (same routine, different name/address) |
+| `numpy_binary_similarity` | Whole-file byte-distribution similarity between two binaries — "is this dropped payload / sibling DLL a variant?" Either path defaults to the active IDB source, so you can compare against a file without loading it into IDA |
+| `numpy_opcode_histogram` | Instruction mnemonic frequency profile + branch/call/arith/nop ratios + mnemonic-distribution entropy + obfuscation anomaly flags — triage junk/obfuscation without a full decompile |
+
+**File scanning:**
+
+| Tool | What it does |
+|------|-------------|
+| `numpy_memmap_scan` | Memory-mapped byte-pattern search with `??` wildcards over any file on disk — large files without RAM limits; anchors on the longest fixed run, verifies the masked pattern with NumPy. Not IDA-bound |
+
+**Bulk-result enrichment:** `lief_sections`, `get_bulk_function_hashes`, and `func_query` now carry a `summary` block (mean / median / stdev / min / max / p25 / p75 / p95 with outlier labels) so the agent gets the distribution at a glance instead of scanning hundreds of rows. Computed by a pure-Python helper — no NumPy dependency added to those tools.
+
 ### 🔧 Enhanced Native Tools — Core & Analysis (`api_core.py`, `api_analysis.py`)
 No extra dependencies.
 
@@ -943,7 +980,7 @@ Feature freeze is in effect. The focus is now on **stability, accuracy, and hard
 
 These ideas are documented but **not scheduled**. They will only be picked up if a concrete use-case demands them.
 
-- **Numpy / SciPy integration** — entropy heatmaps, byte-histogram similarity, spectral analysis for crypto constants.
+- ✅ **Numpy integration — DONE.** Shipped as `api_numpy.py` (9 tools: entropy maps, byte histograms, XOR key recovery, function/binary similarity, opcode profiling, typed value scanning, memmap pattern search) plus `summary` enrichment on bulk tools. See the **🔢 NumPy** section above. *SciPy spectral analysis for crypto constants was evaluated and intentionally not built — YARA's `yara_scan_builtin_crypto` is far more reliable than FFT on code bytes.*
 - **Capstone / Keystone** — independent disassembly/assembly outside IDA's state.
 - **Unicorn Engine** — concrete emulation of decrypt stubs and VM interpreters.
 - **Standalone Z3 bridge** — direct SMT solving without pulling in Triton or Angr.

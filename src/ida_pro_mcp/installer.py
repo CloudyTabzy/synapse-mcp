@@ -598,6 +598,12 @@ OPTIONAL_PACKAGES = {
         "display": "Unicorn — concrete CPU emulation (decrypt stubs, shellcode, hashes)",
         "min_version": "2.1.0",
     },
+    "numpy": {
+        "pip_name": "numpy",
+        "import_name": "numpy",
+        "display": "NumPy   — entropy maps, byte histograms, XOR recovery, similarity",
+        "min_version": "2.0.0",
+    },
 }
 
 
