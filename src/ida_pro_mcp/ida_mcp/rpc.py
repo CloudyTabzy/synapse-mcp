@@ -1,8 +1,28 @@
+import inspect
 import json
 import os
 import threading
 from typing import Any, Optional
 from .arg_aliases import normalize_tool_args
+
+
+def _tool_param_names(fn) -> "set[str] | None":
+    """Return the set of a tool's declared parameter names, or None if it cannot
+    be determined reliably (e.g. the function accepts **kwargs). None disables
+    the schema-aware alias reversal and falls back to blind normalization.
+    """
+    if fn is None:
+        return None
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return None
+    names: set[str] = set()
+    for p in sig.parameters.values():
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            return None  # *args/**kwargs — real params unknowable
+        names.add(p.name)
+    return names or None
 from .zeromcp import (
     McpRpcRegistry,
     McpServer,
@@ -318,14 +338,20 @@ def _install_tools_call_patch() -> None:
     def patched(
         name: str, arguments: Optional[dict] = None, _meta: Optional[dict] = None
     ) -> dict:
+        tool_fn = MCP_SERVER.tools.methods.get(name)
+
         # Normalize arg aliases before dispatch so every MCP transport
         # (HTTP, SSE, stdio proxy) benefits — not just proxy-routed calls.
+        # Pass the tool's real parameter names so the schema-aware reversal can
+        # restore canonical names (addr, max_results, …) that a blind global
+        # rename would otherwise leave the tool unable to accept.
         if arguments:
-            arguments = normalize_tool_args(name, arguments)
+            arguments = normalize_tool_args(
+                name, arguments, valid_params=_tool_param_names(tool_fn)
+            )
 
         # === auto-async: if the tool has prefer_async=True, auto-submit
         # as a background task so the agent never times out waiting ===
-        tool_fn = MCP_SERVER.tools.methods.get(name)
         if (tool_fn is not None
                 and getattr(tool_fn, "__ida_mcp_prefer_async__", False)
                 and not getattr(_reentry, "active", False)):

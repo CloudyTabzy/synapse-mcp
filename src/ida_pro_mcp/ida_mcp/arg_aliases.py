@@ -18,6 +18,20 @@ The rule is: only rename when the source key is present AND the target
 key is absent.  When both are present the canonical key wins silently.
 This makes the operation idempotent — double-normalizing a request is
 safe and produces the same result.
+
+Schema-aware safety net
+-----------------------
+When the caller passes ``valid_params`` (the set of parameter names the
+target tool actually declares), a final reversal pass undoes any global
+rename that produced a key the tool does not accept.  Example: the global
+``addr`` → ``address`` rename fires, but the tool's real parameter is
+``addr``; the reversal restores ``addr``.  This means a tool can never
+become unreachable just because it uses a canonical name (``addr``,
+``max_results``, …) without a hand-written per-tool reversal entry — which
+is exactly the bug class that previously broke new tools.  The reversal is
+purely additive: it only acts when a key is present that the tool cannot
+accept while its alias-equivalent IS a declared parameter, so it never
+changes the result for a tool that is already receiving valid arguments.
 """
 
 # ---------------------------------------------------------------------------
@@ -199,11 +213,20 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
 }
 
 
-def normalize_tool_args(tool_name: str, args: dict) -> dict:
+def normalize_tool_args(
+    tool_name: str, args: dict, valid_params: "set[str] | None" = None
+) -> dict:
     """Rewrite variant/alias arg names to their canonical equivalents.
 
     Never drops unrecognised keys.  When both the alias and the canonical
     key are present the canonical key wins and the alias is discarded.
+
+    ``valid_params`` (optional) is the set of parameter names the target tool
+    actually declares.  When provided, a final schema-aware reversal undoes any
+    global rename that produced a key the tool does not accept — so a tool using
+    a canonical name (``addr``, ``max_results``, …) works without needing a
+    hand-written per-tool reversal.  Pass ``None`` (the default) to skip the
+    reversal, e.g. from a transport that has no access to tool schemas.
     """
     if not args:
         return args
@@ -214,4 +237,13 @@ def normalize_tool_args(tool_name: str, args: dict) -> dict:
     for old, new in _TOOL_ARG_ALIASES.get(tool_name, {}).items():
         if old in result and new not in result:
             result[new] = result.pop(old)
+    # Schema-aware reversal — only when we know the tool's real parameters.
+    # Undo a global rename X→Y when the result carries Y but the tool declares
+    # X (and not Y).  Strict conditions make this a pure safety net: it never
+    # touches a tool that is already receiving a valid argument set.
+    if valid_params is not None:
+        for old, new in _GLOBAL_ARG_ALIASES.items():
+            if (new in result and new not in valid_params
+                    and old in valid_params and old not in result):
+                result[old] = result.pop(new)
     return result

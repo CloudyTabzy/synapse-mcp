@@ -634,19 +634,42 @@ def _classify_exc(exc: Exception) -> str:
     return "internal_error"
 
 
+def _is_expected_error(exc: Exception) -> bool:
+    """True for user-facing conditions that should not spam IDA's console with a
+    traceback — bad input, not-found, missing dependency, timeout, etc.
+
+    Only ``internal_error`` (an unrecognised/unexpected failure) keeps the full
+    traceback, because that is the one case where the stack is actually useful
+    for debugging. Everything else is an expected outcome of agent input and is
+    fully reported in the tool's returned ``error`` field anyway.
+    """
+    return _classify_exc(exc) != "internal_error"
+
+
+def _log_tool_exc(label: str, context: str, exc: Exception, msg: str) -> None:
+    """Log a tool exception, with a traceback only for genuine internal errors."""
+    if _is_expected_error(exc):
+        _log.warning("%s [%s]: %s", label, context or type(exc).__name__, msg)
+    else:
+        _log.exception("%s [%s]: %s", label, context or type(exc).__name__, msg)
+
+
 def tool_error(exc: Exception, context: str = "", hint: str | None = None) -> dict:
-    """Build a top-level structured error dict and log the exception with traceback.
+    """Build a top-level structured error dict and log the exception.
 
     Returns ``{"ok": False, "error": "<context>: <msg>", "error_type": "..."}``.
-    Call this inside a top-level ``except`` block so ``_log.exception`` captures
-    the active traceback.
+    Expected, user-facing errors (bad address, invalid input, not-found, missing
+    dependency, timeout) are logged at WARNING without a traceback so they do not
+    appear as scary "Traceback" blocks in IDA's console — they are already fully
+    reported in the returned ``error`` field. Only ``internal_error`` keeps the
+    traceback. Call this inside a top-level ``except`` block.
     """
     msg = str(exc)
     error_str = f"{context}: {msg}" if (context and msg) else (context or msg)
     result: dict = {"ok": False, "error": error_str, "error_type": _classify_exc(exc)}
     if hint:
         result["hint"] = hint
-    _log.exception("Tool error [%s]: %s", context or type(exc).__name__, msg)
+    _log_tool_exc("Tool error", context, exc, msg)
     return result
 
 
@@ -655,18 +678,15 @@ def item_error(exc: Exception, context: str = "", hint: str | None = None) -> di
 
     Use inside batch-operation loops where each item in the result list carries
     its own error field.  Returns ``{"error": "<context>: <msg>", "error_type": "..."}``.
+    Like ``tool_error``, expected user-facing errors are logged without a
+    traceback; only genuine internal errors keep one.
     """
     msg = str(exc)
     error_str = f"{context}: {msg}" if (context and msg) else (context or msg)
     result: dict = {"error": error_str, "error_type": _classify_exc(exc)}
     if hint:
         result["hint"] = hint
-    if isinstance(exc, IDAError):
-        # IDAError is an expected, user-facing condition (not found, bad input, etc.).
-        # Log at WARNING without traceback to avoid flooding the IDA output log.
-        _log.warning("Item error [%s]: %s", context or type(exc).__name__, msg)
-    else:
-        _log.exception("Item error [%s]: %s", context or type(exc).__name__, msg)
+    _log_tool_exc("Item error", context, exc, msg)
     return result
 
 
