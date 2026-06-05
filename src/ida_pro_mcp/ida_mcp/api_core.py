@@ -199,6 +199,7 @@ _server_started_at = time.time()
 # find_regex/search_text for auto-async routing on very_large binaries.
 _BINARY_CLASS: str = "small"
 _BINARY_CLASS_INITIALIZED: bool = False
+_FUNC_COUNT_CACHE: int = 0  # set by _ensure_binary_class / _build_health_payload
 
 
 def _ensure_binary_class() -> None:
@@ -207,12 +208,13 @@ def _ensure_binary_class() -> None:
     Called from find_regex / search_text when _BINARY_CLASS is still 'small'.
     Avoids calling slow IDA APIs at module load time.
     """
-    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED
+    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED, _FUNC_COUNT_CACHE
     if _BINARY_CLASS_INITIALIZED:
         return
     try:
         import ida_funcs, ida_segment, ida_nalt
         func_count = ida_funcs.get_func_qty()
+        _FUNC_COUNT_CACHE = func_count
         binary_mb = max(1.0, ida_nalt.retrieve_input_file_size() / (1024 * 1024))
         if func_count > 50000 or binary_mb > 40:
             _BINARY_CLASS = "very_large"
@@ -551,9 +553,10 @@ def _build_health_payload() -> dict:
     result["binary_class"] = binary_class
     result["reliability_notes"] = notes
 
-    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED
+    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED, _FUNC_COUNT_CACHE
     _BINARY_CLASS = binary_class
     _BINARY_CLASS_INITIALIZED = True
+    _FUNC_COUNT_CACHE = func_count
 
     return result
 

@@ -372,32 +372,42 @@ def _install_tools_call_patch() -> None:
                 except Exception:
                     pass  # fall through to synchronous execution
 
-        # === auto-async for very_large binaries: find_regex and search_text
-        # must never run synchronously on binaries with 95K+ functions.
-        # Uses the same _reentry guard as the prefer_async path above so
-        # the task worker can re-dispatch synchronously. ===
+        # === Strict guard for very_large binaries ===
+        # find_regex and search_text cannot run safely on binaries with 95K+
+        # functions — IDA's main thread is non-interruptible. Rather than
+        # trying to run these asynchronously (which still blocks the main
+        # thread and crashes the HTTP plugin), we reject them upfront with
+        # actionable alternatives.
         if (name in ("find_regex", "search_text")
                 and not getattr(_reentry, "active", False)):
             from . import api_core as _core
             if not _core._BINARY_CLASS_INITIALIZED:
                 _core._ensure_binary_class()
             if _core._BINARY_CLASS == "very_large":
-                task_submit_fn = MCP_SERVER.tools.methods.get("task_submit")
-                if task_submit_fn is not None:
-                    try:
-                        result = task_submit_fn(tool_name=name, arguments=arguments or {})
-                        if result.get("task_id"):
-                            return {
-                                "structuredContent": result,
-                                "content": [{
-                                    "type": "text",
-                                    "text": json.dumps(result, separators=(",", ":")),
-                                }],
-                                "isError": False,
-                                "_meta": {"ida_mcp": {"async_submit": True}},
-                            }
-                    except Exception:
-                        pass
+                if name == "find_regex":
+                    alt = ("Use `lief_strings(file_path=...)` for raw file byte scanning "
+                           "(works outside IDA's string database), "
+                           "`find_callers_of_import(name=...)` for import tracing, "
+                           "or `numpy_memmap_scan(file_path=..., pattern_hex=...)` "
+                           "for hex pattern search. On smaller binaries (use "
+                           "`server_health` to check), this tool is safe.")
+                else:
+                    alt = ("Use `find_regex(pattern=...)` with a narrow pattern instead. "
+                           "On smaller binaries (use `server_health` to check), "
+                           "this tool is safe for text search.")
+                error_msg = (
+                    f"`{name}` cannot run on this binary (class: {_core._BINARY_CLASS}, "
+                    f"{_core._function_count_str()} functions). "
+                    f"IDA's main thread is non-interruptible and this operation "
+                    f"would block or crash the HTTP plugin. {alt}"
+                )
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({"ok": False, "error": error_msg}, separators=(",", ":")),
+                    }],
+                    "isError": True,
+                }
 
         response = original(name, arguments, _meta)
 
