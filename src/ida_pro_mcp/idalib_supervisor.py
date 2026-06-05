@@ -392,12 +392,23 @@ class IdalibSupervisor:
             str(port),
             *self.worker_args,
         ]
-        logger.info("Spawning idalib worker on 127.0.0.1:%d", port)
+        env = dict(os.environ)
+        if "IDADIR" not in env:
+            for candidate in (
+                os.environ.get("IDADIR", ""),
+                r"C:\Program Files\IDA Professional 9.3",
+                r"C:\Program Files\IDA Pro 9.3",
+            ):
+                if candidate and Path(candidate).is_dir():
+                    env["IDADIR"] = str(Path(candidate))
+                    break
+        logger.info("Spawning idalib worker on 127.0.0.1:%d (IDADIR=%s)", port, env.get("IDADIR", "unset"))
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=env,
         )
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
