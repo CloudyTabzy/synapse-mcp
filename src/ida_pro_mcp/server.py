@@ -244,6 +244,27 @@ def _record_heartbeat_failure() -> None:
         _heartbeat_failures += 1
         if _heartbeat_failures >= _HEARTBEAT_MAX_MISSED:
             _heartbeat_alive = False
+            # Try reconnection before giving up entirely
+            _try_reconnect()
+
+def _try_reconnect() -> bool:
+    """Attempt a fresh probe to IDA. Returns True on success."""
+    global _heartbeat_alive, _heartbeat_failures, _heartbeat_last_ok, IDA_HOST, IDA_PORT
+    print("[MCP] Heartbeat lost — attempting reconnection...", file=sys.stderr)
+    try:
+        probe_resp = _proxy_to_instance(IDA_HOST, IDA_PORT, {
+            "jsonrpc": "2.0", "id": "rc", "method": "server_health", "params": {}
+        })
+        if probe_resp and "result" in probe_resp:
+            with _heartbeat_lock:
+                _heartbeat_alive = True
+                _heartbeat_last_ok = time.monotonic()
+                _heartbeat_failures = 0
+            print(f"[MCP] Reconnected to {IDA_HOST}:{IDA_PORT}", file=sys.stderr)
+            return True
+    except Exception as e:
+        print(f"[MCP] Reconnection failed: {e}", file=sys.stderr)
+    return False
 
 
 def _start_heartbeat(host: str, port: int) -> None:
@@ -268,14 +289,15 @@ def _check_heartbeat(timeout: float = 5.0) -> bool:
     """Return True if the last heartbeat was successful within the given timeout window.
     
     Also performs an immediate synchronous health check if the heartbeat is stale,
-    since a single failed ping shouldn't abort the entire session.
+    since a single failed ping shouldn't abort the entire session. If all checks
+    fail, attempts reconnection before returning False.
     """
     with _heartbeat_lock:
         alive = _heartbeat_alive
         last_ok = _heartbeat_last_ok
     if alive:
         return True
-    # Heartbeat is marked dead — try one synchronous probe as last resort
+    # Heartbeat is marked dead — try one synchronous probe
     ago = time.monotonic() - last_ok
     if ago > _HEARTBEAT_INTERVAL_SEC:
         host, port = _get_active_ida_target()
@@ -295,7 +317,8 @@ def _check_heartbeat(timeout: float = 5.0) -> bool:
                 return True
         except Exception:
             pass
-    return False
+    # Last resort: try reconnection
+    return _try_reconnect()
 
 
 # ---------------------------------------------------------------------------

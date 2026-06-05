@@ -195,6 +195,9 @@ class SearchTextResult(TypedDict, total=False):
 # Cached strings list: [(ea, text), ...]
 _strings_cache: list[tuple[int, str]] | None = None
 _server_started_at = time.time()
+# Cached binary classification — set once by _build_health_payload, used by
+# find_regex/search_text for auto-async routing on very_large binaries.
+_BINARY_CLASS: str = "small"
 
 
 def _get_strings_cache() -> list[tuple[int, str]]:
@@ -523,6 +526,10 @@ def _build_health_payload() -> dict:
 
     result["binary_class"] = binary_class
     result["reliability_notes"] = notes
+
+    global _BINARY_CLASS
+    _BINARY_CLASS = binary_class
+
     return result
 
 
@@ -1427,7 +1434,21 @@ def find_regex(
     See also: lief_strings (raw file bytes, works on any file on disk),
     search_text (disassembly/comment search), entity_query (full catalog),
     list_strings (simple string dump).
+
+    LATENCY: Linear in string count. On very_large binaries (95K+ functions), use
+    task_submit or narrow patterns (max 20 chars). This tool auto-redirects to a
+    background task when the binary is classified as very_large.
     """
+    if _BINARY_CLASS == "very_large":
+        from .api_tasks import task_submit as _ts
+        tid = _ts(tool_name="find_regex", arguments=dict(
+            pattern=pattern, limit=limit, offset=offset,
+            search_strings=search_strings, search_names=search_names,
+            scan_raw=scan_raw,
+        ))
+        return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
+                "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
+
     if limit <= 0:
         limit = 50
     if limit > 500:
@@ -1611,7 +1632,20 @@ def search_text(
 
     See also: find_regex (regex search across strings/symbol names),
     insn_query (instruction pattern search).
+
+    LATENCY: Linear in binary size. On very_large binaries (95K+ functions), this
+    will time out — use find_regex with short patterns instead. Auto-routes to a
+    background task when the binary is classified as very_large.
     """
+    if _BINARY_CLASS == "very_large":
+        from .api_tasks import task_submit as _ts
+        tid = _ts(tool_name="search_text", arguments=dict(
+            pattern=pattern, limit=limit, cursor=cursor, regex=regex,
+            case_sensitive=case_sensitive, include=include, code_only=code_only,
+        ))
+        return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
+                "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
+
     if limit <= 0:
         limit = 30
     if limit > 500:
