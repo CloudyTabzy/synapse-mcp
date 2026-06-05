@@ -160,6 +160,21 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
                 self._handle_output_download(output_match.group(1), output_match.group(2))
                 return
 
+            # MCP Streamable HTTP: GET /mcp is an optional SSE pre-connect probe.
+            # The zeromcp base handler returns 405, which causes some MCP clients
+            # (Kilo, Cursor) to fail instead of falling through to POST /mcp.
+            # Per the MCP spec, 200 OK signals "no SSE stream, use POST".
+            if path == "/mcp" or path.rstrip("/") == "/mcp":
+                if not self._check_api_request():
+                    return
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+                return
+
             super().do_GET()
         finally:
             set_request_proxied(False)
