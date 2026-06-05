@@ -198,6 +198,30 @@ _server_started_at = time.time()
 # Cached binary classification — set once by _build_health_payload, used by
 # find_regex/search_text for auto-async routing on very_large binaries.
 _BINARY_CLASS: str = "small"
+_BINARY_CLASS_INITIALIZED: bool = False
+
+
+def _ensure_binary_class() -> None:
+    """Lazy-init _BINARY_CLASS on the first call to a size-sensitive tool.
+    
+    Called from find_regex / search_text when _BINARY_CLASS is still 'small'.
+    Avoids calling slow IDA APIs at module load time.
+    """
+    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED
+    if _BINARY_CLASS_INITIALIZED:
+        return
+    try:
+        import ida_funcs, ida_segment, ida_nalt
+        func_count = ida_funcs.get_func_qty()
+        binary_mb = max(1.0, ida_nalt.retrieve_input_file_size() / (1024 * 1024))
+        if func_count > 50000 or binary_mb > 40:
+            _BINARY_CLASS = "very_large"
+        elif func_count > 10000 or binary_mb > 15:
+            _BINARY_CLASS = "large"
+        # else stays "small"
+    except Exception:
+        pass
+    _BINARY_CLASS_INITIALIZED = True
 
 
 def _get_strings_cache() -> list[tuple[int, str]]:
@@ -527,8 +551,9 @@ def _build_health_payload() -> dict:
     result["binary_class"] = binary_class
     result["reliability_notes"] = notes
 
-    global _BINARY_CLASS
+    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED
     _BINARY_CLASS = binary_class
+    _BINARY_CLASS_INITIALIZED = True
 
     return result
 
@@ -1439,7 +1464,7 @@ def find_regex(
     task_submit or narrow patterns (max 20 chars). This tool auto-redirects to a
     background task when the binary is classified as very_large.
     """
-    if _BINARY_CLASS == "very_large":
+    if _BINARY_CLASS == "very_large" or (not _BINARY_CLASS_INITIALIZED and _ensure_binary_class() is None and _BINARY_CLASS == "very_large"):
         from .rpc import MCP_SERVER
         guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
         if not getattr(guard, "active", False):
@@ -1450,6 +1475,7 @@ def find_regex(
                 scan_raw=scan_raw,
             ))
             return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
+                    "_meta": {"ida_mcp": {"async_submit": True}},
                     "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
 
     if limit <= 0:
@@ -1459,6 +1485,8 @@ def find_regex(
 
     try:
         regex = re.compile(pattern, re.IGNORECASE)
+
+    # ... (find_regex body continues)
     except re.error as e:
         return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"Invalid regex: {e}"}
 
@@ -1640,7 +1668,7 @@ def search_text(
     will time out — use find_regex with short patterns instead. Auto-routes to a
     background task when the binary is classified as very_large.
     """
-    if _BINARY_CLASS == "very_large":
+    if _BINARY_CLASS == "very_large" or (not _BINARY_CLASS_INITIALIZED and _ensure_binary_class() is None and _BINARY_CLASS == "very_large"):
         from .rpc import MCP_SERVER
         guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
         if not getattr(guard, "active", False):
@@ -1650,6 +1678,7 @@ def search_text(
                 case_sensitive=case_sensitive, include=include, code_only=code_only,
             ))
             return {"ok": True, "auto_async": True, "task_id": tid.get("task_id"),
+                    "_meta": {"ida_mcp": {"async_submit": True}},
                     "note": "Binary is very_large — auto-routed to background task. Poll with task_poll()."}
 
     if limit <= 0:
