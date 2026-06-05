@@ -397,7 +397,7 @@ def _install_tools_call_patch() -> None:
                            "this tool is safe for text search.")
                 error_msg = (
                     f"`{name}` cannot run on this binary (class: {_core._BINARY_CLASS}, "
-                    f"{_core._function_count_str()} functions). "
+                    f"{_core._FUNC_COUNT_CACHE} functions). "
                     f"IDA's main thread is non-interruptible and this operation "
                     f"would block or crash the HTTP plugin. {alt}"
                 )
