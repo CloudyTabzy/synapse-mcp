@@ -461,21 +461,30 @@ def _build_health_payload() -> dict:
     result["alias_tips"] = tips
 
     # Binary-size classification so agents can self-adapt before making calls.
+    # Use APIs that work BEFORE auto-analysis completes — no full enumeration.
     try:
-        seg_count = len(list(ida_segment.get_segm_qty()))
-        func_count = len(list(idautils.Functions()))
-        str_count = sum(1 for _ in idautils.Strings())
+        seg_count = ida_segment.get_segm_qty()
     except Exception:
         seg_count = 0
-        func_count = 0
-        str_count = 0
 
-    image_size = idaapi.get_imagebase()  # the last segment's end minus base is the full image
     try:
-        last_seg_end = max(s.end_ea for s in idautils.Segments())
-        binary_bytes = last_seg_end - idaapi.get_imagebase()
+        func_count = ida_funcs.get_func_qty()
     except Exception:
-        binary_bytes = 0
+        func_count = 0
+
+    # String count is enumerative — skip on large binaries; the
+    # strings_cache already tracks this reliably.
+    str_count = len(_strings_cache) if _strings_cache is not None else 0
+
+    # Binary size: try get_input_file_size (works pre-analysis), fall back
+    # to the segment-based range if that fails.
+    try:
+        binary_bytes = ida_nalt.get_input_file_size()
+    except Exception:
+        try:
+            binary_bytes = idaapi.inf_get_max_ea() - idaapi.inf_get_min_ea()
+        except Exception:
+            binary_bytes = 0
     binary_mb = round(binary_bytes / (1024 * 1024), 2)
 
     result["segment_count"] = seg_count
