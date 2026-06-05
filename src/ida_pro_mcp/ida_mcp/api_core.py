@@ -1442,7 +1442,7 @@ def find_regex(
     if _BINARY_CLASS == "very_large":
         from .rpc import MCP_SERVER
         guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
-        if guard is None or not guard.active:
+        if not getattr(guard, "active", False):
             from .api_tasks import task_submit as _ts
             tid = _ts(tool_name="find_regex", arguments=dict(
                 pattern=pattern, limit=limit, offset=offset,
@@ -1643,7 +1643,7 @@ def search_text(
     if _BINARY_CLASS == "very_large":
         from .rpc import MCP_SERVER
         guard = getattr(MCP_SERVER.registry, "_reentry_guard", None)
-        if guard is None or not guard.active:
+        if not getattr(guard, "active", False):
             from .api_tasks import task_submit as _ts
             tid = _ts(tool_name="search_text", arguments=dict(
                 pattern=pattern, limit=limit, cursor=cursor, regex=regex,
