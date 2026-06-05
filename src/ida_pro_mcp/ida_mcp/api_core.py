@@ -476,10 +476,9 @@ def _build_health_payload() -> dict:
     # strings_cache already tracks this reliably.
     str_count = len(_strings_cache) if _strings_cache is not None else 0
 
-    # Binary size: try get_input_file_size (works pre-analysis), fall back
-    # to the segment-based range if that fails.
+    # Binary size: retrieve_input_file_size() works even before auto-analysis.
     try:
-        binary_bytes = ida_nalt.get_input_file_size()
+        binary_bytes = ida_nalt.retrieve_input_file_size()
     except Exception:
         try:
             binary_bytes = idaapi.inf_get_max_ea() - idaapi.inf_get_min_ea()
