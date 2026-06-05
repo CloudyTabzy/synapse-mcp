@@ -57,6 +57,8 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_warmup",
     "idalib_cleanup_zombies",
     "idalib_task_poll",
+    "idalib_cancel_task",
+    "idalib_start_analysis",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 
@@ -199,6 +201,33 @@ class IdalibWarmupResult(IdalibContextFields, total=False):
     error: str | None
 
 
+def _estimate_analysis_time(size_mb: float) -> int:
+    """Estimate auto-analysis time in seconds based on file size.
+
+    Calibrated against libpersona.dll (343 MB, ~35 min / 2100 s).
+    Piecewise linear model with conservative (high) estimates:
+      - <= 10 MB : 30 + size_mb * 3  (~1 min for 10 MB)
+      - 10-100 MB: 60 + size_mb * 5  (~5 min for 50 MB, ~9 min for 100 MB)
+      - > 100 MB : 60 + size_mb * 6  (~35 min for 343 MB)
+    """
+    if size_mb <= 10:
+        return int(30 + size_mb * 3)
+    elif size_mb <= 100:
+        return int(60 + size_mb * 5)
+    else:
+        return int(60 + size_mb * 6)
+
+
+def _format_duration(seconds: int) -> str:
+    """Format seconds into a human-readable duration string."""
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    else:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
 @dataclass
 class WorkerSession:
     session_id: str
@@ -275,6 +304,7 @@ class IdalibSupervisor:
         self._death_watcher: Thread | None = None
         self._bootstrap_completed = False
         self._open_tasks: dict[str, dict[str, Any]] = {}
+        self._open_task_threads: dict[str, tuple[Thread, WorkerSession | None]] = {}
         if _IDLE_TIMEOUT_S > 0 or True:
             self._start_death_watcher()
 
@@ -1178,12 +1208,20 @@ def idalib_open(
 ) -> dict:
     """Open a binary in its own idalib worker process and bind it to this context.
 
-    For binaries >10 MB, large_file_async is set — the binary opens in a
-    background worker and a task_id is returned immediately. Poll with
-    idalib_idalib_list() to check when the session appears.
+    ANALYSIS TIME GUIDE (run_auto_analysis=True):
+    - Files <10 MB  : ~30s–2min
+    - Files 10-50 MB: ~2–8min
+    - Files 50-100 MB: ~8–15min
+    - Files >100 MB : ~15–45min+ (libpersona.dll 343MB = ~35min)
 
-    Set mode='lief-only' to bypass IDA entirely. Returns LIEF metadata
-    instantly. All idalib_lief_* tools work against the file_path.
+    For large binaries, set run_auto_analysis=False to open instantly
+    (metadata only), then call idalib_start_analysis() later when full
+    decompilation is needed. Use mode='lief-only' for instant static
+    metadata without IDA loading.
+
+    For binaries >10 MB, the open runs in a background thread and a
+    task_id is returned immediately. Poll with idalib_task_poll(task_id).
+    Use idalib_cancel_task(task_id) to abort a long-running open.
     """
     sup = _require_supervisor()
     try:
@@ -1246,17 +1284,22 @@ def idalib_open(
 
     # Large file — async open with task tracking
     _LARGE_FILE_THRESHOLD_MB = 10.0
+    estimated_total_sec = _estimate_analysis_time(file_size_mb) if run_auto_analysis else int(30 + file_size_mb * 0.5)
+
     if file_size_mb > _LARGE_FILE_THRESHOLD_MB:
         task_id = f"open_{uuid.uuid4().hex[:8]}"
         sup._open_tasks[task_id] = {
             "status": "loading",
+            "stage": "spawning_worker",
             "file_path": str(path),
             "size_mb": file_size_mb,
             "started_at": time.time(),
+            "estimated_total_seconds": estimated_total_sec,
         }
 
         def _open_worker_thread():
             try:
+                sup._open_tasks[task_id]["stage"] = "loading_database"
                 session = sup.open_session(
                     str(path),
                     run_auto_analysis=run_auto_analysis,
@@ -1266,25 +1309,45 @@ def idalib_open(
                 )
                 sup._open_tasks[task_id] = {
                     "status": "done",
+                    "stage": "done",
                     "session_id": session.session_id,
                     "filename": session.filename,
+                    "size_mb": file_size_mb,
+                    "started_at": sup._open_tasks[task_id].get("started_at", time.time()),
+                    "estimated_total_seconds": estimated_total_sec,
                 }
             except Exception as exc:
                 sup._open_tasks[task_id] = {
                     "status": "failed",
+                    "stage": "failed",
                     "error": str(exc),
                     "error_type": type(exc).__name__,
+                    "size_mb": file_size_mb,
+                    "started_at": sup._open_tasks[task_id].get("started_at", time.time()),
+                    "estimated_total_seconds": estimated_total_sec,
                 }
 
-        Thread(target=_open_worker_thread, daemon=True, name=f"open-{task_id}").start()
+        thread = Thread(target=_open_worker_thread, daemon=True, name=f"open-{task_id}")
+        sup._open_task_threads[task_id] = (thread, None)
+        thread.start()
+
+        # Build warning / recommendation message
+        warning_parts = []
+        if run_auto_analysis and file_size_mb > 50:
+            warning_parts.append(
+                f"Auto-analysis on {file_size_mb} MB binaries typically takes {_format_duration(estimated_total_sec)}. "
+                f"Consider run_auto_analysis=False for instant metadata, then idalib_start_analysis() later."
+            )
+
         return {
             "success": True,
             "status": "loading",
             "task_id": task_id,
             "size_mb": file_size_mb,
-            "estimated_sec": min(file_size_mb * 2, 600),
+            "estimated_sec": estimated_total_sec,
             **sup.context_fields(context_id),
-            "message": f"Large binary ({file_size_mb} MB) — opening in background. Poll with idalib_idalib_list() or check idalib_task_poll('{task_id}')",
+            "message": f"Large binary ({file_size_mb} MB) — opening in background. Poll with idalib_task_poll('{task_id}').",
+            **({"analysis_time_warning": " ".join(warning_parts)} if warning_parts else {}),
         }
 
     # Small file — synchronous open
@@ -1544,20 +1607,214 @@ def idalib_warmup(
 
 @mcp.tool
 def idalib_task_poll(
-    task_id: Annotated[str, "Task ID returned by idalib_open"],
+    task_id: Annotated[str, "Task ID returned by idalib_open or idalib_start_analysis"],
 ) -> dict:
-    """Poll the status of an async idalib open task.
+    """Poll the status of an async idalib task.
 
-    Large-file opens (>10 MB) run in a background thread and return a
-    task_id immediately. Use this tool to check whether the open has
-    completed, failed, or is still loading."""
+    Returns elapsed time, estimated total time, completion percentage,
+    and current stage so agents can report progress to users instead of
+    polling blindly."""
     sup = _require_supervisor()
-    if task_id.startswith("open_") and task_id in sup._open_tasks:
-        return _call_tool_result(sup._open_tasks[task_id])
-    return _call_tool_result(
-        {"error": f"Task '{task_id}' not found (expired or invalid ID)"},
-        is_error=True,
-    )
+    if not task_id.startswith("open_") and not task_id.startswith("analysis_"):
+        return _call_tool_result(
+            {"error": f"Task '{task_id}' not found (expired or invalid ID)"},
+            is_error=True,
+        )
+    if task_id not in sup._open_tasks:
+        return _call_tool_result(
+            {"error": f"Task '{task_id}' not found (expired or invalid ID)"},
+            is_error=True,
+        )
+
+    task = sup._open_tasks[task_id].copy()
+    started_at = task.get("started_at", time.time())
+    elapsed = int(time.time() - started_at)
+    estimated_total = task.get("estimated_total_seconds", 60)
+
+    task["elapsed_seconds"] = elapsed
+    task["estimated_total_seconds"] = estimated_total
+    task["percent_complete"] = min(99, int((elapsed / max(estimated_total, 1)) * 100))
+
+    if task.get("status") == "loading":
+        remaining = max(0, estimated_total - elapsed)
+        task["message"] = (
+            f"{task.get('stage', 'loading')} in progress — "
+            f"{_format_duration(elapsed)} elapsed, ~{_format_duration(remaining)} remaining"
+        )
+    elif task.get("status") == "done":
+        task["message"] = f"Completed in {_format_duration(elapsed)}"
+        task["percent_complete"] = 100
+    elif task.get("status") == "failed":
+        task["message"] = f"Failed after {_format_duration(elapsed)}"
+
+    return _call_tool_result(task)
+
+
+@mcp.tool
+def idalib_cancel_task(
+    task_id: Annotated[str, "Task ID to cancel (from idalib_open or idalib_start_analysis)"],
+) -> dict:
+    """Cancel an async idalib task and clean up its worker.
+
+    Terminates the background thread and worker process, then removes
+    any temp IDB files created for the task. Returns the final status
+    of the task before cancellation."""
+    sup = _require_supervisor()
+    if task_id not in sup._open_tasks:
+        return _call_tool_result(
+            {"error": f"Task '{task_id}' not found (expired or invalid ID)"},
+            is_error=True,
+        )
+
+    task = sup._open_tasks[task_id]
+    file_path = task.get("file_path", "")
+
+    # Terminate worker if tracked
+    thread_info = sup._open_task_threads.pop(task_id, None)
+    if thread_info:
+        thread, worker = thread_info
+        if worker is not None and worker.process is not None:
+            try:
+                worker.process.terminate()
+                worker.process.wait(timeout=5)
+            except Exception:
+                try:
+                    worker.process.kill()
+                    worker.process.wait()
+                except Exception:
+                    pass
+
+    # Clean up temp files if path is under temp dir
+    if file_path:
+        try:
+            base = Path(file_path).with_suffix("")
+            for ext in (".i64", ".id0", ".id1", ".id2", ".nam", ".til"):
+                f = base.with_suffix(ext)
+                if f.exists():
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+    # Mark as cancelled
+    elapsed = int(time.time() - task.get("started_at", time.time()))
+    sup._open_tasks[task_id] = {
+        "status": "cancelled",
+        "stage": "cancelled",
+        "file_path": file_path,
+        "size_mb": task.get("size_mb", 0),
+        "started_at": task.get("started_at", time.time()),
+        "elapsed_seconds": elapsed,
+        "message": f"Cancelled after {_format_duration(elapsed)}",
+    }
+
+    return _call_tool_result(sup._open_tasks[task_id])
+
+
+@mcp.tool
+def idalib_start_analysis(
+    session_id: Annotated[str, "Session ID of an open database to analyze"],
+) -> dict:
+    """Trigger auto-analysis on an already-open database.
+
+    Use this after idalib_open(run_auto_analysis=False) to start full
+    auto-analysis as a background task. Returns a task_id immediately;
+    poll with idalib_task_poll(). Cancel with idalib_cancel_task().
+
+    Analysis time guide:
+    - Files <10 MB  : ~30s–2min
+    - Files 10-50 MB: ~2–8min
+    - Files 50-100 MB: ~8–15min
+    - Files >100 MB : ~15–45min+"""
+    sup = _require_supervisor()
+    try:
+        session = sup.resolve_session(session_id)
+    except Exception as e:
+        return _call_tool_result(
+            {"error": f"Session not found: {e}"},
+            is_error=True,
+        )
+
+    # Estimate analysis time from file size
+    file_size_mb = 0.0
+    try:
+        file_size_mb = round(os.path.getsize(session.input_path) / (1024 * 1024), 2)
+    except Exception:
+        pass
+    estimated_total_sec = _estimate_analysis_time(file_size_mb)
+
+    task_id = f"analysis_{uuid.uuid4().hex[:8]}"
+    started_at = time.time()
+    sup._open_tasks[task_id] = {
+        "status": "loading",
+        "stage": "auto_analysis",
+        "session_id": session_id,
+        "file_path": session.input_path,
+        "size_mb": file_size_mb,
+        "started_at": started_at,
+        "estimated_total_seconds": estimated_total_sec,
+    }
+
+    def _analysis_worker_thread():
+        try:
+            sup._open_tasks[task_id]["stage"] = "auto_analysis"
+            result = sup.call_worker_tool(
+                session,
+                "idalib_warmup",
+                {
+                    "wait_auto_analysis": True,
+                    "build_caches": True,
+                    "init_hexrays": False,
+                },
+                tool_timeout=estimated_total_sec + 120,
+            )
+            elapsed = int(time.time() - started_at)
+            sup._open_tasks[task_id] = {
+                "status": "done",
+                "stage": "done",
+                "session_id": session_id,
+                "file_path": session.input_path,
+                "size_mb": file_size_mb,
+                "started_at": started_at,
+                "elapsed_seconds": elapsed,
+                "estimated_total_seconds": estimated_total_sec,
+                "warmup": result if isinstance(result, dict) else None,
+            }
+        except Exception as exc:
+            elapsed = int(time.time() - started_at)
+            sup._open_tasks[task_id] = {
+                "status": "failed",
+                "stage": "failed",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "session_id": session_id,
+                "file_path": session.input_path,
+                "size_mb": file_size_mb,
+                "started_at": started_at,
+                "elapsed_seconds": elapsed,
+                "estimated_total_seconds": estimated_total_sec,
+            }
+
+    thread = Thread(target=_analysis_worker_thread, daemon=True, name=f"analysis-{task_id}")
+    sup._open_task_threads[task_id] = (thread, session)
+    thread.start()
+
+    return _call_tool_result({
+        "success": True,
+        "status": "loading",
+        "task_id": task_id,
+        "session_id": session_id,
+        "size_mb": file_size_mb,
+        "estimated_sec": estimated_total_sec,
+        **sup.context_fields(sup.resolve_context_id()),
+        "message": (
+            f"Auto-analysis started for {session.filename} ({file_size_mb} MB). "
+            f"Estimated time: {_format_duration(estimated_total_sec)}. "
+            f"Poll with idalib_task_poll('{task_id}')."
+        ),
+    })
 
 
 @mcp.tool
