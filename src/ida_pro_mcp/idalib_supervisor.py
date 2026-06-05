@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -403,13 +404,17 @@ class IdalibSupervisor:
                     env["IDADIR"] = str(Path(candidate))
                     break
         logger.info("Spawning idalib worker on 127.0.0.1:%d (IDADIR=%s)", port, env.get("IDADIR", "unset"))
+        log_path = self._worker_log_path()
+        stderr_file = open(log_path, "w") if log_path else None
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_file or subprocess.DEVNULL,
             env=env,
         )
+        if stderr_file:
+            stderr_file.close()
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
             input_path="",
@@ -421,6 +426,8 @@ class IdalibSupervisor:
             owned=True,
             pid=process.pid,
         )
+        if log_path:
+            worker.metadata["stderr_log"] = log_path
         try:
             self._wait_worker_ready(worker)
         except Exception:
@@ -456,6 +463,61 @@ class IdalibSupervisor:
         except Exception:
             proc.kill()
             proc.wait(timeout=5)
+
+    def _bootstrap_schemas(self) -> None:
+        """Spawn a temporary worker at startup to discover tool/resource schemas.
+        
+        Caches schemas in _tools_cache and _resources_cache so that the first
+        get_tools() / list_resources() call returns immediately instead of
+        spawning a worker.
+        """
+        if self._bootstrap_completed:
+            return
+        logger.info("Bootstrap: spawning temporary worker for schema discovery...")
+        worker = self._spawn_worker()
+        try:
+            tools_resp = self._worker_rpc(worker, {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
+            })
+            tools = (tools_resp.get("result") or {}).get("tools", [])
+            if tools:
+                ext_data = sorted(getattr(self.mcp._enabled_extensions, "data", set()))
+                self._tools_cache[("injected", tuple(ext_data))] = tools
+                logger.info("Bootstrap: cached %d tool schemas", len(tools))
+            for method in ("resources/list", "resources/templates/list"):
+                try:
+                    resp = self._worker_rpc(worker, {
+                        "jsonrpc": "2.0", "id": 1, "method": method, "params": {},
+                    })
+                    key = "resources" if "template" not in method else "resourceTemplates"
+                    items = (resp.get("result") or {}).get(key, [])
+                    if items:
+                        self._resources_cache[method] = items
+                except Exception:
+                    pass
+            self._bootstrap_completed = True
+            self._schema_worker = worker
+            logger.info("Bootstrap: complete — worker ready for reuse")
+        except Exception as exc:
+            logger.warning("Bootstrap failed: %s — falling back to lazy discovery", exc)
+            self._terminate_worker(worker)
+
+    def _worker_log_path(self) -> str | None:
+        """Return a path for capturing worker stderr, or None if no log dir is configured.
+        
+        Uses TMP_DIR or TEMP env var as the base directory, creating a
+        ``idalib-worker-logs`` subdirectory if needed. Each worker gets a
+        timestamped file.
+        """
+        log_dir = os.environ.get("IDA_MCP_LOG_DIR") or os.environ.get("TMP") or os.environ.get("TEMP") or tempfile.gettempdir()
+        base = Path(log_dir) / "idalib-worker-logs"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        pid = os.getpid()
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return str(base / f"worker-{timestamp}-{pid}.stderr")
 
     def shutdown(self) -> None:
         self._stop_death_watcher()
@@ -1191,6 +1253,7 @@ def idalib_health(
                         "filename": s.filename,
                         "owned": s.owned,
                         "last_accessed_sec_ago": (datetime.now() - s.last_accessed).total_seconds(),
+                        "stderr_log": s.metadata.get("stderr_log"),
                     }
                     if s.is_alive():
                         alive.append(detail)
@@ -1441,6 +1504,10 @@ def main() -> None:
     )
     mcp.registry.dispatch = dispatch_supervisor
     mcp.require_streamable_http_session = args.isolated_contexts
+
+    # Bootstrap: spawn a temporary worker to discover tool/resource schemas
+    # so the first get_tools() call returns instantly.
+    supervisor._bootstrap_schemas()
 
     if args.input_path is not None:
         startup_context_id = STDIO_DEFAULT_CONTEXT_ID if args.isolated_contexts else SHARED_FALLBACK_CONTEXT_ID
