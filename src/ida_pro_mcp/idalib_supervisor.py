@@ -23,11 +23,15 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread, Event
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 
 
 logger = logging.getLogger(__name__)
+
+_DEATH_WATCH_INTERVAL_S = 5.0
+_IDLE_TIMEOUT_S = int(os.environ.get("IDA_MCP_IDALIB_IDLE_TIMEOUT_SEC", "1800"))
+_BOOTSTRAP_DISCOVER_TIMEOUT_S = 30.0
 
 STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
 SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
@@ -181,6 +185,8 @@ class IdalibHealthResult(IdalibContextFields, total=False):
     session: IdalibSessionInfo | None
     health: dict[str, Any] | None
     error: str | None
+    pool: NotRequired[dict[str, Any] | None]
+    workers: NotRequired[list[dict[str, Any]]]
 
 
 class IdalibWarmupResult(IdalibContextFields, total=False):
@@ -258,10 +264,88 @@ class IdalibSupervisor:
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
+        self._stop_event = Event()
+        self._death_watcher: Thread | None = None
+        self._bootstrap_completed = False
+        if _IDLE_TIMEOUT_S > 0 or True:
+            self._start_death_watcher()
 
     # ------------------------------------------------------------------
-    # Context helpers
+    # Death watcher + idle timeout
     # ------------------------------------------------------------------
+
+    def _start_death_watcher(self) -> None:
+        if self._death_watcher is not None and self._death_watcher.is_alive():
+            return
+        self._stop_event.clear()
+        self._death_watcher = Thread(target=self._watcher_loop, daemon=True, name="idalib-watcher")
+        self._death_watcher.start()
+
+    def _stop_death_watcher(self) -> None:
+        self._stop_event.set()
+        if self._death_watcher is not None and self._death_watcher.is_alive():
+            self._death_watcher.join(timeout=2.0)
+
+    def _watcher_loop(self) -> None:
+        """Background daemon: poll workers every _DEATH_WATCH_INTERVAL_S seconds.
+        
+        Detects crashed workers (process died) and idle workers (past their
+        timeout) and cleans them up. Crashing a worker during a tool call
+        returns a clean error instead of hanging the proxy indefinitely.
+        """
+        idle_cleanup_ticks = 0
+        while not self._stop_event.wait(_DEATH_WATCH_INTERVAL_S):
+            try:
+                with self._lock:
+                    dead = [
+                        s.session_id
+                        for s in self.sessions.values()
+                        if s.backend == "worker" and s.owned and not s.is_alive()
+                    ]
+                    if self._schema_worker is not None and not self._schema_worker.is_alive():
+                        self._schema_worker = None
+                for session_id in dead:
+                    logger.warning("Worker for session %s died — cleaning up", session_id)
+                    with self._lock:
+                        session = self.sessions.pop(session_id, None)
+                        if session is not None:
+                            self._unregister_session_locked(session_id)
+                            try:
+                                session.process.wait(timeout=1)
+                            except Exception:
+                                pass
+            except Exception:
+                logger.debug("Death watcher iteration failed", exc_info=True)
+
+            # Idle timeout cleanup: every 6 death-watch cycles (~30s)
+            idle_cleanup_ticks += 1
+            if _IDLE_TIMEOUT_S > 0 and idle_cleanup_ticks >= 6:
+                idle_cleanup_ticks = 0
+                self._idle_cleanup()
+
+    def _idle_cleanup(self) -> None:
+        """Kill workers that have been idle past _IDLE_TIMEOUT_S."""
+        if _IDLE_TIMEOUT_S <= 0:
+            return
+        cutoff = datetime.now().timestamp() - _IDLE_TIMEOUT_S
+        with self._lock:
+            idle_sessions = [
+                s for s in self.sessions.values()
+                if s.backend == "worker" and s.owned
+                and s.is_alive() and s.last_accessed.timestamp() < cutoff
+            ]
+        for session in idle_sessions:
+            logger.info(
+                "Idle timeout (%ss): killing worker for session %s (%s)",
+                _IDLE_TIMEOUT_S, session.session_id, session.filename or session.input_path,
+            )
+            with self._lock:
+                if session.session_id in self.sessions:
+                    self._unregister_session_locked(session.session_id)
+            self._terminate_worker(session)
+
+    def _touch_worker(self, worker: WorkerSession) -> None:
+        worker.last_accessed = datetime.now()
 
     def resolve_context_id(self) -> str:
         transport_context_id = self.mcp.get_current_transport_session_id()
@@ -363,6 +447,7 @@ class IdalibSupervisor:
             proc.wait(timeout=5)
 
     def shutdown(self) -> None:
+        self._stop_death_watcher()
         with self._lock:
             workers = list(self.sessions.values())
             if self._schema_worker is not None:
@@ -463,6 +548,7 @@ class IdalibSupervisor:
     def call_worker_tool(
         self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
+        self._touch_worker(worker)
         response = self._worker_rpc(
             worker,
             {
@@ -1073,13 +1159,51 @@ def idalib_save(
 def idalib_health(
     session_id: Annotated[Optional[str], "Optional session to probe"] = None,
 ) -> IdalibHealthResult:
-    """Health/ready probe for a database worker."""
+    """Health/ready probe for a database worker or the full worker pool.
+    
+    Without session_id: returns pool-level status (worker count, alive count,
+    max workers, idle timeout, per-worker details).
+    With session_id: probes that specific worker."""
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
+        if not session_id:
+            alive = []
+            dead_detail = []
+            with sup._lock:
+                for s in sup.sessions.values():
+                    detail = {
+                        "session_id": s.session_id,
+                        "pid": s.process.pid if s.process else s.pid,
+                        "alive": s.is_alive(),
+                        "backend": s.backend,
+                        "filename": s.filename,
+                        "owned": s.owned,
+                        "last_accessed_sec_ago": (datetime.now() - s.last_accessed).total_seconds(),
+                    }
+                    if s.is_alive():
+                        alive.append(detail)
+                    else:
+                        dead_detail.append(detail)
+                total = len(sup.sessions)
+                alive_count = len(alive)
+            return {
+                "ready": alive_count > 0,
+                **sup.context_fields(context_id),
+                "session": None,
+                "health": None,
+                "error": None,
+                "pool": {
+                    "workers_total": total,
+                    "workers_alive": alive_count,
+                    "workers_dead": len(dead_detail),
+                    "max_workers": sup.max_workers,
+                    "idle_timeout_s": _IDLE_TIMEOUT_S,
+                },
+                "workers": alive + dead_detail,
+            }
         session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
+        sup.bind_context(context_id, session.session_id)
         if session.backend == "gui":
             health = sup.call_worker_tool(session, "server_health", {})
             return {
