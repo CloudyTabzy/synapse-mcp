@@ -211,6 +211,7 @@ class NumpyMemmapScanResult(TypedDict, total=False):
     match_count: int
     matches: list[MemmapMatch]
     truncated: bool
+    next_offset: int
     hint: str
     error: str
     error_type: str
@@ -1360,6 +1361,12 @@ if NUMPY_AVAILABLE:
         context_bytes: Annotated[
             int, "Bytes of surrounding context (hex) to include per match (default: 16)"
         ] = 16,
+        start_offset: Annotated[
+            int,
+            "File offset to begin scanning from (default: 0). When a previous call "
+            "returned truncated=true, pass its next_offset here to page through "
+            "the rest of the matches.",
+        ] = 0,
     ) -> NumpyMemmapScanResult:
         """Memory-mapped byte-pattern search over a file on disk.
 
@@ -1372,6 +1379,10 @@ if NUMPY_AVAILABLE:
         search), then verifies the full masked pattern at each hit with a
         vectorized comparison. Not IDA-bound, so it does not run on the IDA
         main thread.
+
+        Paging: when more than ``max_results`` matches exist the result has
+        ``truncated: true`` and a ``next_offset``. Call again with
+        ``start_offset=next_offset`` to continue from where it left off.
 
         See also: find_bytes (loaded IDB), find_dll_by_purpose (keyword search
         across many DLLs), lief_strings (raw string extraction).
@@ -1406,8 +1417,9 @@ if NUMPY_AVAILABLE:
                         "match_count": 0, "matches": [],
                     }
                 mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                next_offset = 0
                 try:
-                    pos = 0
+                    pos = max(0, int(start_offset))
                     while True:
                         idx = mm.find(anchor, pos)
                         if idx < 0:
@@ -1426,6 +1438,7 @@ if NUMPY_AVAILABLE:
                                 })
                                 if len(matches) >= max_results:
                                     truncated = True
+                                    next_offset = idx + 1
                                     break
                         pos = idx + 1
                 finally:
@@ -1442,9 +1455,11 @@ if NUMPY_AVAILABLE:
             }
             if truncated:
                 result["truncated"] = True
+                result["next_offset"] = next_offset
                 result["hint"] = (
                     f"Stopped at max_results={max_results}; more matches may exist. "
-                    "Raise max_results or narrow the pattern."
+                    f"Call again with start_offset={next_offset} to continue, or "
+                    "raise max_results / narrow the pattern."
                 )
             return result
         except ValueError as e:

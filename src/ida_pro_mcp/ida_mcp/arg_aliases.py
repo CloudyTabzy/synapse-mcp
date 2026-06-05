@@ -166,6 +166,20 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     # struct_recovery: accept "function" or "address" as aliases for addr
     "struct_recovery":              {"function": "addr", "address": "addr", "min_distinct": "min_fields"},
     # -----------------------------------------------------------------------
+    # NumPy numerical-analysis tools.
+    # These declare "addr" as their real param; reverse the global addr→address
+    # rename so an agent-sent "addr" reaches them. numpy_memmap_scan declares
+    # "max_results" (not "limit"); reverse the global max_results→limit rename.
+    # numpy_function_similarity / numpy_binary_similarity take func_*/file_*
+    # params and need no reversal.
+    # -----------------------------------------------------------------------
+    "numpy_entropy_map":            {"address": "addr"},
+    "numpy_byte_histogram":         {"address": "addr"},
+    "numpy_xor_key_recovery":       {"address": "addr"},
+    "numpy_opcode_histogram":       {"address": "addr"},
+    "numpy_value_scan":             {"address": "addr"},
+    "numpy_memmap_scan":            {"limit": "max_results"},
+    # -----------------------------------------------------------------------
     # Unicorn tools — natural aliases for regs/timeout params.
     # Global max_instructions→max_insns already covers max_insns remapping.
     # -----------------------------------------------------------------------
