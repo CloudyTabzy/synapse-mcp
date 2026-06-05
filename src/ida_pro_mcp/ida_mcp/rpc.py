@@ -373,28 +373,71 @@ def _install_tools_call_patch() -> None:
                     pass  # fall through to synchronous execution
 
         # === Strict guard for very_large binaries ===
-        # find_regex and search_text cannot run safely on binaries with 95K+
-        # functions — IDA's main thread is non-interruptible. Rather than
-        # trying to run these asynchronously (which still blocks the main
-        # thread and crashes the HTTP plugin), we reject them upfront with
-        # actionable alternatives.
-        if (name in ("find_regex", "search_text")
+        # These tools need enumeration or full-binary traversal, which
+        # blocks IDA's non-interruptible main thread and crashes the
+        # HTTP plugin. Rather than trying to run them, we reject upfront.
+        _HEAVY_TOOLS_VERY_LARGE = frozenset({
+            "find_regex", "search_text",        # scan all strings/text
+            "survey_binary",                     # enumerates everything
+            "imports", "imports_query",          # import enumeration
+            "callgraph",                         # full call graph
+            "find_similar_functions",            # all-function scan
+            "batch_analyze_completeness",        # all-function scan
+            "get_bulk_function_hashes",          # all-function scan
+            "workflow_reveng_overview",          # composite heavy ops
+            "nx_call_graph",                     # full graph build
+            "nx_central_functions",              # full graph metrics
+            "nx_communities",                    # full graph partitioning
+        })
+        _HEAVY_ALT = {
+            "find_regex": (
+                "Use `lief_strings(file_path=...)` for raw file byte scanning "
+                "(works outside IDA's string database), "
+                "`find_callers_of_import(name=...)` for import tracing, "
+                "or `numpy_memmap_scan(file_path=..., pattern_hex=...)` "
+                "for hex pattern search."
+            ),
+            "search_text": (
+                "Use `find_regex(pattern=...)` with a narrow pattern instead."
+            ),
+            "survey_binary": (
+                "Use `lief_info()` for binary metadata, "
+                "`lief_imports()` for import table, "
+                "and `list_functions_enhanced(limit=100)` for function browsing."
+            ),
+            "imports": (
+                "Use `lief_imports()` instead — it reads from the PE file "
+                "on disk without blocking the IDA main thread."
+            ),
+            "imports_query": (
+                "Use `lief_imports(library_filter='dllname')` instead."
+            ),
+            "callgraph": (
+                "Decompose into smaller steps: `callees()` and `get_function_callers()` "
+                "on individual functions, then assemble the graph client-side."
+            ),
+            "find_similar_functions": (
+                "Limit scope with `scope='.text'` and small max_results (≤5). "
+                "On smaller binaries, this tool is safe for binary-wide scan."
+            ),
+            "batch_analyze_completeness": (
+                "Use `analyze_function_completeness(addr='0x...')` on individual "
+                "functions instead of batch-scanning the entire binary."
+            ),
+            "get_bulk_function_hashes": (
+                "Use `get_function_hash(addr='0x...')` on individual functions."
+            ),
+            "workflow_reveng_overview": (
+                "Use `quick_mode=True` and limit `top_n` to 20."
+            ),
+        }
+        if (name in _HEAVY_TOOLS_VERY_LARGE
                 and not getattr(_reentry, "active", False)):
             from . import api_core as _core
             if not _core._BINARY_CLASS_INITIALIZED:
                 _core._ensure_binary_class()
             if _core._BINARY_CLASS == "very_large":
-                if name == "find_regex":
-                    alt = ("Use `lief_strings(file_path=...)` for raw file byte scanning "
-                           "(works outside IDA's string database), "
-                           "`find_callers_of_import(name=...)` for import tracing, "
-                           "or `numpy_memmap_scan(file_path=..., pattern_hex=...)` "
-                           "for hex pattern search. On smaller binaries (use "
-                           "`server_health` to check), this tool is safe.")
-                else:
-                    alt = ("Use `find_regex(pattern=...)` with a narrow pattern instead. "
-                           "On smaller binaries (use `server_health` to check), "
-                           "this tool is safe for text search.")
+                alt = _HEAVY_ALT.get(name, "Use smaller-scoped alternatives.")
                 func_str = (f"{_core._FUNC_COUNT_CACHE // 1000}K functions" 
                              if _core._FUNC_COUNT_CACHE > 0 else "a very large binary")
                 error_msg = (
