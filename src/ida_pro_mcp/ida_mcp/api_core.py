@@ -67,6 +67,12 @@ class ServerHealthResult(TypedDict):
     profiles: NotRequired[dict[str, int]]
     arg_aliases: NotRequired[dict]
     alias_tips: NotRequired[list[str]]
+    binary_class: NotRequired[str]
+    binary_size_mb: NotRequired[float]
+    function_count: NotRequired[int]
+    string_count: NotRequired[int]
+    segment_count: NotRequired[int]
+    reliability_notes: NotRequired[dict[str, str]]
 
 
 class ServerWarmupStep(TypedDict, total=False):
@@ -453,6 +459,62 @@ def _build_health_payload() -> dict:
         "disasm and disasm_batch reverse this automatically"
     )
     result["alias_tips"] = tips
+
+    # Binary-size classification so agents can self-adapt before making calls.
+    try:
+        seg_count = len(list(ida_segment.get_segm_qty()))
+        func_count = len(list(idautils.Functions()))
+        str_count = sum(1 for _ in idautils.Strings())
+    except Exception:
+        seg_count = 0
+        func_count = 0
+        str_count = 0
+
+    image_size = idaapi.get_imagebase()  # the last segment's end minus base is the full image
+    try:
+        last_seg_end = max(s.end_ea for s in idautils.Segments())
+        binary_bytes = last_seg_end - idaapi.get_imagebase()
+    except Exception:
+        binary_bytes = 0
+    binary_mb = round(binary_bytes / (1024 * 1024), 2)
+
+    result["segment_count"] = seg_count
+    result["function_count"] = func_count
+    result["string_count"] = str_count
+    result["binary_size_mb"] = binary_mb
+
+    # Classification thresholds tuned from real-world experience across 4 binaries
+    # (6.7 MB crackme → "small", 9 MB BoneTown → "small", 30 MB Bully → "large",
+    #  49 MB GameAssembly → "very_large").
+    if func_count > 50000 or binary_mb > 40:
+        binary_class = "very_large"
+        notes = {
+            "find_regex": "Binary too large for broad regex. Use short, specific patterns (max 20 chars).",
+            "search_text": "Binary too large — will time out. Use find_regex instead.",
+            "py_eval": "Use task_submit for any scan >100KB.",
+            "decompile": "Functions >10KB may time out. Use task_submit.",
+            "analyze_function": "Functions >600 basic blocks may time out. Use task_submit.",
+            "find_similar_functions": "Binary-wide scan will time out. Limit scope with scope='.text'.",
+            "callgraph": "Full graph will time out. Use max_depth=2 and max_nodes=200.",
+        }
+    elif func_count > 10000 or binary_mb > 15:
+        binary_class = "large"
+        notes = {
+            "find_regex": "Use specific patterns to avoid timeouts.",
+            "search_text": "May be slow. Prefer find_regex for string searches.",
+            "decompile": "Large functions may be slow. Use task_submit for functions >20KB.",
+            "callgraph": "Limit depth to 3 with max_nodes=500 for large graphs.",
+        }
+    else:
+        binary_class = "small"
+        notes = {
+            "find_regex": "Safe for broad patterns.",
+            "search_text": "Safe.",
+            "decompile": "Safe for all function sizes.",
+        }
+
+    result["binary_class"] = binary_class
+    result["reliability_notes"] = notes
     return result
 
 

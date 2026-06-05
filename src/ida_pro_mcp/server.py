@@ -1,11 +1,14 @@
 import argparse
+import atexit
 import copy
 import http.client
 import json
 import os
 import re
+import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -127,6 +130,276 @@ DEFAULT_IDA_HOST = "127.0.0.1"
 DEFAULT_IDA_PORT = 13337
 IDA_HOST = DEFAULT_IDA_HOST
 IDA_PORT = DEFAULT_IDA_PORT
+
+# ---------------------------------------------------------------------------
+# Proxy singleton lock file — prevents zombie proxy accumulation across
+# session restarts. On startup, any stale proxy holding the same lock is
+# killed before this process claims the lock. Cleaned up on normal exit.
+# ---------------------------------------------------------------------------
+_PROXY_LOCK_PATH = os.path.join(tempfile.gettempdir(), "synapse-mcp-proxy.lock")
+_PROXY_LOCK_FD = None
+
+
+def _acquire_proxy_lock(port: int) -> bool:
+    """Acquire the singleton proxy lock, killing any stale previous owner.
+    
+    Returns True if the lock was acquired (or if locking is unsupported).
+    """
+    global _PROXY_LOCK_FD
+    try:
+        # If a previous lock file exists, check if that process is still alive
+        if os.path.exists(_PROXY_LOCK_PATH):
+            try:
+                with open(_PROXY_LOCK_PATH, "r") as f:
+                    old_data = json.load(f)
+                old_pid = old_data.get("pid", 0)
+                old_port = old_data.get("port", 0)
+                if old_pid and old_port == port:
+                    try:
+                        os.kill(old_pid, 0)
+                        # Process is alive — kill it
+                        print(
+                            f"[MCP] Killing stale proxy PID {old_pid} (port {old_port})",
+                            file=sys.stderr,
+                        )
+                        os.kill(old_pid, signal.SIGTERM)
+                        time.sleep(0.5)
+                    except OSError:
+                        pass  # Already dead
+            except (json.JSONDecodeError, KeyError, FileNotFoundError):
+                pass  # Corrupt lock file — overwrite it
+
+        _PROXY_LOCK_FD = open(_PROXY_LOCK_PATH, "w")
+        json.dump({"pid": os.getpid(), "port": port, "started": time.time()}, _PROXY_LOCK_FD)
+        _PROXY_LOCK_FD.flush()
+        atexit.register(_release_proxy_lock)
+        return True
+    except OSError:
+        return False  # Non-critical — don't block startup
+
+
+def _release_proxy_lock() -> None:
+    """Remove the proxy lock file on clean exit."""
+    global _PROXY_LOCK_FD
+    try:
+        if _PROXY_LOCK_FD is not None:
+            _PROXY_LOCK_FD.close()
+            _PROXY_LOCK_FD = None
+        if os.path.exists(_PROXY_LOCK_PATH):
+            os.remove(_PROXY_LOCK_PATH)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat thread — maintains a lightweight health-check connection to
+# the IDA plugin. Detects dead connections before they waste agent time.
+# ---------------------------------------------------------------------------
+_HEARTBEAT_INTERVAL_SEC = 15.0
+_HEARTBEAT_MAX_MISSED = 4
+_heartbeat_thread: threading.Thread | None = None
+_heartbeat_running = False
+_heartbeat_alive = True  # default: assume alive (tests may not start heartbeat)
+_heartbeat_last_ok = time.monotonic()  # set on module load so check_heartbeat works before start
+_heartbeat_failures = 0
+_heartbeat_lock = threading.Lock()
+# Cache the last successful health payload so the proxy can compute adaptive
+# timeouts without calling IDA on every dispatch.
+_heartbeat_payload: dict | None = None
+
+
+def _heartbeat_loop(host: str, port: int) -> None:
+    """Background thread: ping IDA every _HEARTBEAT_INTERVAL_SEC seconds."""
+    global _heartbeat_alive, _heartbeat_last_ok, _heartbeat_failures, _heartbeat_payload
+    while _heartbeat_running:
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=5.0)
+            conn.request("POST", "/mcp", json.dumps({
+                "jsonrpc": "2.0", "id": "hb", "method": "server_health", "params": {}
+            }), {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            if resp.status == 200 and b'"result"' in body:
+                with _heartbeat_lock:
+                    _heartbeat_alive = True
+                    _heartbeat_last_ok = time.monotonic()
+                    _heartbeat_failures = 0
+                try:
+                    parsed = json.loads(body.decode("utf-8"))
+                    if isinstance(parsed.get("result"), dict):
+                        _heartbeat_payload = parsed["result"]
+                except Exception:
+                    pass
+            else:
+                _record_heartbeat_failure()
+        except Exception:
+            _record_heartbeat_failure()
+        time.sleep(_HEARTBEAT_INTERVAL_SEC)
+
+
+def _record_heartbeat_failure() -> None:
+    global _heartbeat_failures, _heartbeat_alive
+    with _heartbeat_lock:
+        _heartbeat_failures += 1
+        if _heartbeat_failures >= _HEARTBEAT_MAX_MISSED:
+            _heartbeat_alive = False
+
+
+def _start_heartbeat(host: str, port: int) -> None:
+    """Start the background heartbeat thread."""
+    global _heartbeat_running, _heartbeat_thread, _heartbeat_alive, _heartbeat_last_ok, _heartbeat_failures
+    with _heartbeat_lock:
+        _heartbeat_running = True
+        _heartbeat_alive = True
+        _heartbeat_last_ok = time.monotonic()
+        _heartbeat_failures = 0
+    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, args=(host, port), daemon=True)
+    _heartbeat_thread.start()
+
+
+def _stop_heartbeat() -> None:
+    """Stop the heartbeat thread."""
+    global _heartbeat_running
+    _heartbeat_running = False
+
+
+def _check_heartbeat(timeout: float = 5.0) -> bool:
+    """Return True if the last heartbeat was successful within the given timeout window.
+    
+    Also performs an immediate synchronous health check if the heartbeat is stale,
+    since a single failed ping shouldn't abort the entire session.
+    """
+    with _heartbeat_lock:
+        alive = _heartbeat_alive
+        last_ok = _heartbeat_last_ok
+    if alive:
+        return True
+    # Heartbeat is marked dead — try one synchronous probe as last resort
+    ago = time.monotonic() - last_ok
+    if ago > _HEARTBEAT_INTERVAL_SEC:
+        host, port = _get_active_ida_target()
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn.request("POST", "/mcp", json.dumps({
+                "jsonrpc": "2.0", "id": "hb-sync", "method": "server_health", "params": {}
+            }), {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            if resp.status == 200 and b'"result"' in body:
+                with _heartbeat_lock:
+                    _heartbeat_alive = True
+                    _heartbeat_last_ok = time.monotonic()
+                    _heartbeat_failures = 0
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Adaptive timeouts — per-tool timeout hints based on binary size.
+# The heartbeat caches the server_health payload, so we know binary_mb
+# before every dispatch without an extra round-trip to IDA.
+# ---------------------------------------------------------------------------
+
+# Timeout calculator: (scalar_per_mb, fixed_overhead, absolute_max)
+# scalar_per_mb: multiplied by binary_mb to get the variable portion
+# fixed_overhead: added to the variable portion (covers IDA dispatch + serde)
+# absolute_max: hard ceiling even for very large binaries
+_ADAPTIVE_TIMEOUT_PROFILES: dict[str, tuple[float, float, float]] = {
+    # --- Search tools — linear in data size ---
+    "find_regex":          (8.0,  10.0,  300.0),
+    "search_text":         (12.0, 15.0,  300.0),
+    "find_bytes":          (5.0,   5.0,  120.0),
+    "scan_signature":      (5.0,   5.0,  120.0),
+    "insn_query":          (7.0,   5.0,  180.0),
+    # --- Analysis tools — linear in function count/BB size ---
+    "decompile":           (1.0,   5.0,  120.0),
+    "decompile_batch":     (3.0,  10.0,  300.0),
+    "disasm":              (1.0,   5.0,  120.0),
+    "disasm_batch":        (3.0,  10.0,  300.0),
+    "analyze_function":    (2.0,   8.0,  180.0),
+    "analyze_batch":       (4.0,  10.0,  300.0),
+    "find_similar_functions": (10.0, 15.0, 300.0),
+    "callgraph":           (6.0,  10.0,  300.0),
+    "func_profile":        (2.0,   5.0,  120.0),
+    # --- Graph/NX — expensive on large binaries ---
+    "nx_call_graph":       (8.0,  15.0,  300.0),
+    "nx_central_functions": (8.0, 15.0, 300.0),
+    "nx_communities":      (8.0,  15.0,  300.0),
+    "workflow_reveng_overview": (10.0, 20.0, 300.0),
+    # --- Symbolic engines — heavy, give generous time ---
+    "angr_cfg_fast":       (5.0,  20.0,  300.0),
+    "angr_find_paths":     (5.0,  20.0,  300.0),
+    "triton_process_function": (3.0, 10.0, 180.0),
+    "triton_analyze_function": (5.0, 15.0, 300.0),
+    "miasm_lift_function": (2.0,   8.0,  180.0),
+    # --- Data extraction — modest ---
+    "export_funcs":        (3.0,   8.0,  180.0),
+    "get_bulk_function_hashes": (3.0, 8.0, 180.0),
+    "batch_analyze_completeness": (3.0, 8.0, 180.0),
+    # --- py_eval / py_exec — unbounded execution time ---
+    "py_eval":             (5.0,  60.0, 600.0),
+    "py_exec_file":        (5.0,  60.0, 600.0),
+}
+
+
+def _get_adaptive_timeout(tool_name: str) -> float:
+    """Compute a per-tool HTTP socket timeout based on binary size.
+
+    Uses the cached heartbeat health payload (binary_size_mb). Falls back
+    to the global _proxy_timeout_seconds() when no cache is available.
+    """
+    profile = _ADAPTIVE_TIMEOUT_PROFILES.get(tool_name)
+    if profile is None:
+        return _proxy_timeout_seconds()
+
+    scalar_per_mb, fixed_overhead, absolute_max = profile
+    binary_mb: float = 50.0  # conservative default if cache is empty
+
+    payload = _heartbeat_payload
+    if payload is not None and isinstance(payload.get("binary_size_mb"), (int, float)):
+        binary_mb = max(1.0, float(payload["binary_size_mb"]))
+
+    adaptive = scalar_per_mb * binary_mb + fixed_overhead
+    base = _proxy_timeout_seconds()
+
+    # The larger of: adaptive calculation, global proxy timeout, with an
+    # upper bound at absolute_max.
+    return max(base, min(adaptive, absolute_max))
+
+
+def _proxy_to_instance_with_timeout(
+    host: str, port: int, payload: bytes | str | dict, timeout: float | None = None
+) -> dict:
+    """Like _proxy_to_instance but accepts an explicit socket timeout."""
+    if isinstance(payload, dict):
+        payload = json.dumps(payload)
+    elif isinstance(payload, str):
+        payload = payload.encode("utf-8")
+
+    effective = timeout if timeout is not None else _proxy_timeout_seconds()
+    conn = http.client.HTTPConnection(host, port, timeout=effective)
+    try:
+        conn.request(
+            "POST",
+            _get_proxy_request_path(),
+            payload,
+            _get_proxy_request_headers(),
+        )
+        response = conn.getresponse()
+        raw_data = response.read().decode()
+        if response.status >= 400:
+            raise RuntimeError(
+                f"HTTP {response.status} {response.reason}: {raw_data}"
+            )
+        parsed = json.loads(raw_data)
+        _remember_output_proxy_target_from_response(host, port, parsed)
+        return parsed
+    finally:
+        conn.close()
 
 # How long the stdio proxy waits on a single synchronous tool call to IDA before
 # giving up. The old hardcoded 30 s was the V3 "proxy timeout" that dropped heavy
@@ -460,9 +733,15 @@ def _tool_module(name: str) -> str:
     return get_tool_group(name)
 
 
-def _proxy_to_ida(payload: bytes | str | dict) -> dict:
-    """Send a JSON-RPC request to the active IDA instance and return the response."""
+def _proxy_to_ida(payload: bytes | str | dict, timeout: float | None = None) -> dict:
+    """Send a JSON-RPC request to the active IDA instance and return the response.
+
+    timeout: per-call socket timeout override (seconds). If None, uses the
+    global _proxy_timeout_seconds(). If provided, uses the given value.
+    """
     host, port = _get_active_ida_target()
+    if timeout is not None:
+        return _proxy_to_instance_with_timeout(host, port, payload, timeout)
     return _proxy_to_instance(host, port, payload)
 
 
@@ -591,7 +870,27 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
             request = request_obj
 
     try:
-        result = _proxy_to_ida(request)
+        # Pre-flight: check heartbeat before every tools/call dispatch.
+        # If the IDA connection is known dead, fail fast instead of waiting
+        # for the HTTP socket timeout (180s).
+        if not _check_heartbeat(timeout=3.0):
+            return JsonRpcResponse({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": (
+                        "IDA Pro connection is dead (heartbeat lost). "
+                        "The proxy cannot reach the IDA plugin. Restart the MCP plugin "
+                        f"in IDA or restart the proxy process. Last successful heartbeat: "
+                        f"{time.monotonic() - _heartbeat_last_ok:.0f}s ago."
+                    ),
+                },
+                "id": request_obj.get("id"),
+            })
+
+        # Compute per-tool adaptive timeout based on binary size
+        adaptive_timeout = _get_adaptive_timeout(tool_name) if tool_name else None
+        result = _proxy_to_ida(request, timeout=adaptive_timeout)
         if request_obj.get("method") == "tools/call":
             result = _maybe_toon_encode_response(result)
         return result
@@ -1434,6 +1733,12 @@ def main():
     # Resolve IDA RPC target (explicit or auto-discovery)
     _resolve_ida_rpc(args)
 
+    # Acquire the singleton lock so only one proxy runs per IDA port.
+    _acquire_proxy_lock(IDA_PORT)
+
+    # Start background heartbeat so we detect dead connections proactively.
+    _start_heartbeat(IDA_HOST, IDA_PORT)
+
     if LAZY_MODE:
         try:
             _validate_groups()
@@ -1479,6 +1784,9 @@ def main():
             input("Server is running, press Enter or Ctrl+C to stop.")
     except (KeyboardInterrupt, EOFError):
         pass
+    finally:
+        _stop_heartbeat()
+        _release_proxy_lock()
 
 
 if __name__ == "__main__":

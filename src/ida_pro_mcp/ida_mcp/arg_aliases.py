@@ -83,9 +83,9 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     "disasm":                     {"address": "addr", "max_insns": "max_instructions"},
     "analyze_function":           {"address": "addr"},
     "diff_before_after":          {"address": "addr"},
-    # trace_data_flow takes a single starting addr; "start" maps to it via
-    # the global src→start chain: src→start→addr.
-    "trace_data_flow":            {"address": "addr", "start": "addr"},
+    # trace_data_flow takes a single starting addr; both start and end map via
+    # the global src→start and dst→end chains: src→start→addr, dst→end→addr.
+    "trace_data_flow":            {"address": "addr", "start": "addr", "end": "addr"},
     "dbg_run_to":                 {"address": "addr"},
     "remove_type":                {"address": "addr"},
     "find_global_writers":        {"address": "addr"},
