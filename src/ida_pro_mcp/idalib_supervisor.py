@@ -212,6 +212,8 @@ class WorkerSession:
     backend: str = "worker"
     owned: bool = True
     pid: int | None = None
+    stdin: Any | None = None  # subprocess.PIPE for stdio workers
+    stdout: Any | None = None
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -376,21 +378,11 @@ class IdalibSupervisor:
     # Worker process lifecycle
     # ------------------------------------------------------------------
 
-    def _pick_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
-
     def _spawn_worker(self) -> WorkerSession:
-        port = self._pick_port()
         cmd = [
             sys.executable,
             "-m",
             "ida_pro_mcp.idalib_server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
             *self.worker_args,
         ]
         env = dict(os.environ)
@@ -403,13 +395,13 @@ class IdalibSupervisor:
                 if candidate and Path(candidate).is_dir():
                     env["IDADIR"] = str(Path(candidate))
                     break
-        logger.info("Spawning idalib worker on 127.0.0.1:%d (IDADIR=%s)", port, env.get("IDADIR", "unset"))
+        logger.info("Spawning idalib worker (IDADIR=%s)", env.get("IDADIR", "unset"))
         log_path = self._worker_log_path()
         stderr_file = open(log_path, "w") if log_path else None
         process = subprocess.Popen(
             cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             stderr=stderr_file or subprocess.DEVNULL,
             env=env,
         )
@@ -420,11 +412,13 @@ class IdalibSupervisor:
             input_path="",
             filename="",
             host="127.0.0.1",
-            port=port,
+            port=0,
             process=process,
             backend="worker",
             owned=True,
             pid=process.pid,
+            stdin=process.stdin,
+            stdout=process.stdout,
         )
         if log_path:
             worker.metadata["stderr_log"] = log_path
@@ -579,14 +573,8 @@ class IdalibSupervisor:
         )
 
     # ------------------------------------------------------------------
-    # JSON-RPC forwarding
+    # JSON-RPC forwarding (stdio-based workers)
     # ------------------------------------------------------------------
-
-    def _worker_request_path(self) -> str:
-        enabled = sorted(getattr(self.mcp._enabled_extensions, "data", set()))
-        if enabled:
-            return f"/mcp?ext={','.join(enabled)}"
-        return "/mcp"
 
     def _worker_rpc(
         self,
@@ -595,25 +583,44 @@ class IdalibSupervisor:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        conn = http.client.HTTPConnection(worker.host, worker.port, timeout=timeout)
+        """Send a JSON-RPC request to a worker via its stdio pipe and return the response.
+
+        Writes the full JSON payload followed by a newline to the worker's stdin,
+        then reads the response line from its stdout. The stdio MCP transport
+        writes one JSON-RPC message per line.
+        """
+        if worker.process is None or worker.process.poll() is not None:
+            raise RuntimeError("Worker process is not running")
+        if worker.stdin is None or worker.stdout is None:
+            raise RuntimeError("Worker stdio pipes not available")
+
+        body = json.dumps(payload)
+        deadline = time.monotonic() + (timeout or 60.0)
         try:
-            conn.request(
-                "POST",
-                self._worker_request_path(),
-                body,
-                {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                },
-            )
-            response = conn.getresponse()
-            raw = response.read().decode("utf-8")
-            if response.status >= 400:
-                raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw}")
-            return json.loads(raw)
-        finally:
-            conn.close()
+            worker.stdin.write((body + "\n").encode("utf-8"))
+            worker.stdin.flush()
+        except BrokenPipeError as e:
+            raise RuntimeError("Worker process closed stdin") from e
+
+        collected = ""
+        while time.monotonic() < deadline:
+            try:
+                line = worker.stdout.readline()
+            except Exception as e:
+                raise RuntimeError(f"Failed to read from worker: {e}") from e
+            if not line:
+                raise RuntimeError("Worker process closed stdout")
+            collected += line.decode("utf-8")
+            stripped = collected.strip()
+            if stripped and stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    return json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue  # partial JSON — wait for more data
+            # Check if we've accumulated too much without finding a JSON object
+            if len(collected) > 1_000_000:
+                raise RuntimeError("Worker response exceeded 1MB without producing valid JSON")
+        raise TimeoutError(f"Worker RPC timed out after {(timeout or 60.0)}s")
 
     def forward_raw(self, worker: WorkerSession, request_obj: dict[str, Any]) -> dict[str, Any]:
         return self._worker_rpc(worker, request_obj)
@@ -621,7 +628,11 @@ class IdalibSupervisor:
     def call_worker_tool(
         self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
+        """Call a tool on a worker and return the structured content."""
         self._touch_worker(worker)
+        # For GUI-backend workers, use the old HTTP path
+        if worker.backend == "gui":
+            return self._gui_call_worker_tool(worker, name, arguments)
         response = self._worker_rpc(
             worker,
             {
@@ -634,6 +645,37 @@ class IdalibSupervisor:
         if "error" in response:
             raise RuntimeError(response["error"].get("message", "Unknown worker error"))
         result = response.get("result", {})
+        if result.get("isError"):
+            content = result.get("content") or []
+            message = content[0].get("text", "Unknown worker tool error") if content else "Unknown worker tool error"
+            raise RuntimeError(message)
+        return result.get("structuredContent")
+
+    def _gui_call_worker_tool(
+        self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any:
+        """Call a tool on a GUI-backend worker via HTTP."""
+        self._touch_worker(worker)
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        }).encode("utf-8")
+        conn = http.client.HTTPConnection(worker.host, worker.port, timeout=60.0)
+        try:
+            conn.request("POST", "/mcp", body, {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            })
+            response = conn.getresponse()
+            raw = response.read().decode("utf-8")
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw}")
+            resp = json.loads(raw)
+        finally:
+            conn.close()
+        if "error" in resp:
+            raise RuntimeError(resp["error"].get("message", "Unknown worker error"))
+        result = resp.get("result", {})
         if result.get("isError"):
             content = result.get("content") or []
             message = content[0].get("text", "Unknown worker tool error") if content else "Unknown worker tool error"

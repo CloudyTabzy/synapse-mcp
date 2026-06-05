@@ -484,15 +484,6 @@ def main():
         "--verbose", "-v", action="store_true", help="Show debug messages"
     )
     parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host to listen on, default: 127.0.0.1",
-    )
-    parser.add_argument(
-        "--port", type=int, default=8745, help="Port to listen on, default: 8745"
-    )
-    parser.add_argument(
         "--isolated-contexts",
         action="store_true",
         help=(
@@ -617,19 +608,9 @@ def main():
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
-    # TODO: with background=True the main thread does not fake any
-    # work from @idasync, so we deadlock.
     if not "IDA_MCP_URL" in os.environ:
-        # IDA_MCP_URL is used to set download base url by environment,
-        # so we only update download base url if this env var is not
-        # present
-        #
-        # It should be noted that this url ONLY affects the literal string
-        # returned by MCP response, does NOT affect the actual socket
-        # endpoint this server listens to
-        set_download_base_url(f"http://{args.host}:{args.port}")
-    MCP_SERVER.serve(host=args.host, port=args.port, background=False,
-                     request_handler=IdaMcpHttpRequestHandler)
+        set_download_base_url(f"http://127.0.0.1:0")
+    MCP_SERVER.stdio()
 
 
 if __name__ == "__main__":
