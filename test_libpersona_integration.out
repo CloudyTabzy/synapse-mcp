@@ -1,0 +1,43 @@
+[INFO] Starting supervisor: C:\Users\User\AppData\Local\Programs\Python\Python313\python.exe -m ida_pro_mcp.idalib_supervisor --stdio --verbose
+[INFO] IDADIR=C:\Program Files\IDA Professional 9.3
+[INFO] Target=C:\Program Files\Affinity\Canva\libpersona.dll
+[SEND] {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test"}}}
+[RECV] {"jsonrpc": "2.0", "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {}}, "serverInfo": {"name": "synapse-mcp", "version": "1.0.0"}}, "id": 1}
+[OK] initialize -> {'name': 'synapse-mcp', 'version': '1.0.0'}
+[SEND] {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"idalib_open","arguments":{"input_path":"C:\\Program Files\\Affinity\\Canva\\libpersona.dll","run_auto_analysis":true,"session_id":"libp"
+[RECV] {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{\"success\":true,\"status\":\"loading\",\"task_id\":\"open_660b07fd\",\"size_mb\":343.2,\"estimated_sec\":600,\"context_id\":\"shared:fallback\",\"transport_context_id\":\"stdio:default\",\"isolated_contexts\":false,\"message\":\"Large binary (343.2 MB) \\u2014 opening in background. Poll with idalib_idalib_list() or check idalib
+[OK] idalib_open result: {
+  "success": true,
+  "status": "loading",
+  "task_id": "open_660b07fd",
+  "size_mb": 343.2,
+  "estimated_sec": 600,
+  "context_id": "shared:fallback",
+  "transport_context_id": "stdio:default",
+  "isolated_contexts": false,
+  "message": "Large binary (343.2 MB) \u2014 opening in background. Poll with idalib_idalib_list() or check idalib_task_poll('open_660b07fd')"
+}
+[INFO] Async open, task_id=open_660b07fd. Polling...
+[SEND] {"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"idalib_task_poll","arguments":{"task_id":"open_660b07fd"}}}
+[RECV] {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"session_id\\\":\\\"libp\\\",\\\"filename\\\":\\\"libpersona.dll\\\"}\"}],\"isError\":false,\"structuredContent\":{\"status\":\"done\",\"session_id\":\"libp\",\"filename\":\"libpersona.dll\"}}"}], "structuredContent": {"content": [{"type": "text", "text": 
+[POLL #0] status=done full={"status": "done", "session_id": "libp", "filename": "libpersona.dll"}
+[FINAL] {
+  "status": "done",
+  "session_id": "libp",
+  "filename": "libpersona.dll"
+}
+[SEND] {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"idalib_list","arguments":{}}}
+[RECV] {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{\"sessions\":[{\"session_id\":\"libp\",\"input_path\":\"C:\\\\Program Files\\\\Affinity\\\\Canva\\\\libpersona.dll\",\"filename\":\"libpersona.dll\",\"created_at\":\"2026-06-06T03:29:25.555804\",\"last_accessed\":\"2026-06-06T03:29:25.555805\",\"is_analyzing\":false,\"metadata\":{},\"is_active\":true,\"is_current_context\":true,\
+[OK] idalib_list: {"sessions":[{"session_id":"libp","input_path":"C:\\Program Files\\Affinity\\Canva\\libpersona.dll","filename":"libpersona.dll","created_at":"2026-06-06T03:29:25.555804","last_accessed":"2026-06-06T03:29:25.555805","is_analyzing":false,"metadata":{},"is_active":true,"is_current_context":true,"bound_contexts":1,"backend":"worker","owned":true,"pid":5480,"worker_pid":5480}],"count":1,"context_id":"shared:fallback","transport_context_id":"stdio:default","isolated_contexts":false,"current_context_session_id":"libp"}
+[STDERR] INFO:__main__:Bootstrap: spawning temporary worker for schema discovery...
+INFO:__main__:Spawning idalib worker (IDADIR=C:\Program Files\IDA Professional 9.3)
+INFO:__main__:Bootstrap: complete \ufffd worker ready for reuse
+DEBUG:zeromcp.jsonrpc:[MCP] >> initialize({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test"}})
+DEBUG:zeromcp.jsonrpc:[MCP] << initialize (0.1ms) {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {}}, "serverInfo": {"name": "synapse-mcp", "version": "1.0.0"}}
+DEBUG:zeromcp.jsonrpc:[MCP] >> idalib_open({"input_path": "C:\\Program Files\\Affinity\\Canva\\libpersona.dll", "run_auto_analysis": true, "session_id": "libp"})
+DEBUG:zeromcp.jsonrpc:[MCP] << idalib_open (0.7ms) {"success": true, "status": "loading", "task_id": "open_660b07fd", "size_mb": 343.2, "estimated_sec": 600, "context_id": "shared:fallback", "transport_context_id": "stdio:default", "isolated_contexts"...
+DEBUG:zeromcp.jsonrpc:[MCP] >> idalib_task_poll({"task_id": "open_660b07fd"})
+DEBUG:zeromcp.jsonrpc:[MCP] << idalib_task_poll (0.2ms) {"content": [{"type": "text", "text": "{\"status\":\"done\",\"session_id\":\"libp\",\"filename\":\"libpersona.dll\"}"}], "isError": false, "structuredContent": {"status": "done", "session_id": "libp",...
+DEBUG:zeromcp.jsonrpc:[MCP] >> idalib_list({})
+DEBUG:zeromcp.jsonrpc:[MCP] << idalib_list (0.1ms) {"sessions": [{"session_id": "libp", "input_path": "C:\\Program Files\\Affinity\\Canva\\libpersona.dll", "filename": "libpersona.dll", "created_at": "2026-06-06T03:29:25.555804", "last_accessed": "202...
+
