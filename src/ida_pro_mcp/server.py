@@ -741,10 +741,10 @@ _GROUP_REPRESENTATIVE_TOOLS: dict[str, list[str]] = {
 # Known core tools; used by _validate_groups() to avoid false-positive warnings.
 _CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "server_health", "server_warmup", "lookup_funcs", "int_convert",
-    "list_funcs", "func_query", "list_globals", "entity_query",
+    "list_funcs", "func_query", "list_globals", "list_strings", "entity_query",
     "imports", "imports_query", "idb_save", "find_regex", "search_text",
     "read_mcp_output", "list_instances", "select_instance", "get_active_instance",
-    "invoke_on_instance", "compare_instances",
+    "find_instance", "invoke_on_instance", "compare_instances",
     "task_submit", "task_cancel", "task_list", "task_poll",
     "idalib_open", "idalib_close", "idalib_switch", "idalib_unbind",
     "idalib_list", "idalib_current", "idalib_save", "idalib_health", "idalib_warmup",
