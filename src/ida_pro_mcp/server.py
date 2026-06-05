@@ -1000,16 +1000,16 @@ class ProxyHttpRequestHandler(McpHttpRequestHandler):
         # MCP Streamable HTTP: GET /mcp is an optional SSE pre-connect check.
         # Returning 405 (as zeromcp does) causes some MCP clients (Kilo, Cursor)
         # to treat the connection as failed instead of falling through to POST.
-        # Per the MCP spec, a 200 OK with no body signals "no SSE stream, use POST".
+        # Per the MCP spec, an empty SSE stream signals "no events, use POST only".
         if parsed.path == "/mcp" or parsed.path.rstrip("/") == "/mcp":
             if not self._check_api_request():
                 return
             self.send_response(200)
             self.send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", "2")
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(b"{}")
+            self.wfile.flush()
             return
 
         super().do_GET()
