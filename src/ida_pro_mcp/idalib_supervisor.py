@@ -294,6 +294,248 @@ class WorkerCrashedError(RuntimeError):
         self.worker = worker
 
 
+_WORKER_CMDLINE_MARKER = "ida_pro_mcp.idalib_server"
+
+
+def _select_orphan_worker_pids(
+    procs: list[dict[str, Any]],
+    *,
+    protected: set[int],
+    alive_pids: set[int],
+) -> list[int]:
+    """Pick idalib_server worker pids whose supervisor parent is gone.
+
+    An orphaned worker keeps an OS file lock on its .i64 (blocking new opens
+    AND the IDA GUI) and occupies a pool slot forever — this is the Case-3
+    "stuck worker poisons everything / IDB read-only" failure. Pure/testable:
+    *procs* is a list of {"pid","ppid","cmdline"} dicts.
+
+    Only true orphans (parent pid not currently alive) are selected, so a
+    concurrently-running supervisor's live workers are never touched.
+    """
+    victims: list[int] = []
+    for p in procs:
+        cmdline = p.get("cmdline") or []
+        if _WORKER_CMDLINE_MARKER not in " ".join(cmdline):
+            continue
+        pid = p.get("pid")
+        if pid is None or pid in protected:
+            continue
+        ppid = p.get("ppid")
+        if ppid is None or ppid not in alive_pids:
+            victims.append(pid)
+    return victims
+
+
+def _kill_pid_tree(pid: int) -> bool:
+    """Best-effort hard-kill of a pid and its children (releases file locks)."""
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        try:
+            os.kill(pid, 9)
+            return True
+        except OSError:
+            return False
+    try:
+        proc = psutil.Process(pid)
+    except Exception:
+        return False
+    targets = []
+    try:
+        targets = proc.children(recursive=True)
+    except Exception:
+        pass
+    targets.append(proc)
+    killed = False
+    for t in targets:
+        try:
+            t.kill()
+            killed = True
+        except Exception:
+            pass
+    return killed
+
+
+def _sweep_orphan_workers(protected_pids: set[int]) -> list[int]:
+    """Kill leaked idalib_server workers whose supervisor parent has exited.
+
+    Run at startup so a restart auto-recovers from a prior crash that left
+    workers holding .i64 locks. Safe: only parent-dead orphans are killed.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return []
+    procs: list[dict[str, Any]] = []
+    alive: set[int] = set()
+    for p in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            info = p.info
+            alive.add(info["pid"])
+            procs.append({"pid": info["pid"], "ppid": info.get("ppid"), "cmdline": info.get("cmdline")})
+        except Exception:
+            continue
+    victims = _select_orphan_worker_pids(procs, protected=protected_pids, alive_pids=alive)
+    killed = [pid for pid in victims if _kill_pid_tree(pid)]
+    if killed:
+        logger.warning(
+            "Swept %d orphaned idalib worker(s) holding stale locks: %s", len(killed), killed
+        )
+    return killed
+
+
+def _parse_mem_limit_bytes() -> int | None:
+    """Committed-memory cap per worker pool, from IDA_MCP_IDALIB_MEM_LIMIT_GB.
+
+    When set, the Job Object enforces a hard cap on total committed memory across
+    all workers — this is what backs ``pagefile.sys``, so it bounds pagefile
+    growth. Unset/0 → no cap. Too-low a cap will make IDA fail to load large
+    IDBs (allocations error out instead of ballooning), so it's opt-in.
+    """
+    raw = os.environ.get("IDA_MCP_IDALIB_MEM_LIMIT_GB", "").strip()
+    if not raw:
+        return None
+    try:
+        gb = float(raw)
+    except ValueError:
+        return None
+    return int(gb * (1024 ** 3)) if gb > 0 else None
+
+
+class _WorkerJob:
+    """Windows Job Object that owns every idalib worker process.
+
+    Solves two things at once for ``pagefile.sys`` blowup:
+
+    * **KILL_ON_JOB_CLOSE** — when the supervisor process exits for ANY reason
+      (clean shutdown, crash, taskkill, parent death, lost console), Windows
+      terminates every worker still in the job. No orphaned workers survive, so
+      their committed memory (pagefile) is freed and their ``.i64`` locks are
+      released immediately — "clean up no matter what happens".
+    * **JOB_MEMORY limit (opt-in)** — caps total committed memory across all
+      workers (``IDA_MCP_IDALIB_MEM_LIMIT_GB``), bounding how far pagefile can
+      grow.
+
+    No-op on non-Windows; posix uses a PR_SET_PDEATHSIG preexec instead.
+    """
+
+    def __init__(self, mem_limit_bytes: int | None = None):
+        self._handle = None
+        self._kernel32 = None
+        self.mem_limit_bytes = mem_limit_bytes
+        if os.name != "nt":
+            return
+        try:
+            self._init_windows(mem_limit_bytes)
+        except Exception:
+            logger.debug("Job Object setup failed; relying on orphan sweep", exc_info=True)
+
+    def _init_windows(self, mem_limit_bytes: int | None) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+        JobObjectExtendedLimitInformation = 9
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC),
+                ("IoInfo", _IO),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateJobObjectW.restype = wintypes.HANDLE
+        k.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k.SetInformationJobObject.restype = wintypes.BOOL
+        k.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        k.AssignProcessToJobObject.restype = wintypes.BOOL
+        k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = k.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = _EXTENDED()
+        flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if mem_limit_bytes and mem_limit_bytes > 0:
+            flags |= JOB_OBJECT_LIMIT_JOB_MEMORY
+            info.JobMemoryLimit = mem_limit_bytes
+        info.BasicLimitInformation.LimitFlags = flags
+        if not k.SetInformationJobObject(
+            job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            k.CloseHandle(job)
+            return
+        self._handle = job
+        self._kernel32 = k
+        cap = f", commit cap {mem_limit_bytes // (1024 ** 2)} MB" if mem_limit_bytes else ""
+        logger.info("Worker Job Object active (kill-on-close%s)", cap)
+
+    @property
+    def active(self) -> bool:
+        return self._handle is not None
+
+    def assign(self, process: Any) -> None:
+        """Add a freshly-spawned worker to the job so it dies with us."""
+        if self._handle is None or process is None:
+            return
+        try:
+            handle = int(process._handle)  # subprocess.Popen Windows process handle
+        except Exception:
+            return
+        try:
+            if not self._kernel32.AssignProcessToJobObject(self._handle, handle):
+                import ctypes
+                logger.debug("AssignProcessToJobObject failed (err=%s)", ctypes.get_last_error())
+        except Exception:
+            logger.debug("AssignProcessToJobObject raised", exc_info=True)
+
+    def close(self) -> None:
+        """Close the job handle — kills all remaining workers (KILL_ON_JOB_CLOSE)."""
+        if self._handle is not None and self._kernel32 is not None:
+            try:
+                self._kernel32.CloseHandle(self._handle)
+            except Exception:
+                pass
+        self._handle = None
+
+
+def _worker_pdeathsig_preexec() -> None:
+    """posix preexec: ask the kernel to SIGKILL this worker if the supervisor dies."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception:
+        pass
+
+
 def _read_stderr_tail(log_path: str | None, *, max_lines: int = 25, max_bytes: int = 4000) -> str | None:
     """Return the tail of a worker stderr-capture file, or None.
 
@@ -421,6 +663,10 @@ class IdalibSupervisor:
         # pid -> stderr-capture path, so a crash diagnostic can find the log
         # even for a session whose own metadata doesn't carry it.
         self._worker_logs: dict[int, str] = {}
+        # All workers join this Job Object: they're force-killed when the
+        # supervisor exits (any reason), freeing committed memory (pagefile) and
+        # releasing .i64 locks. Optional commit cap bounds pagefile growth.
+        self._job = _WorkerJob(_parse_mem_limit_bytes())
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
@@ -636,19 +882,27 @@ class IdalibSupervisor:
         logger.info("Spawning idalib worker (IDADIR=%s)", env.get("IDADIR", "unset"))
         log_path = self._worker_log_path()
         stderr_file = open(log_path, "w") if log_path else None
-        # CREATE_NEW_PROCESS_GROUP isolates the worker in its own process group
-        # so force-killing the worker never crashes the parent daemon.
-        _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-        process = subprocess.Popen(
-            cmd,
+        popen_kwargs: dict[str, Any] = dict(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_file or subprocess.DEVNULL,
             env=env,
-            creationflags=_CREATE_NEW_PROCESS_GROUP,
         )
+        if os.name == "nt":
+            # CREATE_NEW_PROCESS_GROUP isolates the worker in its own process
+            # group so force-killing the worker never crashes the parent daemon.
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
+        else:
+            # posix: SIGKILL the worker if the supervisor dies (parent-death).
+            popen_kwargs["preexec_fn"] = _worker_pdeathsig_preexec
+        process = subprocess.Popen(cmd, **popen_kwargs)
         if stderr_file:
             stderr_file.close()
+        # Join the Job Object ASAP so the worker is force-killed if we die
+        # (Windows); frees its committed memory and releases .i64 locks.
+        self._job.assign(process)
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
             input_path="",
@@ -787,6 +1041,9 @@ class IdalibSupervisor:
             self._schema_worker = None
         for worker in workers:
             self._terminate_worker(worker)
+        # Closing the job handle force-kills any worker that somehow survived
+        # termination (KILL_ON_JOB_CLOSE) — frees committed memory + locks.
+        self._job.close()
 
     def _schema_or_idle_worker(self) -> WorkerSession:
         with self._lock:
@@ -2330,17 +2587,20 @@ def idalib_start_analysis(
 
 @mcp.tool
 def idalib_cleanup_zombies(
-    max_age_minutes: Annotated[Optional[int], "Kill ida.exe processes older than N minutes"] = 30,
+    max_age_minutes: Annotated[Optional[int], "Reap foreign idalib_server workers / ida.exe older than N minutes"] = 30,
+    include_foreign_workers: Annotated[bool, "Also reap idalib_server workers from OTHER supervisors older than max_age"] = True,
 ) -> dict:
-    """Find and kill orphan IDA processes not managed by this supervisor.
+    """Kill stuck/orphaned idalib worker processes (the real lock-holders).
 
-    Enumerates ida.exe/ida processes via psutil, excludes those this supervisor
-    spawned (tracked workers + their process trees), and terminates the rest
-    once they're older than max_age_minutes. Use after a crash or when stale GUI
-    instances / orphaned workers eat memory. Returns the pids actually killed.
-
-    (Replaces the old wmic-based scan, which silently no-ops on current Windows
-    where wmic.exe has been removed.)
+    The headless workers that hold OS file locks on .i64 databases — blocking
+    new opens AND the IDA GUI — are ``python -m ida_pro_mcp.idalib_server``
+    processes, NOT ``ida.exe``. This reaps:
+      - **orphaned** idalib_server workers (their supervisor parent is gone) — any age;
+      - **foreign** idalib_server workers (another live supervisor) older than
+        max_age_minutes, when include_foreign_workers=True;
+      - stale ``ida.exe`` GUI instances older than max_age_minutes.
+    Workers owned by THIS supervisor (and their children) are always protected.
+    Returns the pids killed, with the reason, so you can see what was reclaimed.
     """
     sup = _require_supervisor()
     supervisor_pids: set[int] = set()
@@ -2354,6 +2614,7 @@ def idalib_cleanup_zombies(
             supervisor_pids.add(sup._schema_worker.process.pid)
         if sup._schema_worker is not None and sup._schema_worker.pid is not None:
             supervisor_pids.add(sup._schema_worker.pid)
+    supervisor_pids.add(os.getpid())
 
     try:
         import psutil  # type: ignore
@@ -2375,32 +2636,47 @@ def idalib_cleanup_zombies(
         except Exception:
             pass
 
-    killed_pids: list[int] = []
-    errors = 0
+    procs = list(psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]))
+    alive = {p.info["pid"] for p in procs if p.info.get("pid") is not None}
     now = time.time()
     cutoff_age = (max_age_minutes or 0) * 60
+    killed: list[dict[str, Any]] = []
+    errors = 0
 
-    for proc in psutil.process_iter(["pid", "name", "create_time"]):
+    for proc in procs:
         try:
-            name = (proc.info.get("name") or "").lower()
-            if name not in ("ida.exe", "ida64.exe", "ida", "ida64"):
-                continue
-            pid = proc.info["pid"]
+            info = proc.info
+            pid = info["pid"]
             if pid in protected:
                 continue
-            age = now - (proc.info.get("create_time") or now)
-            if age < cutoff_age:
-                continue  # too young to be considered a zombie
-            proc.kill()
-            killed_pids.append(pid)
+            cmdline = info.get("cmdline") or []
+            name = (info.get("name") or "").lower()
+            age = now - (info.get("create_time") or now)
+            is_worker = _WORKER_CMDLINE_MARKER in " ".join(cmdline)
+            reason = None
+            if is_worker:
+                ppid = info.get("ppid")
+                if ppid is None or ppid not in alive:
+                    reason = "orphan"  # supervisor parent gone — always reap
+                elif include_foreign_workers and age >= cutoff_age:
+                    reason = "foreign_stale"
+            elif name in ("ida.exe", "ida64.exe", "ida", "ida64") and age >= cutoff_age:
+                reason = "gui_zombie"
+            if reason is None:
+                continue
+            if _kill_pid_tree(pid):
+                killed.append({"pid": pid, "reason": reason, "age_sec": round(age)})
+            else:
+                errors += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             errors += 1
         except Exception:
             errors += 1
 
     return {
-        "killed": len(killed_pids),
-        "killed_pids": killed_pids,
+        "killed": len(killed),
+        "killed_pids": [k["pid"] for k in killed],
+        "killed_detail": killed,
         "errors": errors,
         "remaining_managed": len(supervisor_pids),
     }
@@ -2450,6 +2726,25 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     arguments = copy.deepcopy(params.get("arguments") or {})
     database = arguments.pop(_DATABASE_ARG, None)
+
+    # *_status probes report library availability/version and need no IDB at
+    # all. Route them to the schema/idle worker so they work before any database
+    # is opened (was: "no database bound for this context").
+    if tool_name.endswith("_status"):
+        try:
+            worker = sup.resolve_session(database)
+        except Exception:
+            worker = sup._schema_or_idle_worker()
+        if worker is not None:
+            forwarded = copy.deepcopy(request_obj)
+            forwarded.setdefault("params", {})["arguments"] = arguments
+            try:
+                return sup.forward_raw(worker, forwarded)
+            except WorkerCrashedError as e:
+                diag = sup.handle_worker_crash(e.worker, action=f"tool '{tool_name}'")
+                return _jsonrpc_result(request_id, _call_tool_result(diag, is_error=True))
+            except Exception as e:
+                return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
     # LIEF, ELF, and memmap tools with file_path don't need an IDB
     # session. Route to the schema worker directly so the tool can
@@ -2615,6 +2910,14 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    # Recover from a prior crash/restart: kill leaked idalib_server workers whose
+    # supervisor parent is gone. They hold OS file locks on .i64 databases
+    # (blocking new opens AND the IDA GUI) and would otherwise poison the pool.
+    try:
+        _sweep_orphan_workers(protected_pids=set())
+    except Exception:
+        logger.debug("Startup orphan-worker sweep failed", exc_info=True)
 
     worker_args: list[str] = []
     if args.verbose:

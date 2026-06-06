@@ -455,3 +455,73 @@ def test_idalib_health_reports_state_and_pool_detail(supervisor, monkeypatch):
     assert worker["state"] in ("idle", "busy", "analyzing", "dead")
     assert "active_calls" in worker
     assert "age_sec" in worker
+
+
+# ---------------------------------------------------------------------------
+# Orphaned-worker recovery (file-lock / pagefile poison from a dead supervisor)
+# ---------------------------------------------------------------------------
+
+def test_select_orphan_worker_pids_picks_parent_dead_workers():
+    procs = [
+        {"pid": 100, "ppid": 1, "cmdline": ["python", "-m", "ida_pro_mcp.idalib_server"]},     # parent dead -> orphan
+        {"pid": 101, "ppid": 50, "cmdline": ["python", "-m", "ida_pro_mcp.idalib_server"]},    # parent alive -> keep
+        {"pid": 102, "ppid": None, "cmdline": ["python", "-m", "ida_pro_mcp.idalib_server"]},  # no parent -> orphan
+        {"pid": 103, "ppid": 1, "cmdline": ["python", "-m", "other.module"]},                  # not a worker -> skip
+        {"pid": 104, "ppid": 1, "cmdline": ["python", "-m", "ida_pro_mcp.idalib_server"]},     # orphan but protected
+    ]
+    alive = {50, 100, 101, 102, 103, 104}
+    victims = supmod._select_orphan_worker_pids(procs, protected={104}, alive_pids=alive)
+    assert sorted(victims) == [100, 102]
+
+
+def test_status_tool_routes_to_idle_worker_without_bound_db(supervisor, monkeypatch):
+    """`*_status` probes must work before any database is opened (Issue #1/#6)."""
+    monkeypatch.setattr(supmod, "supervisor", supervisor)
+    sentinel = object()
+    monkeypatch.setattr(supervisor, "_schema_or_idle_worker", lambda: sentinel)
+    seen: dict = {}
+
+    def fake_forward(worker, req):
+        seen["worker"] = worker
+        seen["name"] = req["params"]["name"]
+        return {"jsonrpc": "2.0", "id": req.get("id"),
+                "result": {"structuredContent": {"available": True}}}
+
+    monkeypatch.setattr(supervisor, "forward_raw", fake_forward)
+    req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": "lief_status", "arguments": {}}}
+    supmod._handle_tools_call(req)
+    assert seen["worker"] is sentinel  # routed to idle worker, no "no database bound" error
+    assert seen["name"] == "lief_status"
+
+
+# ---------------------------------------------------------------------------
+# Memory lifecycle: commit cap parsing + Job Object (pagefile control)
+# ---------------------------------------------------------------------------
+
+def test_parse_mem_limit_bytes(monkeypatch):
+    monkeypatch.delenv("IDA_MCP_IDALIB_MEM_LIMIT_GB", raising=False)
+    assert supmod._parse_mem_limit_bytes() is None
+    monkeypatch.setenv("IDA_MCP_IDALIB_MEM_LIMIT_GB", "8")
+    assert supmod._parse_mem_limit_bytes() == 8 * 1024 ** 3
+    monkeypatch.setenv("IDA_MCP_IDALIB_MEM_LIMIT_GB", "1.5")
+    assert supmod._parse_mem_limit_bytes() == int(1.5 * 1024 ** 3)
+    monkeypatch.setenv("IDA_MCP_IDALIB_MEM_LIMIT_GB", "0")
+    assert supmod._parse_mem_limit_bytes() is None
+    monkeypatch.setenv("IDA_MCP_IDALIB_MEM_LIMIT_GB", "garbage")
+    assert supmod._parse_mem_limit_bytes() is None
+
+
+def test_worker_job_construct_assign_close_are_safe():
+    # Must never raise regardless of platform; assign(None)/double-close are no-ops.
+    job = supmod._WorkerJob(None)
+    job.assign(None)
+    job.close()
+    job.close()
+    capped = supmod._WorkerJob(2 * 1024 ** 3)
+    capped.close()
+    if os.name == "nt":
+        # On Windows the kernel object is really created.
+        live = supmod._WorkerJob(None)
+        assert live.active is True
+        live.close()

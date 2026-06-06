@@ -152,6 +152,27 @@ Pass if: `pool` includes `workers_analyzing`, `workers_busy`, `save_on_idle`,
 and each `workers[]` entry has `state` (idle/busy/analyzing/dead),
 `active_calls`, `age_sec`, and `stderr_log`.
 
+### T12 — Status probes need no database
+With NO database open, call `lief_status` (or any `*_status`).
+Pass if: it returns `available`/version instead of "no database bound".
+
+### T13 — Orphan recovery on restart (file-lock release)
+1. Open a binary, then hard-kill the **supervisor** process (not the worker).
+2. Confirm a `python -m ida_pro_mcp.idalib_server` worker is left behind and the
+   `.i64` shows "in use" in IDA GUI.
+3. Start a new idalib-mcp.
+Pass if: the leftover worker is gone (startup sweep killed it) and the `.i64`
+opens cleanly. Also: `idalib_cleanup_zombies()` now lists those python workers
+in `killed_detail` (reason `orphan`/`foreign_stale`), not just `ida.exe`.
+
+### T14 — Memory / pagefile lifecycle (Windows)
+1. Open a large binary so a worker commits multi-GB (watch Task Manager →
+   "Commit size" / pagefile usage rise).
+2. Kill the supervisor by ANY means (close client, `taskkill /F`, Ctrl-C).
+Pass if: the worker process dies within ~1s (Job Object KILL_ON_JOB_CLOSE) and
+commit charge drops. With `IDA_MCP_IDALIB_MEM_LIMIT_GB=<N>` set, total worker
+commit never exceeds N GB (a too-large IDB instead fails to load).
+
 ---
 
 ## Pass criteria summary
