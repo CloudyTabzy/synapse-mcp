@@ -20,9 +20,13 @@ Tool roster (2 tools + 1 always-registered probe):
     numpy_entropy_map       — block-level Shannon entropy heatmap with
                               contiguous high-entropy run detection
                               (⭐ packed/encrypted section triage)
-    numpy_byte_histogram    — 256-bucket byte distribution + chi-square
-                              uniformity test (distinguishes encrypted /
+    numpy_byte_histogram    — 256-bucket byte distribution + chi-square +
+                              Kolmogorov-Smirnov + Anderson-Darling
+                              uniformity tests (distinguishes encrypted /
                               compressed / plaintext / code in one call)
+    numpy_function_similarity — byte-level clone detection via cosine,
+                              EMBER histogram, NCC, or Jensen-Shannon
+                              distance (pure-NumPy proper metric)
 
 Profile: analysis
 """
@@ -118,6 +122,9 @@ class NumpyByteHistogramResult(TypedDict, total=False):
     entropy_class: str
     chi2: float
     chi2_uniform_ratio: float
+    ks_statistic: float
+    ks_p_value_approx: float
+    ad_statistic: float
     distribution: str
     unique_byte_count: int
     most_common: list[ByteHit]
@@ -457,6 +464,96 @@ def _ncc(da: bytes, db: bytes) -> float:
         return 0.0
     corr = np.correlate(a, b, mode="full")
     return float(np.max(np.abs(corr)) / (na * nb))
+
+
+def _jsd(p: np.ndarray, q: np.ndarray) -> float:
+    """Jensen-Shannon distance between two frequency vectors (pure NumPy).
+
+    JS distance is a proper metric: symmetric, bounded [0,1], and satisfies
+    the triangle inequality. More principled than cosine for comparing
+    probability distributions, though slightly slower.
+    """
+    p = p.astype(np.float64)
+    q = q.astype(np.float64)
+    sp = np.sum(p)
+    sq = np.sum(q)
+    if sp == 0.0 or sq == 0.0:
+        return 1.0
+    p = p / sp
+    q = q / sq
+    eps = 1e-12
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    m = 0.5 * (p + q)
+    kl_p = np.sum(p * np.log2(p / m))
+    kl_q = np.sum(q * np.log2(q / m))
+    # JS divergence = (KL(P||M) + KL(Q||M)) / 2
+    # JS distance = sqrt(JS divergence)
+    return float(np.sqrt((kl_p + kl_q) / 2.0))
+
+
+def _ks_uniform(data: bytes) -> float:
+    """Kolmogorov-Smirnov statistic against discrete uniform over [0, 255].
+
+    D = max(|ECDF(x) - CDF(x)|).  Sensitive to differences at the edges
+    of the distribution — complementary to chi-square which tests overall
+    shape.  Research (ENCOD, 2020) shows KS can distinguish compressed
+    from encrypted data in regimes where entropy alone fails.
+    """
+    arr = np.frombuffer(data, dtype=np.uint8)
+    n = arr.size
+    if n == 0:
+        return 0.0
+    sorted_arr = np.sort(arr)
+    i = np.arange(1, n + 1, dtype=np.float64)
+    # Empirical CDF at each sorted point
+    ecdf = i / n
+    # Theoretical CDF for discrete uniform on [0, 255]
+    # Using continuity correction: F(x) = (x + 0.5) / 256
+    theoretical = (sorted_arr.astype(np.float64) + 0.5) / 256.0
+    d_plus = np.max(ecdf - theoretical)
+    d_minus = np.max(theoretical - (i - 1) / n)
+    return float(max(d_plus, d_minus))
+
+
+def _ad_uniform(data: bytes) -> float:
+    """Anderson-Darling statistic against discrete uniform over [0, 255].
+
+    A² weights tail deviations more heavily than KS, making it especially
+    sensitive to cipher-output anomalies (e.g. RC4's slight bias in early
+    keystream bytes) that chi-square might miss.
+    """
+    arr = np.frombuffer(data, dtype=np.uint8)
+    n = arr.size
+    if n < 2:
+        return 0.0
+    sorted_arr = np.sort(arr)
+    # Continuity-corrected CDF for discrete uniform
+    cdf = (sorted_arr.astype(np.float64) + 0.5) / 256.0
+    cdf = np.clip(cdf, 1e-10, 1.0 - 1e-10)
+    i = np.arange(1, n + 1, dtype=np.float64)
+    # A² = -n - (1/n) * sum[(2i-1)*ln(F_i) + (2(n-i)+1)*ln(1-F_i)]
+    term1 = (2 * i - 1) * np.log(cdf)
+    term2 = (2 * (n - i) + 1) * np.log(1.0 - cdf)
+    a2 = -n - np.sum(term1 + term2) / n
+    return float(a2)
+
+
+def _ks_pvalue_approx(d: float, n: int) -> float:
+    """Large-n approximation of the one-sample KS p-value (Kolmogorov distribution).
+
+    Conservative for discrete distributions (reports slightly higher
+    p-values than the exact test), but adequate for RE triage.
+    """
+    if n <= 0 or d <= 0.0:
+        return 1.0
+    x = np.sqrt(n) * d
+    # K(x) = 1 - 2 * sum_{k=1}^{∞} (-1)^(k-1) e^(-2k²x²)
+    k = np.arange(1, 101, dtype=np.float64)
+    terms = (-1.0) ** (k - 1) * np.exp(-2.0 * k ** 2 * x ** 2)
+    k_cdf = 1.0 - 2.0 * np.sum(terms)
+    k_cdf = float(np.clip(k_cdf, 0.0, 1.0))
+    return 1.0 - k_cdf
 
 
 def _interpret_similarity(score: float) -> str:
@@ -844,14 +941,23 @@ if NUMPY_AVAILABLE:
           of freedom). A *non-uniform* (plaintext/code) region produces a HIGH
           chi-square. ``chi2_uniform_ratio`` = chi2 / 255 is ≈1.0 for uniform
           data and grows large for structured data.
+        - ``ks_statistic`` / ``ks_p_value_approx`` — Kolmogorov-Smirnov test
+          against uniform.  Sensitive to edge/tail differences that chi-square
+          misses.  KS > 0.05 with high p-value suggests non-uniform (code/data);
+          KS < 0.02 with low p-value suggests uniform (encrypted/random).
+        - ``ad_statistic`` — Anderson-Darling statistic.  Weights tail
+          deviations more heavily than KS; especially sensitive to subtle cipher
+          biases (e.g. RC4 keystream anomalies) that other tests miss.
         - ``unique_byte_count`` — 256 (every value present) suggests cipher
           output; a small count suggests sparse/structured data.
         - ``most_common`` — top-5 bytes; a single dominant byte at moderate
           entropy is a classic single-byte-XOR / RLE signature.
 
         Together these distinguish AES/stream-cipher output (near-uniform,
-        entropy ≈ 8, chi2 low) from XOR-obfuscated data (one dominant byte,
-        entropy 4–7) from plaintext code (very non-uniform, chi2 high).
+        entropy ≈ 8, chi2 low, KS low) from XOR-obfuscated data (one dominant
+        byte, entropy 4–7) from plaintext code (very non-uniform, chi2 high,
+        KS high).  KS and AD are complementary to chi-square: use all three
+        when the classification is borderline.
 
         See also: numpy_entropy_map (where in a region the entropy lives),
         yara_scan_builtin_crypto (find crypto constants directly),
@@ -871,6 +977,10 @@ if NUMPY_AVAILABLE:
             expected = n / 256.0
             chi2 = float(np.sum((counts - expected) ** 2 / expected))
             chi2_ratio = chi2 / 255.0  # ≈1.0 uniform, >>1 non-uniform
+
+            ks_d = _ks_uniform(data)
+            ks_p = _ks_pvalue_approx(ks_d, n)
+            ad_a2 = _ad_uniform(data)
 
             order = np.argsort(counts)[::-1][:5]
             most_common: list[ByteHit] = []
@@ -907,6 +1017,9 @@ if NUMPY_AVAILABLE:
                 "entropy_class": ent_class,
                 "chi2": round(chi2, 2),
                 "chi2_uniform_ratio": round(chi2_ratio, 3),
+                "ks_statistic": round(ks_d, 4),
+                "ks_p_value_approx": round(ks_p, 4),
+                "ad_statistic": round(ad_a2, 2),
                 "distribution": distribution,
                 "unique_byte_count": unique_byte_count,
                 "most_common": most_common,
@@ -1131,8 +1244,9 @@ if NUMPY_AVAILABLE:
         method: Annotated[
             str,
             "Comparison method: 'byte_histogram' (256-bucket cosine, default), "
-            "'byte_entropy_histogram' (EMBER 16×16 joint), or 'ncc' "
-            "(shift-invariant normalized cross-correlation).",
+            "'byte_entropy_histogram' (EMBER 16×16 joint), 'ncc' "
+            "(shift-invariant normalized cross-correlation), or 'jsd' "
+            "(Jensen-Shannon distance — proper metric, bounded [0,1]).",
         ] = "byte_histogram",
         min_bytes: Annotated[
             int, "Minimum function size for a reliable comparison (default: 32)"
@@ -1153,6 +1267,10 @@ if NUMPY_AVAILABLE:
           discriminative for telling apart structurally-similar functions.
         - ``ncc`` — normalized cross-correlation; shift-invariant, best when two
           functions differ only by alignment/padding (slowest).
+        - ``jsd`` — Jensen-Shannon distance. A proper metric (symmetric, bounded,
+          triangle inequality) that is more principled than cosine for comparing
+          probability distributions. Slightly slower but better for borderline
+          cases where cosine is ambiguous.
 
         Interpretation: ≥0.99 identical · ≥0.92 very_similar · ≥0.80 similar.
 
@@ -1185,11 +1303,13 @@ if NUMPY_AVAILABLE:
                 score = _cosine(_byte_entropy_vec(da), _byte_entropy_vec(db))
             elif m == "ncc":
                 score = _ncc(da[:_NCC_MAX_BYTES], db[:_NCC_MAX_BYTES])
+            elif m == "jsd":
+                score = 1.0 - _jsd(_byte_hist_vec(da), _byte_hist_vec(db))
             else:
                 return {
                     "ok": False,
                     "error": f"Unknown method: {method!r} "
-                             "(use byte_histogram | byte_entropy_histogram | ncc).",
+                             "(use byte_histogram | byte_entropy_histogram | ncc | jsd).",
                 }
 
             score = min(1.0, max(0.0, score))
