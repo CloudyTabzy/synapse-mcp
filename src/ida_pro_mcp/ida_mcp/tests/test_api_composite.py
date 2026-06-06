@@ -19,6 +19,7 @@ from ..framework import (
 )
 from ..api_composite import (
     analyze_function,
+    analyze_function_full,
     analyze_component,
     diff_before_after,
     trace_data_flow,
@@ -538,3 +539,160 @@ def test_diff_invalid_address():
     """diff_before_after reports error for unmapped address."""
     result = diff_before_after(get_unmapped_address(), "rename_func", {"name": "x"})
     assert "error" in result
+
+
+# ============================================================================
+# analyze_function_full tests
+# ============================================================================
+
+from ..api_composite import analyze_function_full
+
+
+@test()
+def test_analyze_function_full_returns_required_keys():
+    """analyze_function_full returns all expected top-level keys."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    assert_has_keys(
+        result,
+        "function",
+        "structure",
+        "code",
+        "completeness",
+        "hash",
+        "statistics",
+        "graph",
+        "ir",
+        "symbolic",
+        "summary",
+        "timing_ms",
+        "engines_available",
+        "engines_used",
+    )
+
+
+@test()
+def test_analyze_function_full_summary_non_empty():
+    """analyze_function_full produces a non-empty summary string."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    assert isinstance(result["summary"], str)
+    assert len(result["summary"]) > 0
+
+
+@test()
+def test_analyze_function_full_timing_ms():
+    """analyze_function_full reports timing for core phase."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    timing = result["timing_ms"]
+    assert isinstance(timing, dict)
+    assert "core" in timing
+    assert isinstance(timing["core"], int)
+    assert timing["core"] >= 0
+
+
+@test()
+def test_analyze_function_full_engines_available():
+    """analyze_function_full reports engine availability."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    avail = result["engines_available"]
+    assert isinstance(avail, dict)
+    assert avail.get("core") is True
+    assert "numpy" in avail
+    assert "networkx" in avail
+    assert "miasm" in avail
+    assert "triton" in avail
+
+
+@test()
+def test_analyze_function_full_function_metadata():
+    """analyze_function_full function section has name, addr, size."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    func = result["function"]
+    assert_has_keys(func, "addr", "name", "size")
+    assert func["size"] >= 0
+
+
+@test()
+def test_analyze_function_full_structure_metrics():
+    """analyze_function_full structure section has block/insn counts."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    struct = result["structure"]
+    assert_has_keys(struct, "instruction_count", "basic_block_count", "cyclomatic_complexity")
+    assert struct["instruction_count"] >= 0
+    assert struct["basic_block_count"] >= 0
+
+
+@test()
+def test_analyze_function_full_completeness():
+    """analyze_function_full completeness has score and grade."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    comp = result["completeness"]
+    assert_has_keys(comp, "score", "grade")
+    assert isinstance(comp["score"], int)
+    assert 0 <= comp["score"] <= 100
+    assert comp["grade"] in ("A", "B", "C", "D", "F")
+
+
+@test()
+def test_analyze_function_full_invalid_address():
+    """analyze_function_full reports error for invalid address."""
+    result = analyze_function_full(get_unmapped_address())
+    assert_error(result)
+    assert "summary" in result
+    assert "Cannot resolve" in result["summary"] or "No function" in result.get("summary", "")
+
+
+@test(binary="crackme03.elf")
+def test_analyze_function_full_crackme_main():
+    """analyze_function_full on crackme main shows expected content."""
+    result = analyze_function_full("main")
+    assert_ok(result)
+    assert result["function"]["name"] == "main"
+    assert result["structure"]["instruction_count"] > 0
+    assert len(result["summary"]) > 0
+
+
+@test()
+def test_analyze_function_full_triton_off_by_default():
+    """analyze_function_full does not invoke Triton by default."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_function_full(fn_addr)
+    assert_ok(result)
+    assert result["engines_used"].get("triton") is not True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from typing import Annotated, Any, TypedDict
+import time
 
 from .rpc import tool, unsafe
 from .sync import idasync, tool_timeout, IDAError
@@ -21,9 +22,48 @@ from .utils import (
     decompile_function_safe,
     get_assembly_lines,
     normalize_list_input,
+    tool_error,
 )
 # Shared decompile-failure classification — avoids duplicating the MERR_* map
 from .api_analysis import _classify_merr, _DECOMPILE_DEFAULT_HINT  # noqa: PLC2701
+from .api_analysis import _hash_function_bytes, _score_function_completeness
+
+# Optional engine helpers — imported at module level with safe fallbacks.
+# These are plain functions (no @idasync) so they can be called from
+# within another @idasync tool without reentrancy issues.
+try:
+    from .api_numpy import NUMPY_AVAILABLE, _collect_mnemonics
+except Exception:
+    NUMPY_AVAILABLE = False
+    _collect_mnemonics = None  # type: ignore[assignment]
+
+try:
+    from .api_networkx import NETWORKX_AVAILABLE, _function_cfg_impl, _graph_metrics_impl, _get_cached
+except Exception:
+    NETWORKX_AVAILABLE = False
+    _function_cfg_impl = None  # type: ignore[assignment]
+    _graph_metrics_impl = None  # type: ignore[assignment]
+    _get_cached = None  # type: ignore[assignment]
+
+try:
+    from .api_miasm import MIASM_AVAILABLE, _manager, _ircfg_edges, _ir_blocks_to_dict, _iter_ircfg_blocks
+except Exception:
+    MIASM_AVAILABLE = False
+    _manager = None  # type: ignore[assignment]
+    _ircfg_edges = None  # type: ignore[assignment]
+    _ir_blocks_to_dict = None  # type: ignore[assignment]
+    _iter_ircfg_blocks = None  # type: ignore[assignment]
+
+try:
+    from .api_triton import TRITON_AVAILABLE, _get_ctx, _CTX_KEY, _detect_arch_from_ida, _build_ctx
+    from .api_triton import _process_function_instructions_linear
+except Exception:
+    TRITON_AVAILABLE = False
+    _get_ctx = None  # type: ignore[assignment]
+    _CTX_KEY = "default"
+    _detect_arch_from_ida = None  # type: ignore[assignment]
+    _build_ctx = None  # type: ignore[assignment]
+    _process_function_instructions_linear = None  # type: ignore[assignment]
 
 # Max decompile lines before truncation.
 _DECOMPILE_LINE_CAP = 100
@@ -57,6 +97,24 @@ class AnalyzeFunctionResult(TypedDict, total=False):
     comments: dict[str, Any]
     basic_blocks: BasicBlockSummary
     error: str | None
+
+
+class AnalyzeFunctionFullResult(TypedDict, total=False):
+    ok: bool
+    function: dict[str, Any]
+    structure: dict[str, Any]
+    code: dict[str, Any]
+    completeness: dict[str, Any]
+    hash: dict[str, Any]
+    statistics: dict[str, Any]
+    graph: dict[str, Any]
+    ir: dict[str, Any]
+    symbolic: dict[str, Any]
+    summary: str
+    timing_ms: dict[str, int]
+    engines_available: dict[str, bool]
+    engines_used: dict[str, bool]
+    error: str
 
 
 class ComponentFunctionSummary(TypedDict, total=False):
@@ -388,7 +446,662 @@ def analyze_function(
 
 
 # ---------------------------------------------------------------------------
-# Tool 2 — analyze_component
+# Internal helpers for analyze_function_full
+# ---------------------------------------------------------------------------
+
+
+def _cap_decompile_lines(code: str | None, max_lines: int) -> tuple[str | None, int | None]:
+    """Truncate decompiled code to max_lines, returning (code, total_lines_or_None)."""
+    if code is None:
+        return None, None
+    lines = code.splitlines()
+    total = len(lines)
+    if max_lines > 0 and total > max_lines:
+        return "\n".join(lines[:max_lines]) + f"\n... ({total - max_lines} more lines)", total
+    return code, None
+
+
+def _function_jump_targets_internal(ea: int) -> list[dict[str, Any]]:
+    """Return jump targets for a function using plain IDA APIs."""
+    import idaapi
+    import idautils
+    import ida_ua
+
+    jumps: list[dict[str, Any]] = []
+    func = idaapi.get_func(ea)
+    if func is None:
+        return jumps
+
+    for item_ea in idautils.FuncItems(ea):
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, item_ea) <= 0:
+            continue
+        mnem = insn.get_canon_mnem().lower()
+        is_jump = idaapi.is_jump_insn(insn)
+        is_call = idaapi.is_call_insn(insn)
+        if not is_jump and not is_call:
+            continue
+
+        kind = "indirect"
+        target = None
+        if is_call:
+            kind = "call"
+        elif insn.ops[0].type in (idaapi.o_near, idaapi.o_far):
+            kind = "unconditional" if mnem in ("jmp", "b", "br") else "conditional"
+            target_val = insn.ops[0].addr
+            if target_val != idaapi.BADADDR:
+                target = hex(target_val)
+        else:
+            if mnem in (
+                "jz", "je", "jnz", "jne", "ja", "jae", "jb", "jbe",
+                "jg", "jge", "jl", "jle", "jo", "jno", "js", "jns",
+                "jp", "jnp", "jc", "jnc",
+            ):
+                kind = "conditional"
+
+        jumps.append({
+            "ea": hex(item_ea),
+            "target": target,
+            "kind": kind,
+            "mnemonic": mnem,
+        })
+    return jumps
+
+
+def _analyze_function_full_internal(
+    ea: int,
+    *,
+    include_disasm: bool = True,
+    include_decompile: bool = True,
+    include_numpy: bool = True,
+    include_networkx: bool = True,
+    include_miasm: bool = True,
+    include_triton: bool = False,
+    max_disasm_insns: int = 100,
+    max_decompile_lines: int = 100,
+    max_strings: int = 15,
+    max_constants: int = 15,
+    triton_max_insns: int = 500,
+    triton_solve_timeout_ms: int = 10000,
+) -> AnalyzeFunctionFullResult:
+    """Core logic for analyze_function_full — must be called from @idasync context."""
+    import idaapi
+    import idautils
+    import ida_funcs
+
+    timing: dict[str, int] = {}
+    engines_available: dict[str, bool] = {
+        "core": True,
+        "numpy": bool(NUMPY_AVAILABLE),
+        "networkx": bool(NETWORKX_AVAILABLE),
+        "miasm": bool(MIASM_AVAILABLE),
+        "triton": bool(TRITON_AVAILABLE),
+    }
+    engines_used: dict[str, bool] = {"core": True}
+
+    func = idaapi.get_func(ea)
+    if func is None:
+        return {
+            "ok": False,
+            "error": f"No function at {hex(ea)}",
+            "engines_available": engines_available,
+            "engines_used": engines_used,
+            "timing_ms": timing,
+            "summary": f"No function found at {hex(ea)}.",
+        }
+
+    func_name = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
+    func_size = func.end_ea - func.start_ea
+
+    # --- Core: function metadata ---
+    t0 = time.perf_counter()
+    function_meta: dict[str, Any] = {
+        "addr": hex(ea),
+        "name": func_name,
+        "size": func_size,
+        "prototype": get_prototype(func),
+        "is_thunk": bool(func.flags & ida_funcs.FUNC_THUNK),
+        "is_library": bool(func.flags & ida_funcs.FUNC_LIB),
+        "is_noret": bool(func.flags & ida_funcs.FUNC_NORET),
+    }
+
+    # --- Core: structure ---
+    bb_info = _basic_block_info(ea)
+    jumps = _function_jump_targets_internal(ea)
+
+    insn_count = 0
+    for _ in idautils.FuncItems(ea):
+        insn_count += 1
+
+    structure: dict[str, Any] = {
+        "instruction_count": insn_count,
+        "basic_block_count": bb_info["count"],
+        "cyclomatic_complexity": bb_info["cyclomatic_complexity"],
+        "caller_count": len(get_callers(hex(ea))),
+        "callee_count": len(get_callees(hex(ea))),
+        "jump_targets": jumps[:20],
+        "jump_count": len(jumps),
+    }
+
+    # --- Core: code ---
+    code_section: dict[str, Any] = {}
+
+    if include_decompile:
+        try:
+            raw_code = decompile_function_safe(ea)
+            code_section["decompiled"], truncated = _cap_decompile_lines(raw_code, max_decompile_lines)
+            if truncated:
+                code_section["decompile_truncated"] = truncated
+        except Exception as exc:
+            code_section["decompiled"] = None
+            code_section["decompile_error"] = str(exc)
+
+    if include_disasm:
+        try:
+            asm_lines = get_assembly_lines(ea)
+            if asm_lines:
+                lines = asm_lines.splitlines()
+                if max_disasm_insns > 0 and len(lines) > max_disasm_insns:
+                    code_section["disasm"] = "\n".join(lines[:max_disasm_insns]) + f"\n... ({len(lines) - max_disasm_insns} more instructions)"
+                    code_section["disasm_truncated"] = len(lines)
+                else:
+                    code_section["disasm"] = asm_lines
+            else:
+                code_section["disasm"] = None
+        except Exception as exc:
+            code_section["disasm"] = None
+            code_section["disasm_error"] = str(exc)
+
+    # Strings
+    raw_strings = extract_function_strings(ea)
+    seen_strings: set[str] = set()
+    unique_strings: list[str] = []
+    for s in raw_strings:
+        val = s.get("value") or s.get("string", "")
+        if val and val not in seen_strings:
+            seen_strings.add(val)
+            unique_strings.append(val)
+            if len(unique_strings) >= max_strings:
+                break
+    code_section["strings"] = unique_strings
+    code_section["string_count"] = len(seen_strings)
+
+    # Constants
+    raw_constants = extract_function_constants(ea)
+    interesting_constants: list[dict[str, Any]] = []
+    for c in raw_constants:
+        val = c.get("value")
+        if val in _BORING_CONSTANTS:
+            continue
+        interesting_constants.append(c)
+        if len(interesting_constants) >= max_constants:
+            break
+    code_section["constants"] = interesting_constants
+
+    code_section["xrefs"] = get_all_xrefs(ea)
+    code_section["comments"] = get_all_comments(ea)
+
+    timing["core"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- Core: completeness ---
+    t0 = time.perf_counter()
+    completeness: dict[str, Any] = _score_function_completeness(ea)
+    timing["completeness"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- Core: hash ---
+    t0 = time.perf_counter()
+    try:
+        digest, nbytes, hash_insn_count = _hash_function_bytes(ea)
+        hash_info: dict[str, Any] = {
+            "sha256": f"sha256:{digest}",
+            "normalized_bytes": nbytes,
+            "instruction_count": hash_insn_count,
+        }
+    except Exception as exc:
+        hash_info = {"error": str(exc)}
+    timing["hash"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- NumPy: opcode histogram ---
+    statistics: dict[str, Any] = {"available": False}
+    if NUMPY_AVAILABLE and include_numpy:
+        t0 = time.perf_counter()
+        engines_used["numpy"] = True
+        try:
+            if _collect_mnemonics is not None:
+                mnems = _collect_mnemonics(0, 0, func)
+                total = len(mnems)
+                if total > 0:
+                    counts: dict[str, int] = {}
+                    for m in mnems:
+                        counts[m] = counts.get(m, 0) + 1
+
+                    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+                    top = [{"mnemonic": m, "count": c, "ratio": round(c / total, 4)} for m, c in sorted_counts[:15]]
+
+                    _OPC_BRANCH = frozenset({
+                        "jmp", "je", "jne", "jz", "jnz", "ja", "jae", "jb", "jbe",
+                        "jg", "jge", "jl", "jle", "jo", "jno", "js", "jns",
+                        "jp", "jnp", "jc", "jnc", "call", "ret", "retn",
+                    })
+                    _OPC_CALL = frozenset({"call"})
+                    _OPC_RET = frozenset({"ret", "retn", "retf"})
+                    _OPC_ARITH = frozenset({
+                        "add", "sub", "mul", "imul", "div", "idiv", "inc", "dec",
+                        "neg", "sal", "and", "or", "xor", "not", "shl", "shr",
+                        "sar", "rol", "ror", "adc", "sbb",
+                    })
+                    _OPC_DATA = frozenset({"mov", "movzx", "movsx", "movsxd", "lea", "movabs", "xchg"})
+                    _OPC_STACK = frozenset({"push", "pop", "pusha", "popa", "pushf", "popf", "pushfd", "popfd"})
+                    _OPC_NOP = frozenset({"nop", "fnop"})
+
+                    def _grp(group: frozenset[str]) -> int:
+                        return sum(counts.get(m, 0) for m in group)
+
+                    ratios = {
+                        "branch": round(_grp(_OPC_BRANCH) / total, 4),
+                        "call": round(_grp(_OPC_CALL) / total, 4),
+                        "ret": round(_grp(_OPC_RET) / total, 4),
+                        "arith": round(_grp(_OPC_ARITH) / total, 4),
+                        "data_move": round(_grp(_OPC_DATA) / total, 4),
+                        "stack": round(_grp(_OPC_STACK) / total, 4),
+                        "nop": round(_grp(_OPC_NOP) / total, 4),
+                    }
+
+                    import numpy as np
+                    cvals = np.array(list(counts.values()), dtype=np.float64)
+                    p = cvals / total
+                    dist_entropy = float(-np.sum(p * np.log2(p)))
+
+                    anomalies: list[str] = []
+                    if ratios["nop"] > 0.15:
+                        anomalies.append("high_nop_ratio")
+                    if dist_entropy < 2.0 and total > 20:
+                        anomalies.append("low_diversity")
+                    if sorted_counts and sorted_counts[0][1] / total > 0.5:
+                        anomalies.append("single_dominant_mnemonic")
+
+                    statistics = {
+                        "available": True,
+                        "instruction_count": total,
+                        "unique_mnemonics": len(counts),
+                        "distribution_entropy": round(dist_entropy, 4),
+                        "top_mnemonics": top,
+                        "ratios": ratios,
+                        "anomalies": anomalies,
+                    }
+        except Exception as exc:
+            statistics = {"available": False, "error": str(exc)}
+        timing["numpy"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- NetworkX: CFG + dominators + metrics ---
+    graph: dict[str, Any] = {"available": False}
+    if NETWORKX_AVAILABLE and include_networkx:
+        t0 = time.perf_counter()
+        engines_used["networkx"] = True
+        try:
+            if _function_cfg_impl is not None and _get_cached is not None:
+                cfg_res = _function_cfg_impl(hex(ea))
+                if cfg_res.get("ok"):
+                    graph_id = cfg_res["graph_id"]
+                    graph["cfg"] = {
+                        "graph_id": graph_id,
+                        "node_count": cfg_res.get("node_count", 0),
+                        "edge_count": cfg_res.get("edge_count", 0),
+                        "is_dag": cfg_res.get("is_dag", False),
+                        "density": cfg_res.get("density", 0.0),
+                    }
+
+                    if _graph_metrics_impl is not None:
+                        metrics_res = _graph_metrics_impl(graph_id)
+                        if metrics_res.get("ok"):
+                            graph["metrics"] = {
+                                "density": metrics_res.get("density", 0.0),
+                                "avg_in_degree": metrics_res.get("avg_in_degree", 0.0),
+                                "avg_out_degree": metrics_res.get("avg_out_degree", 0.0),
+                                "weakly_connected_components": metrics_res.get("weakly_connected_components", 0),
+                                "strongly_connected_components": metrics_res.get("strongly_connected_components", 0),
+                            }
+
+                    entry = _get_cached(graph_id)
+                    if entry is not None:
+                        G = entry["graph"]
+                        import networkx as _nx
+                        if G.number_of_nodes() > 0:
+                            entry_block = ea
+                            if not G.has_node(entry_block):
+                                entry_block = min(G.nodes())
+                            try:
+                                idoms = _nx.immediate_dominators(G, entry_block)
+                                idom_list: list[dict[str, str]] = []
+                                loop_headers: list[str] = []
+                                seen_loops: set[str] = set()
+                                for b, d in idoms.items():
+                                    b_str = hex(b) if isinstance(b, int) else str(b)
+                                    d_str = hex(d) if isinstance(d, int) else str(d)
+                                    idom_list.append({"block": b_str, "idom": d_str})
+                                    for pred in G.predecessors(b):
+                                        if pred in idoms and idoms[pred] == b:
+                                            if b_str not in seen_loops:
+                                                seen_loops.add(b_str)
+                                                loop_headers.append(b_str)
+                                            break
+                                graph["dominators"] = {
+                                    "block_count": len(idom_list),
+                                    "immediate_dominators": idom_list,
+                                    "loop_headers": loop_headers,
+                                }
+                            except Exception:
+                                pass
+                else:
+                    graph["cfg_error"] = cfg_res.get("error", "CFG build failed")
+        except Exception as exc:
+            graph = {"available": False, "error": str(exc)}
+        timing["networkx"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- Miasm: IR lift + CFG summary + side effects ---
+    ir: dict[str, Any] = {"available": False}
+    if MIASM_AVAILABLE and include_miasm:
+        t0 = time.perf_counter()
+        engines_used["miasm"] = True
+        try:
+            if _manager is not None and _ircfg_edges is not None and _ir_blocks_to_dict is not None and _iter_ircfg_blocks is not None:
+                data = _manager.get_bytes(func.start_ea, func.end_ea)
+                if data is not None:
+                    mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+                    asmcfg = mdis.dis_multiblock(func.start_ea)
+
+                    block_count = 0
+                    edge_count = 0
+                    for block in asmcfg.blocks:
+                        block_count += 1
+                        for dst in block.bto:
+                            edge_count += 1
+
+                    ir["cfg_summary"] = {
+                        "block_count": block_count,
+                        "edge_count": edge_count,
+                        "cyclomatic_complexity": edge_count - block_count + 2,
+                    }
+
+                    lifter = _manager.machine.lifter_model_call(loc_db)
+                    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+
+                    edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+                    ir["lift"] = {
+                        "function_ea": hex(func.start_ea),
+                        "blocks": _ir_blocks_to_dict(ircfg),
+                        "edges": edges[:100],
+                        "edge_count": len(edges),
+                    }
+
+                    # Side effects using get_expr_ids from miasm (imported via api_miasm)
+                    from .api_miasm import get_expr_ids as _miasm_get_expr_ids
+                    written: set[str] = set()
+                    read: set[str] = set()
+                    for _, irblock in _iter_ircfg_blocks(ircfg):
+                        for assignblk in irblock:
+                            for dst, src in assignblk.items():
+                                written.add(str(dst))
+                                for expr_id in _miasm_get_expr_ids(src):
+                                    read.add(str(expr_id))
+                    ir["side_effects"] = {
+                        "registers_read": sorted(read)[:50],
+                        "registers_written": sorted(written)[:50],
+                    }
+                else:
+                    ir["error"] = "Could not read function bytes"
+        except Exception as exc:
+            ir = {"available": False, "error": str(exc)}
+        timing["miasm"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- Triton: symbolic trace + path constraints + solve ---
+    symbolic: dict[str, Any] = {"available": False}
+    if TRITON_AVAILABLE and include_triton:
+        t0 = time.perf_counter()
+        engines_used["triton"] = True
+        try:
+            if _detect_arch_from_ida is not None and _build_ctx is not None and _process_function_instructions_linear is not None:
+                # Initialize or reuse context
+                try:
+                    ctx = _get_ctx(_CTX_KEY)
+                except Exception:
+                    arch = _detect_arch_from_ida()
+                    ctx = _build_ctx(arch, pc_tracking_symbolic=True)
+                    from .api_triton import _set_ctx
+                    _set_ctx(_CTX_KEY, ctx)
+
+                records, truncated, _ = _process_function_instructions_linear(
+                    ctx, func.start_ea, func.end_ea, triton_max_insns
+                )
+
+                symbolic["trace"] = {
+                    "instructions_processed": len(records),
+                    "truncated": truncated,
+                }
+
+                # Path constraints (inline — cannot call @idasync triton_get_path_constraints)
+                try:
+                    all_sym_var_names = {sv.getName() for sv in ctx.getSymbolicVariables().values()}
+                    pcs = ctx.getPathConstraints()
+                    pc_items: list[dict[str, Any]] = []
+                    symbolic_count = 0
+                    concrete_count = 0
+                    for pc in pcs:
+                        branches: list[dict[str, Any]] = []
+                        pc_has_symbolic = False
+                        for branch in pc.getBranchConstraints():
+                            ast_str = str(branch["constraint"])
+                            has_sym = bool(all_sym_var_names & set(ast_str.split()))
+                            if has_sym:
+                                ctype = "symbolic"
+                                pc_has_symbolic = True
+                            else:
+                                ast_lower = ast_str.strip()
+                                if ast_lower in ("true", "#b1", "(= #b1 #b1)"):
+                                    ctype = "concrete_true"
+                                elif ast_lower in ("false", "#b0", "(= #b1 #b0)"):
+                                    ctype = "concrete_false"
+                                else:
+                                    ctype = "concrete"
+                            branches.append({
+                                "is_taken": branch["isTaken"],
+                                "src_addr": hex(branch["srcAddr"]),
+                                "dst_addr": hex(branch["dstAddr"]),
+                                "constraint_type": ctype,
+                            })
+                        if pc_has_symbolic:
+                            symbolic_count += 1
+                        else:
+                            concrete_count += 1
+                        pc_items.append({
+                            "source_addr": hex(pc.getSourceAddress()),
+                            "taken_addr": hex(pc.getTakenAddress()),
+                            "branches": branches,
+                            "has_symbolic": pc_has_symbolic,
+                        })
+                    symbolic["path_constraints"] = {
+                        "count": len(pc_items),
+                        "symbolic_count": symbolic_count,
+                        "concrete_count": concrete_count,
+                    }
+                except Exception as exc:
+                    symbolic["path_constraints"] = {"error": str(exc)}
+
+                # Solve (inline — cannot call @idasync triton_solve_path_constraints)
+                try:
+                    ast_ctx = ctx.getAstContext()
+                    predicate = ctx.getPathPredicate()
+                    model = ctx.getModel(predicate, timeout=triton_solve_timeout_ms)
+                    if model:
+                        result: dict[str, str] = {}
+                        for var_id, solver_model in model.items():
+                            sv = solver_model.getVariable()
+                            alias = sv.getAlias() or sv.getName()
+                            result[alias] = hex(solver_model.getValue())
+                        symbolic["solve"] = {"sat": True, "model": result}
+                    else:
+                        from .api_triton import _constraint_diagnostics
+                        diag = _constraint_diagnostics(ctx)
+                        symbolic["solve"] = {"sat": False, "diagnostics": diag}
+                except Exception as exc:
+                    symbolic["solve"] = {"error": str(exc)}
+        except Exception as exc:
+            symbolic = {"available": False, "error": str(exc)}
+        timing["triton"] = int((time.perf_counter() - t0) * 1000)
+
+    # --- Summary synthesis ---
+    summary_parts: list[str] = []
+
+    if func_size < 64:
+        size_desc = f"Small ({func_size} bytes, {insn_count} insns)"
+    elif func_size < 512:
+        size_desc = f"Medium ({func_size} bytes, {insn_count} insns)"
+    else:
+        size_desc = f"Large ({func_size} bytes, {insn_count} insns)"
+
+    summary_parts.append(
+        f"{func_name} at {hex(ea)} — {size_desc}, {bb_info['count']} blocks, complexity {bb_info['cyclomatic_complexity']}."
+    )
+
+    grade = completeness.get("grade", "F")
+    score = completeness.get("score", 0)
+    summary_parts.append(f"Documentation grade: {grade} ({score}/100).")
+
+    anomaly_flags: list[str] = []
+    if statistics.get("available"):
+        if statistics.get("anomalies"):
+            anomaly_flags.extend(statistics["anomalies"])
+        if statistics.get("ratios", {}).get("nop", 0) > 0.1:
+            anomaly_flags.append("unusual_nop_ratio")
+
+    if structure.get("jump_count", 0) > structure.get("basic_block_count", 0) * 2:
+        anomaly_flags.append("high_branch_density")
+
+    if ir.get("available") and ir.get("cfg_summary", {}).get("cyclomatic_complexity", 0) > 20:
+        anomaly_flags.append("high_cyclomatic_complexity")
+
+    if anomaly_flags:
+        summary_parts.append(f"Anomalies detected: {', '.join(dict.fromkeys(anomaly_flags))}.")
+
+    engine_notes: list[str] = []
+    if graph.get("available") and graph.get("dominators", {}).get("loop_headers"):
+        engine_notes.append(f"NetworkX found {len(graph['dominators']['loop_headers'])} loop header(s)")
+    if ir.get("available"):
+        engine_notes.append(f"Miasm lifted {ir.get('lift', {}).get('edge_count', 0)} IR edges")
+    if symbolic.get("available"):
+        engine_notes.append(f"Triton traced {symbolic.get('trace', {}).get('instructions_processed', 0)} instructions")
+
+    if engine_notes:
+        summary_parts.append("Engine highlights: " + "; ".join(engine_notes) + ".")
+
+    if score >= 80 and not anomaly_flags:
+        rec = "Well-documented function with no obvious anomalies."
+    elif anomaly_flags:
+        if "high_nop_ratio" in anomaly_flags or "low_diversity" in anomaly_flags:
+            rec = "Obfuscation signatures detected — consider hybrid_iterative_deobfuscate."
+        else:
+            rec = "Structural anomalies detected — review jump targets and control flow."
+    elif score < 40:
+        rec = "Poorly documented — consider renaming, typing, and adding comments."
+    else:
+        rec = "Moderate documentation — review missing items."
+
+    summary_parts.append(rec)
+    summary = " ".join(summary_parts)
+
+    return {
+        "ok": True,
+        "function": function_meta,
+        "structure": structure,
+        "code": code_section,
+        "completeness": completeness,
+        "hash": hash_info,
+        "statistics": statistics,
+        "graph": graph,
+        "ir": ir,
+        "symbolic": symbolic,
+        "summary": summary,
+        "timing_ms": timing,
+        "engines_available": engines_available,
+        "engines_used": engines_used,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 2 — analyze_function_full
+# ---------------------------------------------------------------------------
+
+
+@tool
+@idasync
+@tool_timeout(180.0, prefer_async=True)
+def analyze_function_full(
+    address: Annotated[str, "Function address or name (hex string or symbol)"],
+    include_disasm: Annotated[bool, "Include full disassembly (default: True)"] = True,
+    include_decompile: Annotated[bool, "Include decompiled pseudocode (default: True)"] = True,
+    include_numpy: Annotated[bool, "Include NumPy statistical analysis (default: True)"] = True,
+    include_networkx: Annotated[bool, "Include NetworkX graph metrics (default: True)"] = True,
+    include_miasm: Annotated[bool, "Include Miasm IR analysis (default: True)"] = True,
+    include_triton: Annotated[bool, "Include Triton symbolic execution (default: False)"] = False,
+    max_disasm_insns: Annotated[int, "Max disassembly instructions (0 = unlimited)"] = 100,
+    max_decompile_lines: Annotated[int, "Max decompile lines (0 = unlimited)"] = 100,
+    max_strings: Annotated[int, "Max string references"] = 15,
+    max_constants: Annotated[int, "Max interesting constants"] = 15,
+    triton_max_insns: Annotated[int, "Max instructions for Triton trace"] = 500,
+    triton_solve_timeout_ms: Annotated[int, "Timeout for Z3 solving"] = 10000,
+) -> AnalyzeFunctionFullResult:
+    """Complete multi-engine dossier for a single function.
+
+    Combines core IDA analysis (metadata, structure, code, strings, constants,
+    xrefs, comments) with optional deep analysis from NumPy, NetworkX, Miasm,
+    and Triton. Each engine runs in an isolated phase — if one fails, the
+    rest still return data.
+
+    **Recommended first call:** Use default parameters for a comprehensive
+    snapshot without the heavy Triton phase. Add ``include_triton=True`` only
+    when you need symbolic execution or path-constraint solving.
+
+    **Performance:** Core analysis is typically < 2s. NumPy and NetworkX add
+    ~1–3s each. Miasm adds ~2–5s. Triton can add 30–60s depending on
+    instruction count — use ``triton_max_insns`` to cap it.
+
+    Returns per-phase timing in ``timing_ms`` and a synthesized ``summary``
+    string with size, documentation grade, anomalies, and next-step advice.
+
+    See also: analyze_function (compact single-engine), hybrid_analyze_function
+    (Miasm + Triton cross-engine deep dive), func_profile (metrics-only).
+    """
+    try:
+        ea = _resolve_addr(address)
+    except IDAError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "summary": f"Cannot resolve address: {address}.",
+            "timing_ms": {},
+            "engines_available": {},
+            "engines_used": {},
+        }
+
+    return _analyze_function_full_internal(
+        ea,
+        include_disasm=include_disasm,
+        include_decompile=include_decompile,
+        include_numpy=include_numpy,
+        include_networkx=include_networkx,
+        include_miasm=include_miasm,
+        include_triton=include_triton,
+        max_disasm_insns=max_disasm_insns,
+        max_decompile_lines=max_decompile_lines,
+        max_strings=max_strings,
+        max_constants=max_constants,
+        triton_max_insns=triton_max_insns,
+        triton_solve_timeout_ms=triton_solve_timeout_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool 3 — analyze_component
 # ---------------------------------------------------------------------------
 
 

@@ -111,6 +111,7 @@ _TOOL_MODULE_EXACT: dict[str, str] = {
     "patch": "analysis",
     "put_int": "analysis",
     "survey_binary": "analysis",
+    "analyze_function_full": "analysis",
     # enhanced analysis tools
     "list_functions_enhanced": "analysis",
     "list_classes": "analysis",

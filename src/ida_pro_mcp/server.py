@@ -712,6 +712,7 @@ _GROUP_REPRESENTATIVE_TOOLS: dict[str, list[str]] = {
         "func_profile",
         "callgraph",
         "analyze_function",
+        "analyze_function_full",
         "find_bytes",
     ],
     "core":     [
