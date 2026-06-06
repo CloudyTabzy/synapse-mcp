@@ -6,6 +6,7 @@ Each session represents an opened binary with its own IDA database instance.
 
 import uuid
 import os
+import shutil
 import tempfile
 import threading
 import logging
@@ -100,15 +101,18 @@ class IDASessionManager:
             elif session_id in self._sessions:
                 raise ValueError(f"Session already exists: {session_id}")
 
+            # A saved IDB is already analyzed — reopening only loads it.
+            effective_analysis = run_auto_analysis and not self._is_idb_input(str(input_path))
+
             # Open the database
             logger.info(f"Opening database: {input_path} (session: {session_id})")
-            idb_path = self._activate_database_path(str(input_path), run_auto_analysis, processor=processor)
+            idb_path = self._activate_database_path(str(input_path), effective_analysis, processor=processor)
 
             # Create session object
             session = IDASession(
                 session_id=session_id,
                 input_path=input_path,
-                is_analyzing=run_auto_analysis,
+                is_analyzing=effective_analysis,
                 metadata={"idb_path": idb_path},
             )
 
@@ -116,7 +120,7 @@ class IDASessionManager:
             self._active_session_id = session_id
 
             # Wait for analysis if requested
-            if run_auto_analysis:
+            if effective_analysis:
                 logger.debug(
                     f"Waiting for auto-analysis to complete (session: {session_id})"
                 )
@@ -286,6 +290,41 @@ class IDASessionManager:
         self._active_session_id = session_id
         logger.info("Activated session %s (%s)", session_id, session.input_path.name)
 
+    @staticmethod
+    def _is_idb_input(input_path: str) -> bool:
+        """True if the input is already an IDA database, not a raw binary."""
+        return Path(input_path).suffix.lower() in (".i64", ".idb")
+
+    def _sweep_idb_locks(self, idb_path: str) -> None:
+        """Remove stale IDA lock files that make a headless reopen hang forever.
+
+        When the GUI (or a crashed worker) leaves a ``.lck`` next to a saved
+        database, idalib blocks indefinitely on a hidden "database is already
+        opened" confirmation — presenting as a 0-CPU hang with no progress.
+        Removing the stale lock(s) before opening avoids that wedge. (Safe: a
+        genuinely-in-use database is held by a live process; force-killing
+        zombies is handled separately by idalib_cleanup_zombies.)
+        """
+        p = Path(idb_path)
+        seen: set[Path] = set()
+        candidates = [
+            p.with_name(p.name + ".lck"),  # e.g. sample.dll.i64.lck
+            p.parent / "ida.idb",          # legacy fixed-name lock
+        ]
+        try:
+            candidates.extend(p.parent.glob(p.name + "*.lck"))
+        except OSError:
+            pass
+        for lck in candidates:
+            if lck in seen or not lck.exists():
+                continue
+            seen.add(lck)
+            try:
+                lck.unlink()
+                logger.info("Removed stale IDA lock before reopen: %s", lck)
+            except OSError as e:
+                logger.warning("Could not remove stale IDA lock %s: %s", lck, e)
+
     def _is_directory_writable(self, path: Path) -> bool:
         """Actually test-write a file — os.access is unreliable on Windows."""
         try:
@@ -309,6 +348,26 @@ class IDASessionManager:
         tmp_dir = Path(tempfile.gettempdir())
         unique = uuid.uuid4().hex[:8]
         return str(tmp_dir / f"idalib_{unique}_{stem}.i64")
+
+    def _prepare_idb_open(self, input_path: str) -> str:
+        """Resolve the path to open for a pre-analyzed IDB input.
+
+        Opens in place when the directory is writable — IDA must create its lock
+        file there — after sweeping any stale lock. If the directory is not
+        writable (e.g. Program Files), copies the self-contained .i64/.idb to
+        %TEMP% and opens that copy instead, so the reopen never fails for lack
+        of a place to write its lock. Temp copies are cleaned up on close.
+        """
+        src = Path(input_path)
+        if self._is_directory_writable(src.parent):
+            self._sweep_idb_locks(input_path)
+            return input_path
+        tmp_dir = Path(tempfile.gettempdir())
+        dest = tmp_dir / f"idalib_{uuid.uuid4().hex[:8]}_{src.name}"
+        logger.info("IDB directory not writable; copying %s -> %s for reopen", src, dest)
+        shutil.copy2(src, dest)
+        self._sweep_idb_locks(str(dest))
+        return str(dest)
 
     def _cleanup_stale_sidecars(self, idb_path: str) -> None:
         """Remove stale IDA sidecar files before opening a database.
@@ -334,9 +393,14 @@ class IDASessionManager:
         tmp_dir = str(Path(tempfile.gettempdir()))
         if not str(idb_path).startswith(tmp_dir):
             return
-        base = Path(idb_path).with_suffix("")
-        for ext in (".i64", ".id0", ".id1", ".id2", ".nam", ".til"):
-            f = base.with_suffix(ext)
+        # Swap only the FINAL extension so multi-dot names like
+        # "idalib_ab12_sample.dll.i64" resolve their sidecars correctly
+        # (with_suffix("") would wrongly strip ".dll" too).
+        p = Path(idb_path)
+        targets = {p}
+        for ext in (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til"):
+            targets.add(p.with_suffix(ext))
+        for f in targets:
             if f.exists():
                 try:
                     f.unlink()
@@ -356,23 +420,39 @@ class IDASessionManager:
         except OSError:
             pass
 
-        idb_path = self._get_writable_idb_path(input_path)
-        self._cleanup_stale_sidecars(idb_path)
-
-        # -o: redirect IDB output to writable path
-        # -Opdb:off: disable PDB symbol loading (prevents headless hang on missing PDBs)
-        # -p<proc>: specify processor module for raw binaries or when auto-detection fails
-        args = f'-o"{idb_path}" -Opdb:off'
-        if processor:
-            args += f' -p{processor}'
-
-        logger.info(
-            "Opening database: %s (%.1f MB) -> IDB: %s",
-            input_path, file_size_mb, idb_path,
-        )
+        if self._is_idb_input(input_path):
+            # Reopening a pre-analyzed database: do NOT redirect output onto the
+            # database itself (the old code did, because Path('x.dll.i64').stem
+            # drops only '.i64'), never re-run analysis, and sweep stale locks
+            # that would otherwise wedge the headless open on a hidden prompt.
+            open_path = self._prepare_idb_open(input_path)
+            idb_path = open_path
+            run_auto_analysis = False
+            args = "-Opdb:off"
+            if processor:
+                args += f" -p{processor}"
+            logger.info(
+                "Reopening IDB: %s (%.1f MB)%s",
+                open_path, file_size_mb,
+                "" if open_path == input_path else f" (copied from {input_path})",
+            )
+        else:
+            open_path = input_path
+            idb_path = self._get_writable_idb_path(input_path)
+            self._cleanup_stale_sidecars(idb_path)
+            # -o: redirect IDB output to writable path
+            # -Opdb:off: disable PDB symbol loading (prevents headless hang on missing PDBs)
+            # -p<proc>: processor module for raw binaries / when auto-detect fails
+            args = f'-o"{idb_path}" -Opdb:off'
+            if processor:
+                args += f' -p{processor}'
+            logger.info(
+                "Opening database: %s (%.1f MB) -> IDB: %s",
+                input_path, file_size_mb, idb_path,
+            )
         try:
             err = idapro.open_database(
-                input_path, run_auto_analysis=run_auto_analysis, args=args
+                open_path, run_auto_analysis=run_auto_analysis, args=args
             )
         except Exception as e:
             logger.exception(

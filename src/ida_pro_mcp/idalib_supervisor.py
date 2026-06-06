@@ -24,8 +24,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import RLock, Thread, Event
-from typing import Annotated, Any, NotRequired, Optional, TypedDict
+from threading import RLock, Thread, Event, Lock, Condition
+from typing import Annotated, Any, Callable, NotRequired, Optional, TypedDict
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 _DEATH_WATCH_INTERVAL_S = 5.0
 _IDLE_TIMEOUT_S = int(os.environ.get("IDA_MCP_IDALIB_IDLE_TIMEOUT_SEC", "1800"))
 _BOOTSTRAP_DISCOVER_TIMEOUT_S = 30.0
+# Stuck-open watchdog: if a worker makes no CPU progress for
+# _OPEN_STALL_NO_PROGRESS_SEC after an initial _OPEN_STALL_GRACE_SEC window,
+# the open is considered wedged (OOM/page-thrash or a stale IDB lock) and the
+# worker is terminated. Requires psutil for CPU sampling; otherwise the bounded
+# RPC timeout is the only backstop.
+_OPEN_STALL_GRACE_SEC = float(os.environ.get("IDA_MCP_OPEN_STALL_GRACE_SEC", "90"))
+_OPEN_STALL_NO_PROGRESS_SEC = float(os.environ.get("IDA_MCP_OPEN_STALL_SEC", "150"))
 
 STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
 SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
@@ -204,7 +211,7 @@ class IdalibWarmupResult(IdalibContextFields, total=False):
 def _estimate_analysis_time(size_mb: float) -> int:
     """Estimate auto-analysis time in seconds based on file size.
 
-    Calibrated against libpersona.dll (343 MB, ~35 min / 2100 s).
+    Calibrated against a large PE binary (~343 MB, ~35 min / 2100 s).
     Piecewise linear model with conservative (high) estimates:
       - <= 10 MB : 30 + size_mb * 3  (~1 min for 10 MB)
       - 10-100 MB: 60 + size_mb * 5  (~5 min for 50 MB, ~9 min for 100 MB)
@@ -218,6 +225,59 @@ def _estimate_analysis_time(size_mb: float) -> int:
         return int(60 + size_mb * 6)
 
 
+def _available_memory_mb() -> float | None:
+    """Return available physical RAM in MB, or None if it can't be determined.
+
+    Prefers psutil (cross-platform); falls back to GlobalMemoryStatusEx on
+    Windows so the precheck works without an extra hard dependency.
+    """
+    try:
+        import psutil  # type: ignore
+        return psutil.virtual_memory().available / (1024 * 1024)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return stat.ullAvailPhys / (1024 * 1024)
+        except Exception:
+            pass
+    return None
+
+
+def _estimate_required_memory_mb(size_mb: float, is_idb: bool) -> float:
+    """Rough peak-RAM estimate for opening a binary or pre-analyzed IDB.
+
+    - IDB (.i64/.idb): IDA maps most of the database in, so ~1.3x its size
+      plus a ~1.5 GB baseline for Hex-Rays/type system.
+    - Raw binary: auto-analysis expands well beyond the file; ~3x plus baseline.
+    """
+    if is_idb:
+        return size_mb * 1.3 + 1536
+    return max(size_mb * 3.0, 1536) + 512
+
+
+def _is_idb_path(path: Path) -> bool:
+    return path.suffix.lower() in (".i64", ".idb")
+
+
 def _format_duration(seconds: int) -> str:
     """Format seconds into a human-readable duration string."""
     if seconds < 60:
@@ -226,6 +286,28 @@ def _format_duration(seconds: int) -> str:
         return f"{seconds // 60}m {seconds % 60}s"
     else:
         return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+class _WorkerChannel:
+    """Per-process stdio JSON-RPC channel.
+
+    Keyed by worker pid and shared across every WorkerSession that wraps the
+    same process (e.g. lief-only sessions that piggyback on the schema worker),
+    so exactly one reader thread ever drains a given pipe. A single reader
+    routes responses by id into ``responses``; senders wait on ``cond`` with a
+    deadline, so a silent/wedged worker can never block the caller.
+    """
+
+    def __init__(self, stdin: Any, stdout: Any, process: Any) -> None:
+        self.stdin = stdin
+        self.stdout = stdout
+        self.process = process
+        self.lock = Lock()           # serializes request writes + id allocation
+        self.request_id = 0
+        self.responses: dict[int, dict[str, Any]] = {}
+        self.cond = Condition()
+        self.reader_thread: Thread | None = None
+        self.reader_eof = False
 
 
 @dataclass
@@ -245,8 +327,6 @@ class WorkerSession:
     pid: int | None = None
     stdin: Any | None = None  # subprocess.PIPE for stdio workers
     stdout: Any | None = None
-    _rpc_request_id: int = 0
-    _rpc_response_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -297,6 +377,9 @@ class IdalibSupervisor:
         self.path_to_session: dict[str, str] = {}
         self.context_bindings: dict[str, str] = {}
         self._schema_worker: WorkerSession | None = None
+        # pid -> _WorkerChannel, shared across WorkerSession copies of one process.
+        self._channels: dict[int, _WorkerChannel] = {}
+        self._channels_lock = Lock()
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
@@ -305,6 +388,9 @@ class IdalibSupervisor:
         self._bootstrap_completed = False
         self._open_tasks: dict[str, dict[str, Any]] = {}
         self._open_task_threads: dict[str, tuple[Thread, WorkerSession | None]] = {}
+        # task_id -> {"cpu": last_cpu_seconds, "ts": last_progress_time} for the
+        # stuck-open watchdog.
+        self._open_worker_progress: dict[str, dict[str, float]] = {}
         if _IDLE_TIMEOUT_S > 0 or True:
             self._start_death_watcher()
 
@@ -355,6 +441,11 @@ class IdalibSupervisor:
             except Exception:
                 logger.debug("Death watcher iteration failed", exc_info=True)
 
+            try:
+                self._check_stuck_opens()
+            except Exception:
+                logger.debug("Stuck-open check failed", exc_info=True)
+
             # Idle timeout cleanup: every 6 death-watch cycles (~30s)
             idle_cleanup_ticks += 1
             if _IDLE_TIMEOUT_S > 0 and idle_cleanup_ticks >= 6:
@@ -381,6 +472,73 @@ class IdalibSupervisor:
                 if session.session_id in self.sessions:
                     self._unregister_session_locked(session.session_id)
             self._terminate_worker(session)
+
+    def _check_stuck_opens(self) -> None:
+        """Detect background opens whose worker is making no CPU progress.
+
+        A worker that sits at ~0 CPU well past the initial load window is
+        wedged — typically OOM/page-thrash or a hidden 'database already open'
+        prompt from a stale IDB lock. We fail the task with a diagnostic and
+        terminate the worker so the agent gets a clear error in seconds-to-
+        minutes instead of waiting out the full RPC timeout. CPU sampling needs
+        psutil; without it we silently rely on the bounded RPC timeout.
+        """
+        if not self._open_task_threads:
+            return
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return
+
+        now = time.time()
+        for task_id, (_thread, worker) in list(self._open_task_threads.items()):
+            task = self._open_tasks.get(task_id)
+            if task is None or task.get("status") != "loading" or worker is None:
+                continue
+            proc = worker.process
+            if proc is None or proc.poll() is not None:
+                continue
+            if now - task.get("started_at", now) < _OPEN_STALL_GRACE_SEC:
+                continue
+            try:
+                cpu_times = psutil.Process(proc.pid).cpu_times()
+                cpu_total = float(cpu_times.user + cpu_times.system)
+            except Exception:
+                continue
+
+            state = self._open_worker_progress.setdefault(
+                task_id, {"cpu": cpu_total, "ts": now}
+            )
+            if cpu_total > state["cpu"] + 0.5:
+                state["cpu"] = cpu_total
+                state["ts"] = now
+                continue
+            stalled_for = now - state["ts"]
+            if stalled_for < _OPEN_STALL_NO_PROGRESS_SEC:
+                continue
+
+            size_mb = task.get("size_mb", "?")
+            logger.warning(
+                "Open task %s wedged: no CPU progress for %.0fs (%.0f MB) — terminating worker %s",
+                task_id, stalled_for, size_mb if isinstance(size_mb, (int, float)) else 0, proc.pid,
+            )
+            self._open_tasks[task_id] = {
+                "status": "failed",
+                "stage": "stuck_no_progress",
+                "error": (
+                    f"Worker made no CPU progress for {int(stalled_for)}s while opening "
+                    f"{size_mb} MB and was terminated. Likely causes: insufficient RAM "
+                    f"(page-thrash) or a stale IDA lock (.lck) / 'database already open' "
+                    f"state. Free memory, remove stale lock files next to the .i64, or retry."
+                ),
+                "error_type": "StuckWorker",
+                "size_mb": size_mb,
+                "started_at": task.get("started_at", now),
+                "elapsed_seconds": int(now - task.get("started_at", now)),
+            }
+            self._terminate_worker(worker)
+            self._open_task_threads.pop(task_id, None)
+            self._open_worker_progress.pop(task_id, None)
 
     def _touch_worker(self, worker: WorkerSession) -> None:
         worker.last_accessed = datetime.now()
@@ -489,13 +647,32 @@ class IdalibSupervisor:
             return
         proc = worker.process
         if proc is None or proc.poll() is not None:
+            self._drop_channel(worker)
             return
+        pid = proc.pid
+        self._drop_channel(worker)
         try:
             proc.terminate()
-            proc.wait(timeout=10)
+            proc.wait(timeout=8)
+            return
         except Exception:
+            pass
+        # A wedged worker may ignore terminate() or hold child handles that keep
+        # its pipes alive. Kill the whole process tree so it can't linger.
+        if os.name == "nt" and pid:
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        try:
             proc.kill()
             proc.wait(timeout=5)
+        except Exception:
+            logger.debug("Failed to reap worker pid %s", pid, exc_info=True)
 
     def _bootstrap_schemas(self) -> None:
         """Spawn a temporary worker at startup to discover tool/resource schemas.
@@ -615,6 +792,77 @@ class IdalibSupervisor:
     # JSON-RPC forwarding (stdio-based workers)
     # ------------------------------------------------------------------
 
+    def _get_channel(self, worker: WorkerSession) -> _WorkerChannel:
+        """Return the shared RPC channel for this worker's process (by pid)."""
+        proc = worker.process
+        if proc is None:
+            raise RuntimeError("Worker stdio pipes not available")
+        pid = proc.pid
+        with self._channels_lock:
+            chan = self._channels.get(pid)
+            if chan is None or chan.process is not proc:
+                chan = _WorkerChannel(worker.stdin, worker.stdout, proc)
+                self._channels[pid] = chan
+            return chan
+
+    def _drop_channel(self, worker: WorkerSession) -> None:
+        proc = worker.process
+        if proc is None:
+            return
+        with self._channels_lock:
+            chan = self._channels.get(proc.pid)
+            if chan is not None and chan.process is proc:
+                self._channels.pop(proc.pid, None)
+
+    def _reader_loop(self, chan: _WorkerChannel) -> None:
+        """Drain a channel's stdout, routing JSON-RPC responses by id.
+
+        Runs as a daemon thread so a silent/wedged worker never blocks a caller:
+        the blocking readline lives here, while senders wait on the condition
+        with a deadline. On EOF (worker exit/kill) we flag reader_eof and wake
+        all waiters so they fail fast instead of hanging.
+        """
+        stdout = chan.stdout
+        try:
+            while True:
+                try:
+                    line = stdout.readline()
+                except Exception:
+                    break
+                if not line:
+                    break  # EOF — worker closed stdout / exited
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text or not text.startswith("{"):
+                    continue
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("id") is None:
+                    continue  # notification — no correlation id
+                with chan.cond:
+                    chan.responses[msg["id"]] = msg
+                    chan.cond.notify_all()
+        finally:
+            with chan.cond:
+                chan.reader_eof = True
+                chan.cond.notify_all()
+
+    def _ensure_reader(self, chan: _WorkerChannel) -> None:
+        # Guard against two concurrent RPCs starting two readers on one pipe.
+        with chan.lock:
+            if chan.reader_thread is not None and chan.reader_thread.is_alive():
+                return
+            chan.reader_eof = False
+            thread = Thread(
+                target=self._reader_loop,
+                args=(chan,),
+                daemon=True,
+                name=f"worker-reader-{chan.process.pid}",
+            )
+            chan.reader_thread = thread
+            thread.start()
+
     def _worker_rpc(
         self,
         worker: WorkerSession,
@@ -622,60 +870,47 @@ class IdalibSupervisor:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Send a JSON-RPC request to a worker via its stdio pipe and return the response.
+        """Send a JSON-RPC request to a worker and wait for its response.
 
-        Correlates responses by request ID so out-of-order or stale buffered
-        responses do not get consumed by the wrong call.
+        Time-bounded and worker-death aware: the caller waits on the channel
+        condition and re-checks the deadline and ``process.poll()`` at least
+        once per second, so a worker that goes silent inside ``open_database()``
+        can never block this thread (or the supervisor's main MCP loop) forever.
         """
         if worker.process is None or worker.process.poll() is not None:
             raise RuntimeError("Worker process is not running")
         if worker.stdin is None or worker.stdout is None:
             raise RuntimeError("Worker stdio pipes not available")
 
-        worker._rpc_request_id += 1
-        request_id = worker._rpc_request_id
-        payload = {**payload, "id": request_id}
+        chan = self._get_channel(worker)
+        self._ensure_reader(chan)
 
-        # Check cache first (stale response from previous call)
-        cached = worker._rpc_response_cache.pop(request_id, None)
-        if cached is not None:
-            return cached
+        with chan.lock:
+            chan.request_id += 1
+            request_id = chan.request_id
+            body = json.dumps({**payload, "id": request_id})
+            try:
+                chan.stdin.write((body + "\n").encode("utf-8"))
+                chan.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                raise RuntimeError("Worker process closed stdin") from e
 
-        body = json.dumps(payload)
         deadline = time.monotonic() + (timeout or 60.0)
-        try:
-            worker.stdin.write((body + "\n").encode("utf-8"))
-            worker.stdin.flush()
-        except BrokenPipeError as e:
-            raise RuntimeError("Worker process closed stdin") from e
-
-        while time.monotonic() < deadline:
-            try:
-                line = worker.stdout.readline()
-            except Exception as e:
-                raise RuntimeError(f"Failed to read from worker: {e}") from e
-            if not line:
-                raise RuntimeError("Worker process closed stdout")
-            text = line.decode("utf-8").strip()
-            if not text or not text.startswith("{"):
-                continue
-            try:
-                msg = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-
-            # Skip notifications (no id field)
-            msg_id = msg.get("id")
-            if msg_id is None:
-                continue
-
-            if msg_id == request_id:
-                return msg
-
-            # Stale response for a different request — cache it
-            worker._rpc_response_cache[msg_id] = msg
-
-        raise TimeoutError(f"Worker RPC timed out after {(timeout or 60.0)}s")
+        with chan.cond:
+            while True:
+                msg = chan.responses.pop(request_id, None)
+                if msg is not None:
+                    return msg
+                if chan.reader_eof or (
+                    chan.process is not None and chan.process.poll() is not None
+                ):
+                    raise RuntimeError("Worker process closed stdout")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Worker RPC timed out after {(timeout or 60.0)}s"
+                    )
+                chan.cond.wait(timeout=min(remaining, 1.0))
 
     def forward_raw(self, worker: WorkerSession, request_obj: dict[str, Any]) -> dict[str, Any]:
         return self._worker_rpc(worker, request_obj)
@@ -843,6 +1078,7 @@ class IdalibSupervisor:
         context_id: str | None = None,
         open_timeout: float | None = None,
         processor: str | None = None,
+        worker_sink: Callable[[WorkerSession], None] | None = None,
     ) -> WorkerSession:
         resolved = self._normalize_input_path(input_path)
         requested_session_id = session_id
@@ -880,6 +1116,14 @@ class IdalibSupervisor:
                 return session
 
             worker = self._allocate_worker_locked()
+
+        # Expose the worker to the caller (async-open watchdog / cancel) as soon
+        # as it exists, before the potentially long idalib_open RPC below.
+        if worker_sink is not None:
+            try:
+                worker_sink(worker)
+            except Exception:
+                logger.debug("worker_sink callback failed", exc_info=True)
 
         try:
             open_args = {
@@ -1029,6 +1273,8 @@ class IdalibSupervisor:
             backend="worker",
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
+            stdin=worker.stdin,
+            stdout=worker.stdout,
         )
         with self._lock:
             current = self.sessions.get(session.session_id)
@@ -1207,22 +1453,32 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
-    open_timeout_sec: Annotated[Optional[float], "Timeout in seconds (default: 120; increase for large binaries)"] = None,
+    open_timeout_sec: Annotated[Optional[float], "Timeout in seconds (default: auto-scaled by size; increase for large binaries)"] = None,
     mode: Annotated[Optional[str], "Open mode: 'full' (default, IDA load) or 'lief-only' (static metadata, instant)"] = None,
     processor: Annotated[Optional[str], "IDA processor module short name (e.g. 'mipsr5900l', 'ppcvle', 'sh4l', 'tricore'). Auto-detected if omitted."] = None,
+    force: Annotated[bool, "Skip the free-RAM precheck and open even if memory looks insufficient"] = False,
 ) -> dict:
     """Open a binary in its own idalib worker process and bind it to this context.
 
-    ANALYSIS TIME GUIDE (run_auto_analysis=True):
+    Pass a pre-analyzed IDA database (.i64/.idb) directly to reopen it: the
+    worker skips re-analysis, sweeps stale .lck locks, and never redirects
+    output onto the database itself. This is the fast path for large saved IDBs.
+
+    ANALYSIS TIME GUIDE (run_auto_analysis=True, raw binary):
     - Files <10 MB  : ~30s–2min
     - Files 10-50 MB: ~2–8min
     - Files 50-100 MB: ~8–15min
-    - Files >100 MB : ~15–45min+ (libpersona.dll 343MB = ~35min)
+    - Files >100 MB : ~15–45min+ (a 343 MB DLL ≈ ~35min)
 
     For large binaries, set run_auto_analysis=False to open instantly
     (metadata only), then call idalib_start_analysis() later when full
     decompilation is needed. Use mode='lief-only' for instant static
     metadata without IDA loading.
+
+    Before opening, free RAM is checked against an estimate (IDB ≈ 1.2x its
+    size; raw binary ≈ 3x). If it looks insufficient the call returns
+    error='insufficient_memory' instead of spawning a worker that would
+    page-thrash; pass force=true to override.
 
     For binaries >10 MB, the open runs in a background thread and a
     task_id is returned immediately. Poll with idalib_task_poll(task_id).
@@ -1263,14 +1519,43 @@ def idalib_open(
 
     actual_mode = (mode or "full").lower()
     path = Path(input_path)
+    is_idb = _is_idb_path(path)
     try:
         file_size_mb = round(path.stat().st_size / (1024 * 1024), 2)
     except Exception:
         file_size_mb = 0.0
 
-    # Auto-scale open timeout for large binaries (5 sec per MB, max 60 min)
+    # A saved IDB is already analyzed — reopening only loads it, so analysis is
+    # effectively off no matter what the caller requested.
+    effective_analysis = run_auto_analysis and not is_idb
+
+    # Auto-scale open timeout. IDB reopen only loads (no analysis) so it gets a
+    # tighter bound; raw binaries with analysis get the larger budget.
     if open_timeout_sec is None:
-        open_timeout_sec = min(300 + file_size_mb * 5, 3600)
+        if is_idb:
+            open_timeout_sec = min(180 + file_size_mb * 2, 1800)
+        else:
+            open_timeout_sec = min(300 + file_size_mb * 5, 3600)
+
+    # Memory precheck (skipped for lief-only, which never loads IDA).
+    if actual_mode != "lief-only" and not force:
+        available_mb = _available_memory_mb()
+        required_mb = _estimate_required_memory_mb(file_size_mb, is_idb)
+        if available_mb is not None and available_mb < required_mb:
+            return {
+                "success": False,
+                "error": "insufficient_memory",
+                "required_mb": round(required_mb),
+                "available_mb": round(available_mb),
+                "size_mb": file_size_mb,
+                "is_idb": is_idb,
+                "recommendation": (
+                    f"Opening this {'IDB' if is_idb else 'binary'} needs ~{round(required_mb)} MB free "
+                    f"but only {round(available_mb)} MB is available. Close other apps and retry, "
+                    f"pass force=true to override, or use mode='lief-only' for static metadata."
+                ),
+                **sup.context_fields(context_id),
+            }
 
     # LIEF-only mode — return metadata + register lightweight session
     if actual_mode == "lief-only":
@@ -1316,7 +1601,11 @@ def idalib_open(
 
     # Large file — async open with task tracking
     _LARGE_FILE_THRESHOLD_MB = 10.0
-    estimated_total_sec = _estimate_analysis_time(file_size_mb) if run_auto_analysis else int(30 + file_size_mb * 0.5)
+    estimated_total_sec = (
+        _estimate_analysis_time(file_size_mb)
+        if effective_analysis
+        else int(30 + file_size_mb * 0.3)
+    )
 
     if file_size_mb > _LARGE_FILE_THRESHOLD_MB:
         task_id = f"open_{uuid.uuid4().hex[:8]}"
@@ -1329,6 +1618,14 @@ def idalib_open(
             "estimated_total_seconds": estimated_total_sec,
         }
 
+        def _record_worker(w: WorkerSession) -> None:
+            thread_info = sup._open_task_threads.get(task_id)
+            existing_thread = thread_info[0] if thread_info else None
+            sup._open_task_threads[task_id] = (existing_thread, w)
+            task = sup._open_tasks.get(task_id)
+            if task is not None and task.get("status") == "loading":
+                task["worker_pid"] = w.pid or (w.process.pid if w.process else None)
+
         def _open_worker_thread():
             try:
                 sup._open_tasks[task_id]["stage"] = "loading_database"
@@ -1339,6 +1636,7 @@ def idalib_open(
                     context_id=context_id,
                     open_timeout=open_timeout_sec,
                     processor=processor,
+                    worker_sink=_record_worker,
                 )
                 sup._open_tasks[task_id] = {
                     "status": "done",
@@ -1350,6 +1648,10 @@ def idalib_open(
                     "estimated_total_seconds": estimated_total_sec,
                 }
             except Exception as exc:
+                # Don't clobber a terminal state the watchdog or cancel set.
+                current = sup._open_tasks.get(task_id, {})
+                if current.get("status") in ("failed", "cancelled"):
+                    return
                 sup._open_tasks[task_id] = {
                     "status": "failed",
                     "stage": "failed",
@@ -1359,6 +1661,8 @@ def idalib_open(
                     "started_at": sup._open_tasks[task_id].get("started_at", time.time()),
                     "estimated_total_seconds": estimated_total_sec,
                 }
+            finally:
+                sup._open_worker_progress.pop(task_id, None)
 
         thread = Thread(target=_open_worker_thread, daemon=True, name=f"open-{task_id}")
         sup._open_task_threads[task_id] = (thread, None)
@@ -1366,7 +1670,7 @@ def idalib_open(
 
         # Build warning / recommendation message
         warning_parts = []
-        if run_auto_analysis and file_size_mb > 50:
+        if effective_analysis and file_size_mb > 50:
             warning_parts.append(
                 f"Auto-analysis on {file_size_mb} MB binaries typically takes {_format_duration(estimated_total_sec)}. "
                 f"Consider run_auto_analysis=False for instant metadata, then idalib_start_analysis() later."
@@ -1703,32 +2007,31 @@ def idalib_cancel_task(
     task = sup._open_tasks[task_id]
     file_path = task.get("file_path", "")
 
-    # Terminate worker if tracked
+    # Terminate worker if tracked (worker is recorded via worker_sink as soon
+    # as it's allocated, so a hung open can actually be cancelled).
     thread_info = sup._open_task_threads.pop(task_id, None)
+    sup._open_worker_progress.pop(task_id, None)
     if thread_info:
         thread, worker = thread_info
-        if worker is not None and worker.process is not None:
-            try:
-                worker.process.terminate()
-                worker.process.wait(timeout=5)
-            except Exception:
-                try:
-                    worker.process.kill()
-                    worker.process.wait()
-                except Exception:
-                    pass
+        if worker is not None:
+            sup._terminate_worker(worker)
 
-    # Clean up temp files if path is under temp dir
+    # Clean up IDA sidecars ONLY if they live under the temp dir — never touch
+    # files next to the user's original input. Swap the final extension so
+    # multi-dot names (foo.dll.i64) resolve correctly.
     if file_path:
         try:
-            base = Path(file_path).with_suffix("")
-            for ext in (".i64", ".id0", ".id1", ".id2", ".nam", ".til"):
-                f = base.with_suffix(ext)
-                if f.exists():
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+            p = Path(file_path)
+            if str(p).startswith(str(Path(tempfile.gettempdir()))):
+                targets = {p}
+                for ext in (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til"):
+                    targets.add(p.with_suffix(ext))
+                for f in targets:
+                    if f.exists():
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
         except Exception:
             pass
 
@@ -1856,14 +2159,17 @@ def idalib_cleanup_zombies(
     max_age_minutes: Annotated[Optional[int], "Kill ida.exe processes older than N minutes"] = 30,
 ) -> dict:
     """Find and kill orphan IDA processes not managed by this supervisor.
-    
-    Scans the system for ida.exe processes, excludes those that this
-    supervisor spawned (tracked workers), and terminates the rest.
-    Use after a crash or when the system runs out of memory from
-    stale GUI instances or orphaned workers.
+
+    Enumerates ida.exe/ida processes via psutil, excludes those this supervisor
+    spawned (tracked workers + their process trees), and terminates the rest
+    once they're older than max_age_minutes. Use after a crash or when stale GUI
+    instances / orphaned workers eat memory. Returns the pids actually killed.
+
+    (Replaces the old wmic-based scan, which silently no-ops on current Windows
+    where wmic.exe has been removed.)
     """
     sup = _require_supervisor()
-    supervisor_pids = set()
+    supervisor_pids: set[int] = set()
     with sup._lock:
         for s in sup.sessions.values():
             if s.process is not None and s.process.pid is not None:
@@ -1875,60 +2181,52 @@ def idalib_cleanup_zombies(
         if sup._schema_worker is not None and sup._schema_worker.pid is not None:
             supervisor_pids.add(sup._schema_worker.pid)
 
-    killed = 0
-    errors = 0
-    cutoff = time.time() - max_age_minutes * 60
-
     try:
-        import subprocess
-        raw = subprocess.check_output(
-            ["wmic", "process", "where", "name='ida.exe'", "get", "ProcessId,ProcessId"],
-            text=True, timeout=10,
-        )
-        for line in raw.strip().split("\n"):
-            line = line.strip()
-            if not line or line == "ProcessId":
-                continue
-            parts = line.split()
-            for part in parts:
-                try:
-                    pid = int(part)
-                except ValueError:
-                    continue
-                if pid in supervisor_pids:
-                    continue
-                # Check process age via creation time
-                try:
-                    age_raw = subprocess.check_output(
-                        ["wmic", "process", "where", f"ProcessId={pid}", "get", "CreationDate"],
-                        text=True, timeout=5,
-                    )
-                    for aline in age_raw.strip().split("\n"):
-                        aline = aline.strip()
-                        if aline and aline != "CreationDate":
-                            import datetime
-                            try:
-                                created = datetime.datetime.strptime(aline[:14], "%Y%m%d%H%M%S")
-                                age_sec = time.time() - created.timestamp()
-                                if age_sec < max_age_minutes * 60:
-                                    continue  # too young to be zombie
-                            except ValueError:
-                                pass
-                            break
-                except Exception:
-                    pass
-                try:
-                    import os
-                    os.kill(pid, 9)
-                    killed += 1
-                except (OSError, PermissionError):
-                    errors += 1
+        import psutil  # type: ignore
     except Exception:
-        # Fallback: use os.kill directly for supervisor-tracked cleanup
-        pass
+        return {
+            "killed": 0,
+            "killed_pids": [],
+            "errors": 0,
+            "remaining_managed": len(supervisor_pids),
+            "error": "psutil unavailable — cannot enumerate processes",
+        }
+
+    # Protect managed workers and their descendants (idalib may spawn helpers).
+    protected: set[int] = set(supervisor_pids)
+    for pid in list(supervisor_pids):
+        try:
+            for child in psutil.Process(pid).children(recursive=True):
+                protected.add(child.pid)
+        except Exception:
+            pass
+
+    killed_pids: list[int] = []
+    errors = 0
+    now = time.time()
+    cutoff_age = (max_age_minutes or 0) * 60
+
+    for proc in psutil.process_iter(["pid", "name", "create_time"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            if name not in ("ida.exe", "ida64.exe", "ida", "ida64"):
+                continue
+            pid = proc.info["pid"]
+            if pid in protected:
+                continue
+            age = now - (proc.info.get("create_time") or now)
+            if age < cutoff_age:
+                continue  # too young to be considered a zombie
+            proc.kill()
+            killed_pids.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            errors += 1
+        except Exception:
+            errors += 1
 
     return {
-        "killed": killed,
+        "killed": len(killed_pids),
+        "killed_pids": killed_pids,
         "errors": errors,
         "remaining_managed": len(supervisor_pids),
     }
@@ -2079,7 +2377,10 @@ def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
         session = _require_supervisor().resolve_session(None)
     except Exception as e:
         return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
-    return _require_supervisor().forward_raw(session, request_obj)
+    try:
+        return _require_supervisor().forward_raw(session, request_obj)
+    except Exception as e:
+        return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
 
 
 def main() -> None:
