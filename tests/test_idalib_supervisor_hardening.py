@@ -302,3 +302,156 @@ def test_idalib_open_force_bypasses_memory_check(tmp_path, monkeypatch):
         assert res.get("success") is True
     finally:
         sup.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Worker-crash diagnostics + mark-dead-fast (robustness round 2)
+# ---------------------------------------------------------------------------
+
+def test_worker_crash_diagnostic_surfaces_stderr(tmp_path, supervisor):
+    log = tmp_path / "worker.stderr"
+    log.write_text("FATAL: could not load processor module 'xyz'\nLicense check failed\n")
+    proc = _FakeWorkerProc(next(_pid_counter))
+    proc.kill()  # dead with returncode -9
+    sess = supmod.WorkerSession(
+        session_id="s", input_path="x", filename="x", process=proc,
+        backend="worker", owned=True, pid=proc.pid,
+        metadata={"stderr_log": str(log)},
+    )
+    diag = supervisor._worker_crash_diagnostic(sess, action="open_database")
+    assert diag["error"] == "worker_crashed"
+    assert diag["error_type"] == "WorkerCrashed"
+    assert diag["stderr_log"] == str(log)
+    assert "could not load processor" in diag["stderr_tail"]
+    assert diag["exit_code"] == -9
+    assert "recommendation" in diag
+
+
+def test_worker_rpc_raises_workercrashed_with_worker_ref(supervisor):
+    fw = _FakeWorker("hang")
+    captured: dict = {}
+
+    def call():
+        try:
+            supervisor._worker_rpc(fw.session, {"jsonrpc": "2.0", "method": "ping"}, timeout=30)
+        except supmod.WorkerCrashedError as e:
+            captured["err"] = e
+
+    t = threading.Thread(target=call)
+    t.start()
+    time.sleep(0.3)
+    fw.die()
+    t.join(timeout=5)
+    assert isinstance(captured.get("err"), supmod.WorkerCrashedError)
+    assert captured["err"].worker is fw.session
+    fw.close()
+
+
+def test_handle_worker_crash_prunes_session(supervisor):
+    proc = _FakeWorkerProc(next(_pid_counter))
+    sess = supmod.WorkerSession(
+        session_id="dead1", input_path="x", filename="x", process=proc,
+        backend="worker", owned=True, pid=proc.pid,
+    )
+    with supervisor._lock:
+        supervisor.sessions["dead1"] = sess
+    diag = supervisor.handle_worker_crash(sess, action="tool 'decompile'")
+    assert diag["error"] == "worker_crashed"
+    assert "dead1" not in supervisor.sessions  # pruned immediately, not after the watcher
+
+
+# ---------------------------------------------------------------------------
+# Analysis gating
+# ---------------------------------------------------------------------------
+
+def test_tool_call_gated_during_analysis(supervisor, monkeypatch):
+    proc = _FakeWorkerProc(next(_pid_counter))
+    sess = supmod.WorkerSession(
+        session_id="an1", input_path="x", filename="x", process=proc,
+        backend="worker", owned=True, pid=proc.pid,
+    )
+    supervisor.sessions["an1"] = sess
+    supervisor._open_tasks["analysis_zzz"] = {"status": "loading", "session_id": "an1"}
+    monkeypatch.setattr(supmod, "supervisor", supervisor)
+
+    req = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "decompile", "arguments": {"database": "an1", "addr": "0x1000"}},
+    }
+    result = supmod._handle_tools_call(req)
+    assert result["result"]["isError"] is True
+    data = json.loads(result["result"]["content"][0]["text"])
+    assert data["error"] == "analysis_in_progress"
+    assert data["task_id"] == "analysis_zzz"
+
+
+def test_session_state_transitions(supervisor):
+    proc = _FakeWorkerProc(next(_pid_counter))
+    sess = supmod.WorkerSession(
+        session_id="st1", input_path="x", filename="x", process=proc,
+        backend="worker", owned=True, pid=proc.pid,
+    )
+    supervisor.sessions["st1"] = sess
+    assert supervisor.session_state(sess) == "idle"
+    sess.active_calls = 1
+    assert supervisor.session_state(sess) == "busy"
+    sess.active_calls = 0
+    supervisor._open_tasks["analysis_a"] = {"status": "loading", "session_id": "st1"}
+    assert supervisor.session_state(sess) == "analyzing"
+    proc.kill()
+    assert supervisor.session_state(sess) == "dead"
+
+
+# ---------------------------------------------------------------------------
+# Save-before-kill + health detail
+# ---------------------------------------------------------------------------
+
+def test_close_session_saves_before_close(supervisor, monkeypatch):
+    proc = _FakeWorkerProc(next(_pid_counter))
+    sess = supmod.WorkerSession(
+        session_id="c1", input_path="x", filename="x", process=proc,
+        backend="worker", owned=True, pid=proc.pid,
+    )
+    supervisor.sessions["c1"] = sess
+    calls: list[str] = []
+    monkeypatch.setattr(
+        supervisor, "call_worker_tool",
+        lambda worker, name, arguments=None, tool_timeout=None: (calls.append(name), {"ok": True})[1],
+    )
+    assert supervisor.close_session("c1", save=True) is True
+    assert calls[0] == "idalib_save"  # saved before...
+    assert "idalib_close" in calls     # ...closing
+
+
+def test_close_session_without_save_does_not_save(supervisor, monkeypatch):
+    proc = _FakeWorkerProc(next(_pid_counter))
+    sess = supmod.WorkerSession(
+        session_id="c2", input_path="x", filename="x", process=proc,
+        backend="worker", owned=True, pid=proc.pid,
+    )
+    supervisor.sessions["c2"] = sess
+    calls: list[str] = []
+    monkeypatch.setattr(
+        supervisor, "call_worker_tool",
+        lambda worker, name, arguments=None, tool_timeout=None: (calls.append(name), {"ok": True})[1],
+    )
+    assert supervisor.close_session("c2") is True
+    assert "idalib_save" not in calls
+
+
+def test_idalib_health_reports_state_and_pool_detail(supervisor, monkeypatch):
+    proc = _FakeWorkerProc(next(_pid_counter))
+    sess = supmod.WorkerSession(
+        session_id="h1", input_path="x", filename="x.bin", process=proc,
+        backend="worker", owned=True, pid=proc.pid, metadata={"stderr_log": "/tmp/x"},
+    )
+    supervisor.sessions["h1"] = sess
+    monkeypatch.setattr(supmod, "supervisor", supervisor)
+
+    res = supmod.idalib_health()
+    assert "save_on_idle" in res["pool"]
+    assert res["pool"]["workers_analyzing"] == 0
+    worker = res["workers"][0]
+    assert worker["state"] in ("idle", "busy", "analyzing", "dead")
+    assert "active_calls" in worker
+    assert "age_sec" in worker

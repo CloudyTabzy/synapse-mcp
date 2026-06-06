@@ -40,6 +40,9 @@ _BOOTSTRAP_DISCOVER_TIMEOUT_S = 30.0
 # RPC timeout is the only backstop.
 _OPEN_STALL_GRACE_SEC = float(os.environ.get("IDA_MCP_OPEN_STALL_GRACE_SEC", "90"))
 _OPEN_STALL_NO_PROGRESS_SEC = float(os.environ.get("IDA_MCP_OPEN_STALL_SEC", "150"))
+# Persist a worker's IDB before the idle timeout kills it, so an expensive
+# analysis isn't lost. Disable with IDA_MCP_IDALIB_SAVE_ON_IDLE=0.
+_SAVE_ON_IDLE = os.environ.get("IDA_MCP_IDALIB_SAVE_ON_IDLE", "1") not in ("0", "false", "False", "")
 
 STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
 SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
@@ -278,6 +281,40 @@ def _is_idb_path(path: Path) -> bool:
     return path.suffix.lower() in (".i64", ".idb")
 
 
+class WorkerCrashedError(RuntimeError):
+    """Raised by _worker_rpc when the worker subprocess died mid-call.
+
+    Subclasses RuntimeError so existing ``except Exception`` / ``except
+    RuntimeError`` handlers keep working, but lets dispatch handlers catch
+    a crash specifically to prune the dead worker and surface its stderr.
+    """
+
+    def __init__(self, worker: "WorkerSession", message: str = "Worker process closed stdout"):
+        super().__init__(message)
+        self.worker = worker
+
+
+def _read_stderr_tail(log_path: str | None, *, max_lines: int = 25, max_bytes: int = 4000) -> str | None:
+    """Return the tail of a worker stderr-capture file, or None.
+
+    Workers capture raw stderr (incl. C-level crash output IDA prints before
+    Python logging is up) to a per-worker file. On a crash this is usually the
+    only place the real cause (bad processor, OOM, license, corrupt IDB) shows.
+    """
+    if not log_path:
+        return None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError:
+        return None
+    data = data.strip()
+    if not data:
+        return None
+    tail = "\n".join(data.splitlines()[-max_lines:])
+    return tail[-max_bytes:]
+
+
 def _format_duration(seconds: int) -> str:
     """Format seconds into a human-readable duration string."""
     if seconds < 60:
@@ -327,6 +364,7 @@ class WorkerSession:
     pid: int | None = None
     stdin: Any | None = None  # subprocess.PIPE for stdio workers
     stdout: Any | None = None
+    active_calls: int = 0  # in-flight tool calls to this worker (for health/state)
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -380,6 +418,9 @@ class IdalibSupervisor:
         # pid -> _WorkerChannel, shared across WorkerSession copies of one process.
         self._channels: dict[int, _WorkerChannel] = {}
         self._channels_lock = Lock()
+        # pid -> stderr-capture path, so a crash diagnostic can find the log
+        # even for a session whose own metadata doesn't carry it.
+        self._worker_logs: dict[int, str] = {}
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
@@ -468,6 +509,10 @@ class IdalibSupervisor:
                 "Idle timeout (%ss): killing worker for session %s (%s)",
                 _IDLE_TIMEOUT_S, session.session_id, session.filename or session.input_path,
             )
+            # Preserve analysis: persist the IDB before the idle kill so an
+            # expensive (multi-minute) analysis isn't silently discarded.
+            if _SAVE_ON_IDLE:
+                self._save_session_best_effort(session)
             with self._lock:
                 if session.session_id in self.sessions:
                     self._unregister_session_locked(session.session_id)
@@ -619,6 +664,7 @@ class IdalibSupervisor:
         )
         if log_path:
             worker.metadata["stderr_log"] = log_path
+            self._worker_logs[process.pid] = log_path
         try:
             self._wait_worker_ready(worker)
         except Exception:
@@ -813,6 +859,7 @@ class IdalibSupervisor:
             chan = self._channels.get(proc.pid)
             if chan is not None and chan.process is proc:
                 self._channels.pop(proc.pid, None)
+        self._worker_logs.pop(proc.pid, None)
 
     def _reader_loop(self, chan: _WorkerChannel) -> None:
         """Drain a channel's stdout, routing JSON-RPC responses by id.
@@ -878,7 +925,7 @@ class IdalibSupervisor:
         can never block this thread (or the supervisor's main MCP loop) forever.
         """
         if worker.process is None or worker.process.poll() is not None:
-            raise RuntimeError("Worker process is not running")
+            raise WorkerCrashedError(worker, "Worker process is not running")
         if worker.stdin is None or worker.stdout is None:
             raise RuntimeError("Worker stdio pipes not available")
 
@@ -893,7 +940,7 @@ class IdalibSupervisor:
                 chan.stdin.write((body + "\n").encode("utf-8"))
                 chan.stdin.flush()
             except (BrokenPipeError, OSError) as e:
-                raise RuntimeError("Worker process closed stdin") from e
+                raise WorkerCrashedError(worker, "Worker process closed stdin") from e
 
         deadline = time.monotonic() + (timeout or 60.0)
         with chan.cond:
@@ -904,7 +951,7 @@ class IdalibSupervisor:
                 if chan.reader_eof or (
                     chan.process is not None and chan.process.poll() is not None
                 ):
-                    raise RuntimeError("Worker process closed stdout")
+                    raise WorkerCrashedError(worker, "Worker process closed stdout")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
@@ -913,7 +960,82 @@ class IdalibSupervisor:
                 chan.cond.wait(timeout=min(remaining, 1.0))
 
     def forward_raw(self, worker: WorkerSession, request_obj: dict[str, Any]) -> dict[str, Any]:
-        return self._worker_rpc(worker, request_obj)
+        worker.active_calls += 1
+        try:
+            return self._worker_rpc(worker, request_obj)
+        finally:
+            worker.active_calls = max(0, worker.active_calls - 1)
+
+    def _worker_crash_diagnostic(self, worker: WorkerSession, *, action: str) -> dict[str, Any]:
+        """Structured 'worker_crashed' error enriched with the worker's stderr.
+
+        Turns an opaque transport failure into the actual cause (bad processor,
+        OOM, license, corrupt IDB) by attaching the worker's captured stderr.
+        """
+        info: dict[str, Any] = {
+            "error": "worker_crashed",
+            "error_type": "WorkerCrashed",
+            "message": f"The idalib worker for this database crashed during {action}.",
+        }
+        proc = worker.process
+        if proc is not None and proc.poll() is not None and proc.returncode is not None:
+            info["exit_code"] = proc.returncode
+        log_path = worker.metadata.get("stderr_log") or (
+            self._worker_logs.get(proc.pid) if proc is not None else None
+        )
+        if log_path:
+            info["stderr_log"] = log_path
+            tail = _read_stderr_tail(log_path)
+            if tail:
+                info["stderr_tail"] = tail
+        info["recommendation"] = (
+            "Reopen the database (idalib_open). If it keeps crashing, check stderr_tail "
+            "for the real cause (OOM, bad processor, corrupt/locked IDB) and consider "
+            "mode='lief-only' for static metadata."
+        )
+        return info
+
+    def handle_worker_crash(self, worker: WorkerSession, *, action: str = "an operation") -> dict[str, Any]:
+        """Prune every session backed by *worker*'s process, then diagnose.
+
+        Fails fast: the dead worker is removed from the pool immediately so the
+        next call returns a clean error instead of waiting for the death watcher.
+        """
+        diagnostic = self._worker_crash_diagnostic(worker, action=action)
+        proc = worker.process
+        with self._lock:
+            dead_ids = [
+                sid for sid, s in self.sessions.items()
+                if s is worker or (proc is not None and s.process is proc)
+            ]
+            for sid in dead_ids:
+                self._unregister_session_locked(sid)
+            if self._schema_worker is worker or (
+                self._schema_worker is not None and proc is not None
+                and self._schema_worker.process is proc
+            ):
+                self._schema_worker = None
+        self._terminate_worker(worker)
+        return diagnostic
+
+    def _active_analysis_task_for(self, session_id: str) -> str | None:
+        """Return the task_id of an in-flight analysis for *session_id*, if any."""
+        for task_id, task in self._open_tasks.items():
+            if (
+                task_id.startswith("analysis_")
+                and task.get("status") == "loading"
+                and task.get("session_id") == session_id
+            ):
+                return task_id
+        return None
+
+    def session_state(self, session: WorkerSession) -> str:
+        """Coarse lifecycle state for health reporting."""
+        if not session.is_alive():
+            return "dead"
+        if self._active_analysis_task_for(session.session_id):
+            return "analyzing"
+        return "busy" if session.active_calls > 0 else "idle"
 
     def call_worker_tool(
         self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None,
@@ -924,16 +1046,20 @@ class IdalibSupervisor:
         # For GUI-backend workers, use the old HTTP path
         if worker.backend == "gui":
             return self._gui_call_worker_tool(worker, name, arguments, tool_timeout=tool_timeout)
-        response = self._worker_rpc(
-            worker,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments or {}},
-            },
-            timeout=tool_timeout,
-        )
+        worker.active_calls += 1
+        try:
+            response = self._worker_rpc(
+                worker,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments or {}},
+                },
+                timeout=tool_timeout,
+            )
+        finally:
+            worker.active_calls = max(0, worker.active_calls - 1)
         if "error" in response:
             raise RuntimeError(response["error"].get("message", "Unknown worker error"))
         result = response.get("result", {})
@@ -1146,12 +1272,17 @@ class IdalibSupervisor:
             raise
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+        session_meta = dict(worker_session.get("metadata") or {})
+        # Carry the worker's stderr-capture path onto the session so health and
+        # crash diagnostics can find it (the worker's own metadata doesn't have it).
+        if worker.metadata.get("stderr_log") and "stderr_log" not in session_meta:
+            session_meta["stderr_log"] = worker.metadata["stderr_log"]
         session = WorkerSession(
             session_id=session_id,
             input_path=str(worker_session.get("input_path") or resolved),
             filename=str(worker_session.get("filename") or Path(resolved).name),
             is_analyzing=bool(worker_session.get("is_analyzing", False)),
-            metadata=dict(worker_session.get("metadata") or {}),
+            metadata=session_meta,
             host=worker.host,
             port=worker.port,
             process=worker.process,
@@ -1204,7 +1335,39 @@ class IdalibSupervisor:
             raise session_collision_error
         return existing_session
 
-    def close_session(self, session_id: str) -> bool:
+    def _save_session_best_effort(self, session: WorkerSession) -> bool:
+        """Persist a worker's IDB before it is torn down. Best-effort.
+
+        Skips lief-only sessions (no IDB) and temp-redirected DBs (cleaned up on
+        close anyway). Returns True if a save was attempted and succeeded.
+        """
+        if session.backend != "worker" or not session.is_alive():
+            return False
+        if session.metadata.get("mode") == "lief-only":
+            return False
+        try:
+            size_mb = 0.0
+            try:
+                size_mb = os.path.getsize(session.input_path) / (1024 * 1024)
+            except OSError:
+                pass
+            timeout = min(120 + size_mb * 2, 1800)
+            result = self.call_worker_tool(session, "idalib_save", {"path": ""}, tool_timeout=timeout)
+            ok = bool(isinstance(result, dict) and result.get("ok"))
+            if ok:
+                logger.info("Saved IDB for session %s before teardown", session.session_id)
+            return ok
+        except Exception:
+            logger.debug("Save-before-teardown failed for %s", session.session_id, exc_info=True)
+            return False
+
+    def close_session(self, session_id: str, *, save: bool = False) -> bool:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return False
+        if save:
+            self._save_session_best_effort(session)
         with self._lock:
             session = self._unregister_session_locked(session_id)
             if session is None:
@@ -1711,18 +1874,6 @@ def idalib_open(
 
 
 @mcp.tool
-def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibCloseResult:
-    """Close a database worker and remove all context bindings targeting it."""
-    sup = _require_supervisor()
-    try:
-        if sup.close_session(session_id):
-            return {"success": True, "message": f"Session closed: {session_id}"}
-        return {"success": False, "error": f"Session not found: {session_id}"}
-    except Exception as e:
-        return {"error": f"Failed to close session: {e}"}
-
-
-@mcp.tool
 def idalib_switch(session_id: Annotated[str, "Session ID to bind to active context"]) -> IdalibSwitchResult:
     """Bind the active idalib context to an existing database worker."""
     sup = _require_supervisor()
@@ -1762,12 +1913,19 @@ def idalib_unbind() -> IdalibUnbindResult:
 
 
 @mcp.tool
-def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibCloseResult:
-    """Close a database worker and remove all context bindings targeting it."""
+def idalib_close(
+    session_id: Annotated[str, "Session ID to close"],
+    save: Annotated[bool, "Save the IDB to disk before closing (preserves analysis)"] = False,
+) -> IdalibCloseResult:
+    """Close a database worker and remove all context bindings targeting it.
+
+    Pass save=True to persist the IDB first — important after a long analysis,
+    so the work isn't discarded when the worker is torn down."""
     sup = _require_supervisor()
     try:
-        if sup.close_session(session_id):
-            return {"success": True, "message": f"Session closed: {session_id}"}
+        if sup.close_session(session_id, save=save):
+            saved = " (saved)" if save else ""
+            return {"success": True, "message": f"Session closed: {session_id}{saved}"}
         return {"success": False, "error": f"Session not found: {session_id}"}
     except Exception as e:
         return {"error": f"Failed to close session: {e}"}
@@ -1844,18 +2002,31 @@ def idalib_health(
         if not session_id:
             alive = []
             dead_detail = []
+            analyzing_count = 0
+            busy_count = 0
             with sup._lock:
                 for s in sup.sessions.values():
+                    state = sup.session_state(s)
+                    analysis_task = sup._active_analysis_task_for(s.session_id)
                     detail = {
                         "session_id": s.session_id,
                         "pid": s.process.pid if s.process else s.pid,
                         "alive": s.is_alive(),
+                        "state": state,
+                        "active_calls": s.active_calls,
                         "backend": s.backend,
                         "filename": s.filename,
                         "owned": s.owned,
-                        "last_accessed_sec_ago": (datetime.now() - s.last_accessed).total_seconds(),
+                        "age_sec": round((datetime.now() - s.created_at).total_seconds(), 1),
+                        "last_accessed_sec_ago": round((datetime.now() - s.last_accessed).total_seconds(), 1),
                         "stderr_log": s.metadata.get("stderr_log"),
                     }
+                    if analysis_task:
+                        detail["analysis_task"] = analysis_task
+                    if state == "analyzing":
+                        analyzing_count += 1
+                    elif state == "busy":
+                        busy_count += 1
                     if s.is_alive():
                         alive.append(detail)
                     else:
@@ -1872,8 +2043,11 @@ def idalib_health(
                     "workers_total": total,
                     "workers_alive": alive_count,
                     "workers_dead": len(dead_detail),
+                    "workers_analyzing": analyzing_count,
+                    "workers_busy": busy_count,
                     "max_workers": sup.max_workers,
                     "idle_timeout_s": _IDLE_TIMEOUT_S,
+                    "save_on_idle": _SAVE_ON_IDLE,
                 },
                 "workers": alive + dead_detail,
             }
@@ -2305,6 +2479,9 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
                 forwarded.setdefault("params", {})["arguments"] = arguments
                 try:
                     return sup.forward_raw(worker, forwarded)
+                except WorkerCrashedError as e:
+                    diag = sup.handle_worker_crash(e.worker, action=f"tool '{tool_name}'")
+                    return _jsonrpc_result(request_id, _call_tool_result(diag, is_error=True))
                 except Exception as e:
                     return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
             return _jsonrpc_result(request_id, _call_tool_result({"error": "No worker available for file-analysis tool. Open a session first."}, is_error=True))
@@ -2314,10 +2491,29 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
+    # Gate non-management tools while a background analysis occupies the worker's
+    # single thread — otherwise the call silently blocks on the pipe for the
+    # whole analysis. Give the agent a fast, clear "poll the task" instead.
+    analysis_task = sup._active_analysis_task_for(session.session_id)
+    if analysis_task is not None:
+        return _jsonrpc_result(request_id, _call_tool_result({
+            "error": "analysis_in_progress",
+            "error_type": "AnalysisInProgress",
+            "message": (
+                f"Database '{session.session_id}' is being analyzed in the background. "
+                f"Tools are blocked until it finishes — poll idalib_task_poll('{analysis_task}') "
+                "until status='done', then retry."
+            ),
+            "task_id": analysis_task,
+        }, is_error=True))
+
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments
     try:
         return sup.forward_raw(session, forwarded)
+    except WorkerCrashedError as e:
+        diag = sup.handle_worker_crash(e.worker, action=f"tool '{tool_name}'")
+        return _jsonrpc_result(request_id, _call_tool_result(diag, is_error=True))
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
@@ -2344,6 +2540,9 @@ def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None
     try:
         session = sup.resolve_session(None)
         return sup.forward_raw(session, request_obj)
+    except WorkerCrashedError as e:
+        sup.handle_worker_crash(e.worker, action="a resource read")
+        return _jsonrpc_error(request_obj.get("id"), -32001, "worker_crashed: the idalib worker died; reopen the database")
     except Exception as e:
         return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
 
@@ -2373,12 +2572,16 @@ def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
     if method in {"prompts/list", "prompts/get"}:
         return _original_dispatch(request_obj)
 
+    sup = _require_supervisor()
     try:
-        session = _require_supervisor().resolve_session(None)
+        session = sup.resolve_session(None)
     except Exception as e:
         return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
     try:
-        return _require_supervisor().forward_raw(session, request_obj)
+        return sup.forward_raw(session, request_obj)
+    except WorkerCrashedError as e:
+        sup.handle_worker_crash(e.worker, action="an operation")
+        return _jsonrpc_error(request_obj.get("id"), -32001, "worker_crashed: the idalib worker died; reopen the database")
     except Exception as e:
         return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
 

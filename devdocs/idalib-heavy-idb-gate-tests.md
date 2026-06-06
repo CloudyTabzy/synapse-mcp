@@ -117,6 +117,41 @@ idalib_cleanup_zombies(max_age_minutes=0)
 Pass if: `killed` > 0 and `killed_pids` lists them (the old `wmic` path silently
 returned `killed=0` on current Windows). Managed workers must be untouched.
 
+### T8 — Crash diagnostics surface the real cause
+Open a database, then hard-kill its worker (`Stop-Process -Id <pid> -Force`),
+then call any worker tool on it (e.g. `get_metadata(database=<id>)`).
+Pass if: the result is `error="worker_crashed"` with `exit_code`, `stderr_log`,
+and a `stderr_tail` snippet — not a generic "connection lost". A second call
+returns a clean "no database / not found" (the dead worker was pruned
+immediately, not left lingering).
+
+### T9 — Analysis gating
+```
+r = idalib_open(input_path="<mid-size>.dll", run_auto_analysis=false)   # poll to done
+a = idalib_start_analysis(session_id=<id>)                              # returns analysis task
+get_function_count(database=<id>)   # or any worker tool, while analysis runs
+```
+Pass if: the tool call returns `error="analysis_in_progress"` with the analysis
+`task_id` to poll — immediately, not after a long block. After
+`idalib_task_poll(task_id)` reports done, the same call succeeds.
+
+### T10 — Save-before-kill
+```
+idalib_open(...); idalib_start_analysis(...); wait for done
+idalib_close(session_id=<id>, save=true)
+```
+Pass if: the message reports "(saved)" and the `.i64` on disk has a newer mtime.
+Also: with the default `IDA_MCP_IDALIB_SAVE_ON_IDLE=1`, a worker killed by the
+idle timeout saves its IDB first (check the `.i64` mtime / worker log).
+
+### T11 — Detailed health
+```
+idalib_health()    # no session_id
+```
+Pass if: `pool` includes `workers_analyzing`, `workers_busy`, `save_on_idle`,
+and each `workers[]` entry has `state` (idle/busy/analyzing/dead),
+`active_calls`, `age_sec`, and `stderr_log`.
+
 ---
 
 ## Pass criteria summary
@@ -131,3 +166,7 @@ returned `killed=0` on current Windows). Managed workers must be untouched.
 | Cancel kills hung open | T5 | `cancelled`, no orphan |
 | Watchdog frees wedged opens | T6 | `stuck_no_progress` auto-set |
 | Zombie cleanup works on Win11 | T7 | `killed_pids` populated |
+| Crash surfaces stderr + prunes | T8 | `worker_crashed` + `stderr_tail` |
+| Tools gated during analysis | T9 | `analysis_in_progress` + task_id |
+| Analysis preserved on close/idle | T10 | `.i64` mtime updated |
+| Health reports state/active_calls | T11 | per-worker `state` present |
