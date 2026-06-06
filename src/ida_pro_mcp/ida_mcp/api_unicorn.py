@@ -60,6 +60,7 @@ IDASyncError on nested execute_sync).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -79,6 +80,7 @@ from .utils import (
     tool_error,
     normalize_list_input,
 )
+from .numpy_compat import NUMPY_AVAILABLE, np_entropy
 
 logger = logging.getLogger(__name__)
 
@@ -714,6 +716,32 @@ def _shannon_entropy(data: bytes) -> float:
     return round(ent, 3)
 
 
+def _fast_entropy(data: bytes) -> float:
+    """Vectorized entropy when NumPy is available; falls back to pure Python."""
+    if NUMPY_AVAILABLE:
+        return round(np_entropy(data), 3)
+    return _shannon_entropy(data)
+
+
+def _fast_diff_count(before: bytes, after: bytes) -> int:
+    """Vectorized byte-difference count when NumPy is available.
+
+    Falls back to a pure-Python zip loop. Both buffers must be the same
+    length; caller guarantees this.
+    """
+    if NUMPY_AVAILABLE:
+        import numpy as np
+        a = np.frombuffer(before, dtype=np.uint8)
+        b = np.frombuffer(after, dtype=np.uint8)
+        return int(np.count_nonzero(a != b))
+    return sum(1 for x, y in zip(before, after) if x != y)
+
+
+def _md5_hex(data: bytes) -> str:
+    """Fast MD5 digest for hash-based short-circuit comparisons."""
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
+
+
 def _extract_ascii_strings(data: bytes, min_len: int = 4) -> list[str]:
     out: list[str] = []
     cur = bytearray()
@@ -946,10 +974,23 @@ class _EmuController:
                     pass
 
     # -- hooks -----------------------------------------------------------
-    def install_default_hooks(self, record_writes: bool = True) -> None:
-        self.emu.hook_add(UC_HOOK_MEM_INVALID, self._hook_mem_invalid)
+    def install_default_hooks(
+        self, record_writes: bool = True, hook_begin: int = 1, hook_end: int = 0
+    ) -> None:
+        """Install default hooks with optional address-range filtering.
+
+        When ``hook_end`` > ``hook_begin``, Unicorn filters callbacks at the
+        C level before invoking Python — eliminating Python→C round-trips for
+        out-of-range accesses.  This is the single biggest hook overhead win
+        when the region of interest is known up front.
+        """
+        self.emu.hook_add(
+            UC_HOOK_MEM_INVALID, self._hook_mem_invalid, begin=hook_begin, end=hook_end
+        )
         if record_writes:
-            self.emu.hook_add(UC_HOOK_MEM_WRITE, self._hook_mem_write)
+            self.emu.hook_add(
+                UC_HOOK_MEM_WRITE, self._hook_mem_write, begin=hook_begin, end=hook_end
+            )
 
     def _hook_mem_invalid(self, uc, access, address, size, value, user_data):
         # Auto-map a zero page and continue; record the fault for the agent.
@@ -1995,14 +2036,17 @@ if UNICORN_AVAILABLE:
                     after = bytes(ctl.emu.mem_read(w["start"], size))
                 except UcError:
                     continue
-                if before == after:
+                # hashlib short-circuit: skip byte-by-byte diff for unchanged
+                # regions (the common case for all_writable scans).
+                if _md5_hex(before) == _md5_hex(after):
                     unchanged.append({"addr": hex(w["start"]), "size": size,
                                       "label": w["label"]})
                     continue
-                nchg = sum(1 for a, b in zip(before, after) if a != b)
+                # Only reach here when bytes actually differ.
+                nchg = _fast_diff_count(before, after)
                 total_changed += nchg
-                eb = _shannon_entropy(before)
-                ea = _shannon_entropy(after)
+                eb = _fast_entropy(before)
+                ea = _fast_entropy(after)
                 strings = (_extract_ascii_strings(after, 4)
                            + _extract_utf16le_strings(after, 4))[:20]
                 if eb - ea >= 1.0:
@@ -2229,8 +2273,18 @@ if UNICORN_AVAILABLE:
 
             ctl = _EmuController(segments, uc_arch, uc_mode, bits)
             ctl.setup_stack()
-            ctl.install_default_hooks(record_writes=False)
-            ctl.emu.hook_add(UC_HOOK_CODE, ctl.count_hook)
+
+            # When filter_regions is given, compute C-level hook bounds so
+            # Unicorn filters out-of-range accesses before calling Python.
+            hook_lo, hook_hi = 1, 0
+            if ranges:
+                hook_lo = min(lo for lo, _hi, _lbl in ranges)
+                hook_hi = max(hi for _lo, hi, _lbl in ranges)
+
+            ctl.install_default_hooks(record_writes=False,
+                                      hook_begin=hook_lo, hook_end=hook_hi)
+            ctl.emu.hook_add(UC_HOOK_CODE, ctl.count_hook,
+                             begin=hook_lo, end=hook_hi)
             _set_regs(ctl.emu, ctl.reg_map, regs)
 
             accesses: list[dict] = []
@@ -2262,7 +2316,8 @@ if UNICORN_AVAILABLE:
                     try:
                         def _on_read(uc, access, address, size, value, user_data):
                             _record("read", uc, address, size, value)
-                        ctl.emu.hook_add(hook_type, _on_read)
+                        ctl.emu.hook_add(hook_type, _on_read,
+                                         begin=hook_lo, end=hook_hi)
                         read_hook_added = True
                         break
                     except UcError:
@@ -2270,7 +2325,8 @@ if UNICORN_AVAILABLE:
             if want in ("all", "writes"):
                 def _on_write(uc, access, address, size, value, user_data):
                     _record("write", uc, address, size, value)
-                ctl.emu.hook_add(UC_HOOK_MEM_WRITE, _on_write)
+                ctl.emu.hook_add(UC_HOOK_MEM_WRITE, _on_write,
+                                 begin=hook_lo, end=hook_hi)
 
             ctl.run(start_ea, end_ea, max_insns, timeout_ms)
 
