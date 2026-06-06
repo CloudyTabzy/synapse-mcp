@@ -23,6 +23,7 @@ from .utils import (
     get_assembly_lines,
     normalize_list_input,
     tool_error,
+    item_error,
 )
 # Shared decompile-failure classification — avoids duplicating the MERR_* map
 from .api_analysis import _classify_merr, _DECOMPILE_DEFAULT_HINT  # noqa: PLC2701
@@ -1363,6 +1364,9 @@ def find_functions_by_string(
     xrefs_to (single-hop references), analyze_function (deep per-function analysis).
     """
     try:
+        import idaapi
+        import idautils
+        import ida_funcs
         from .api_core import _get_strings_cache
         strings = _get_strings_cache()
         matched_addrs: list[tuple[int, str]] = []
