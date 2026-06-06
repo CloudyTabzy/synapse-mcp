@@ -479,14 +479,12 @@ def _function_jump_targets_internal(ea: int) -> list[dict[str, Any]]:
             continue
         mnem = insn.get_canon_mnem().lower()
         is_call = idaapi.is_call_insn(insn)
-        # idaapi.is_jump_insn does not exist — use mnemonic-based detection
-        _JMP_MNEMS = frozenset({
-            "jmp", "jo", "jno", "js", "jns", "je", "jz", "jne", "jnz",
-            "jb", "jnae", "jc", "jnb", "jae", "jnc", "jbe", "jna", "jnbe", "ja",
-            "jl", "jnge", "jnl", "jge", "jle", "jng", "jnle", "jg", "jpe", "jp",
-            "jpo", "jnp", "jcxz", "jecxz", "jrcxz", "b", "br",
-        })
-        is_jump = mnem in _JMP_MNEMS
+        # Canonical IDA API for jump detection: use instruction feature flags.
+        # CF_JUMP is set for all jump instructions (conditional, unconditional,
+        # direct, indirect). CF_STOP indicates an unconditional jump/ret.
+        # This is the same pattern used in api_analysis.py:get_function_jump_targets.
+        feat = insn.get_canon_feature()
+        is_jump = bool(feat & idaapi.CF_JUMP)
         if not is_jump and not is_call:
             continue
 
@@ -495,17 +493,16 @@ def _function_jump_targets_internal(ea: int) -> list[dict[str, Any]]:
         if is_call:
             kind = "call"
         elif insn.ops[0].type in (idaapi.o_near, idaapi.o_far):
-            kind = "unconditional" if mnem in ("jmp", "b", "br") else "conditional"
+            # CF_STOP on a jump means unconditional; without it, conditional
+            is_unconditional = bool(feat & idaapi.CF_STOP)
+            kind = "unconditional" if is_unconditional else "conditional"
             target_val = insn.ops[0].addr
             if target_val != idaapi.BADADDR:
                 target = hex(target_val)
         else:
-            if mnem in (
-                "jz", "je", "jnz", "jne", "ja", "jae", "jb", "jbe",
-                "jg", "jge", "jl", "jle", "jo", "jno", "js", "jns",
-                "jp", "jnp", "jc", "jnc",
-            ):
-                kind = "conditional"
+            # Register/memory operand on a jump = indirect
+            if is_jump:
+                kind = "indirect"
 
         jumps.append({
             "ea": hex(item_ea),
