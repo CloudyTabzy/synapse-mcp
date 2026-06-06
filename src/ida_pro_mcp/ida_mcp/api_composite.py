@@ -1301,6 +1301,8 @@ class IterativeDeobfuscateIteration(TypedDict, total=False):
     blocks_removed: int
     patches_applied: int
     bytes_nopped: int
+    proposed_patches: int
+    proposed_bytes_nopped: int
     patch_errors: list[str]
     verified: bool | None
     verification_mismatches: list[str]
@@ -1315,6 +1317,8 @@ class IterativeDeobfuscateResult(TypedDict, total=False):
     total_patches: int
     total_blocks_removed: int
     total_bytes_nopped: int
+    total_proposed_patches: int
+    total_proposed_bytes_nopped: int
     converged: bool
     final_state: str
     aborted_reason: str | None
@@ -1682,6 +1686,8 @@ def _hybrid_iterative_deobfuscate_core(
     total_patches = 0
     total_blocks_removed = 0
     total_bytes_nopped = 0
+    total_proposed_patches = 0
+    total_proposed_bytes_nopped = 0
     converged = False
     aborted_reason: str | None = None
     func = ida_funcs.get_func(func_start)
@@ -1818,9 +1824,8 @@ def _hybrid_iterative_deobfuscate_core(
                             if ida_bytes.patch_bytes(addr, sled):
                                 patches_applied += 1
                                 bytes_nopped_iter += size
-                        else:
-                            patches_applied += 1
-                            bytes_nopped_iter += size
+                        # In dry_run mode, actual patches_applied stays 0;
+                        # proposed counts are tracked separately below
                     except RuntimeError as exc:
                         patch_errors.append(
                             f"{cand['address']}: {exc}"
@@ -1833,6 +1838,14 @@ def _hybrid_iterative_deobfuscate_core(
                     idaapi.auto_wait()
                 total_patches += patches_applied
                 total_bytes_nopped += bytes_nopped_iter
+
+            # Proposed counts = what WOULD be applied (independent of dry_run)
+            proposed_patches_iter = len(candidates)
+            proposed_bytes_nopped_iter = sum(
+                c.get("size", 0) for c in candidates if c.get("size", 0) > 0
+            )
+            total_proposed_patches += proposed_patches_iter
+            total_proposed_bytes_nopped += proposed_bytes_nopped_iter
 
         blocks_removed_iter = patches_applied
         total_blocks_removed += blocks_removed_iter
@@ -1850,6 +1863,8 @@ def _hybrid_iterative_deobfuscate_core(
             "blocks_removed": blocks_removed_iter,
             "patches_applied": patches_applied,
             "bytes_nopped": bytes_nopped_iter,
+            "proposed_patches": proposed_patches_iter,
+            "proposed_bytes_nopped": proposed_bytes_nopped_iter,
             "patch_errors": patch_errors,
             "verified": verified,
             "verification_mismatches": mismatches,
@@ -1859,19 +1874,33 @@ def _hybrid_iterative_deobfuscate_core(
 
         prev_signature = (block_count_after, ir_stmt_after, edge_count_after)
 
-        _cand_sig = tuple(sorted(c["address"] for c in candidates)) + (verified,)
-        if _cand_sig == _prev_cand_sig:
-            _dup_iter_count += 1
-        else:
-            _dup_iter_count = 0
-        _prev_cand_sig = _cand_sig
+        # In dry_run mode, IDA bytes never change, so candidates repeat
+        # identically — this convergence check is meaningless. Skip it.
+        if not dry_run:
+            _cand_sig = tuple(sorted(c["address"] for c in candidates)) + (verified,)
+            if _cand_sig == _prev_cand_sig:
+                _dup_iter_count += 1
+            else:
+                _dup_iter_count = 0
+            _prev_cand_sig = _cand_sig
 
-        if _dup_iter_count >= 3:
+            if _dup_iter_count >= 3:
+                converged = True
+                iterations[-1]["converged"] = True
+                iterations[-1]["note"] = (
+                    "converged after repeated identical candidate+verification signatures; "
+                    "Triton mismatch all-or-nothing limitation may prevent deobfuscation"
+                )
+                break
+
+        # Dry-run short-circuit: if signature is unchanged and no patches
+        # were actually applied, further iterations are pure waste.
+        if dry_run and prev_signature is not None and signature == prev_signature:
             converged = True
             iterations[-1]["converged"] = True
-            iterations[-1]["note"] = (
-                "converged after repeated identical candidate+verification signatures; "
-                "Triton mismatch all-or-nothing limitation may prevent deobfuscation"
+            iterations[-1]["note"] += (
+                "; dry-run short-circuit — no patches applied so further iterations "
+                "would produce identical results."
             )
             break
 
@@ -1897,6 +1926,8 @@ def _hybrid_iterative_deobfuscate_core(
         "total_patches": total_patches,
         "total_blocks_removed": total_blocks_removed,
         "total_bytes_nopped": total_bytes_nopped,
+        "total_proposed_patches": total_proposed_patches,
+        "total_proposed_bytes_nopped": total_proposed_bytes_nopped,
         "converged": converged,
         "final_state": final_state,
         "aborted_reason": aborted_reason,
@@ -1947,6 +1978,15 @@ def hybrid_iterative_deobfuscate(
 
     `dry_run=True` (default) makes this safe to call exploratorily — the full
     Miasm pipeline runs and reports proposed patches without modifying the IDB.
+
+    **Dry-run semantics:**
+    - ``patches_applied`` / ``bytes_nopped`` / ``blocks_removed`` report the
+      *actual* changes made to the IDB (always zero when ``dry_run=True``).
+    - ``proposed_patches`` / ``proposed_bytes_nopped`` report what *would* be
+      applied if ``dry_run=False``.
+    - In ``dry_run=True`` mode, iterations short-circuit after the first pass
+      if the signature is unchanged (no actual patches → further passes are
+      identical), avoiding the confusing 4-iteration convergence seen before.
     """
     import idaapi
     import ida_funcs
