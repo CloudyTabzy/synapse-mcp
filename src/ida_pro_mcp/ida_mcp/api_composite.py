@@ -478,8 +478,15 @@ def _function_jump_targets_internal(ea: int) -> list[dict[str, Any]]:
         if ida_ua.decode_insn(insn, item_ea) <= 0:
             continue
         mnem = insn.get_canon_mnem().lower()
-        is_jump = idaapi.is_jump_insn(insn)
         is_call = idaapi.is_call_insn(insn)
+        # idaapi.is_jump_insn does not exist — use mnemonic-based detection
+        _JMP_MNEMS = frozenset({
+            "jmp", "jo", "jno", "js", "jns", "je", "jz", "jne", "jnz",
+            "jb", "jnae", "jc", "jnb", "jae", "jnc", "jbe", "jna", "jnbe", "ja",
+            "jl", "jnge", "jnl", "jge", "jle", "jng", "jnle", "jg", "jpe", "jp",
+            "jpo", "jnp", "jcxz", "jecxz", "jrcxz", "b", "br",
+        })
+        is_jump = mnem in _JMP_MNEMS
         if not is_jump and not is_call:
             continue
 
