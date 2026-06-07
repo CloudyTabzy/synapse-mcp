@@ -536,6 +536,65 @@ def _worker_pdeathsig_preexec() -> None:
         pass
 
 
+_SUPERVISOR_LOCK_NAME = "synapse-idalib-supervisor.lock"
+
+
+def _supervisor_lock_path() -> str:
+    return os.path.join(tempfile.gettempdir(), _SUPERVISOR_LOCK_NAME)
+
+
+def _enforce_supervisor_singleton() -> list[int]:
+    """Kill a stale *prior* idalib supervisor + its workers, then claim the lock.
+
+    A stdio supervisor whose client disconnected should exit on stdin EOF; when a
+    prior one lingers (crash / blocked main thread / relaunch) it keeps workers
+    that hold `.i64` locks and causes the multi-daemon routing chaos seen in the
+    stress reports. On startup we kill the previously-recorded supervisor (only if
+    it's verifiably an idalib supervisor) and its worker tree, then record our pid.
+    Mirrors server.py's proxy singleton. Opt out: ``IDA_MCP_IDALIB_SINGLETON=0``.
+    """
+    if os.environ.get("IDA_MCP_IDALIB_SINGLETON", "1") in ("0", "false", "False", ""):
+        return []
+    lock = _supervisor_lock_path()
+    our_pid = os.getpid()
+    killed: list[int] = []
+    prior_pid: int | None = None
+    try:
+        if os.path.exists(lock):
+            with open(lock, "r", encoding="utf-8") as f:
+                prior_pid = int((json.load(f) or {}).get("pid"))
+    except Exception:
+        prior_pid = None
+
+    if prior_pid and prior_pid != our_pid:
+        try:
+            import psutil  # type: ignore
+            if psutil.pid_exists(prior_pid):
+                proc = psutil.Process(prior_pid)
+                cmd = " ".join(proc.cmdline() or [])
+                name = (proc.name() or "").lower()
+                # Only kill if it's genuinely an idalib supervisor (guard pid reuse).
+                if "idalib_supervisor" in cmd or "idalib-mcp" in cmd or "idalib-mcp" in name:
+                    for child in proc.children(recursive=True):
+                        if _kill_pid_tree(child.pid):
+                            killed.append(child.pid)
+                    if _kill_pid_tree(prior_pid):
+                        killed.append(prior_pid)
+                    logger.warning(
+                        "Singleton: killed stale prior supervisor %s and its workers %s",
+                        prior_pid, killed,
+                    )
+        except Exception:
+            logger.debug("Supervisor singleton check failed", exc_info=True)
+
+    try:
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": our_pid, "started": time.time()}, f)
+    except Exception:
+        pass
+    return killed
+
+
 def _read_stderr_tail(log_path: str | None, *, max_lines: int = 25, max_bytes: int = 4000) -> str | None:
     """Return the tail of a worker stderr-capture file, or None.
 
@@ -1534,6 +1593,16 @@ class IdalibSupervisor:
         # crash diagnostics can find it (the worker's own metadata doesn't have it).
         if worker.metadata.get("stderr_log") and "stderr_log" not in session_meta:
             session_meta["stderr_log"] = worker.metadata["stderr_log"]
+        # Carry the worker's honest post-open stats (function_count, warning, ...)
+        # so callers can see an empty/failed analysis instead of a bare "success".
+        if isinstance(opened, dict):
+            open_stats = {
+                k: opened[k]
+                for k in ("function_count", "segment_count", "imagebase", "analysis_warning")
+                if k in opened
+            }
+            if open_stats:
+                session_meta["open_stats"] = open_stats
         session = WorkerSession(
             session_id=session_id,
             input_path=str(worker_session.get("input_path") or resolved),
@@ -2058,6 +2127,7 @@ def idalib_open(
                     processor=processor,
                     worker_sink=_record_worker,
                 )
+                open_stats = session.metadata.get("open_stats") or {}
                 sup._open_tasks[task_id] = {
                     "status": "done",
                     "stage": "done",
@@ -2066,6 +2136,7 @@ def idalib_open(
                     "size_mb": file_size_mb,
                     "started_at": sup._open_tasks[task_id].get("started_at", time.time()),
                     "estimated_total_seconds": estimated_total_sec,
+                    **open_stats,
                 }
             except Exception as exc:
                 # Don't clobber a terminal state the watchdog or cancel set.
@@ -2117,10 +2188,12 @@ def idalib_open(
             open_timeout=open_timeout_sec,
             processor=processor,
         )
+        open_stats = session.metadata.get("open_stats") or {}
         return {
             "success": True,
             **sup.context_fields(context_id),
             "session": session.to_dict(),
+            **open_stats,
             "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
         }
     except Exception as e:
@@ -2319,7 +2392,28 @@ def idalib_health(
                 "health": health if isinstance(health, dict) else None,
                 "error": None,
             }
-        result = sup.call_worker_tool(session, "idalib_health", {})
+        # Bound the health probe so a wedged worker yields a structured
+        # "unresponsive" answer (with its stderr) instead of hanging the client
+        # until its own transport timeout (the report's "2nd health aborts").
+        try:
+            result = sup.call_worker_tool(session, "idalib_health", {}, tool_timeout=20.0)
+        except WorkerCrashedError as e:
+            diag = sup.handle_worker_crash(e.worker, action="health probe")
+            return {"ready": False, **sup.context_fields(context_id), "session": session.to_dict(), "health": None, **diag}
+        except TimeoutError:
+            return {
+                "ready": False,
+                **sup.context_fields(context_id),
+                "session": session.to_dict(),
+                "health": None,
+                "error": "worker_unresponsive",
+                "message": (
+                    f"Worker for '{session.session_id}' did not answer a health probe in 20s "
+                    "(busy with a long op, or wedged). Check stderr_log, or idalib_cancel_task / "
+                    "idalib_close it."
+                ),
+                "stderr_log": session.metadata.get("stderr_log"),
+            }
         if isinstance(result, dict):
             return {**result, **sup.context_fields(context_id)}
         return {"ready": False, **sup.context_fields(context_id), "session": None, "health": None, "error": "Unexpected health result"}
@@ -2911,9 +3005,12 @@ def main() -> None:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    # Recover from a prior crash/restart: kill leaked idalib_server workers whose
-    # supervisor parent is gone. They hold OS file locks on .i64 databases
-    # (blocking new opens AND the IDA GUI) and would otherwise poison the pool.
+    # Kill a stale prior supervisor + its workers (the multi-daemon root cause),
+    # then recover from any crash that left leaked workers holding .i64 locks.
+    try:
+        _enforce_supervisor_singleton()
+    except Exception:
+        logger.debug("Supervisor singleton enforcement failed", exc_info=True)
     try:
         _sweep_orphan_workers(protected_pids=set())
     except Exception:

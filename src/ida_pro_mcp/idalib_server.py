@@ -231,7 +231,7 @@ def idalib_open(
             Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id, processor=processor
         )
         session = manager.bind_context(context_id, opened_session_id, activate=True)
-        return {
+        result = {
             "success": True,
             **_context_response_fields(context_id),
             "session": session.to_dict(),
@@ -240,6 +240,29 @@ def idalib_open(
                 f"({opened_session_id})"
             ),
         }
+        # Honest post-open stats so callers aren't told "success" while the
+        # database is silently empty (the false-positive open from the stress
+        # reports: success=true but function_count=0 / analysis failed).
+        try:
+            import idaapi
+            import ida_funcs
+            import ida_segment
+
+            func_count = int(ida_funcs.get_func_qty())
+            result["function_count"] = func_count
+            result["segment_count"] = int(ida_segment.get_segm_qty())
+            result["imagebase"] = hex(idaapi.get_imagebase())
+            is_idb = str(input_path).lower().endswith((".i64", ".idb"))
+            if run_auto_analysis and not is_idb and func_count == 0:
+                result["analysis_warning"] = (
+                    "Auto-analysis finished with 0 functions. The database may be "
+                    "empty, or the loader/processor mis-detected the binary. Try "
+                    "idalib_start_analysis(session_id), analyze_range over the code "
+                    "segment, or reopen with an explicit processor=... ."
+                )
+        except Exception:
+            pass
+        return result
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         return {"error": str(e)}
     except Exception as e:

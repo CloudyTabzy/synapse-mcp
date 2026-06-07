@@ -512,6 +512,50 @@ def test_parse_mem_limit_bytes(monkeypatch):
     assert supmod._parse_mem_limit_bytes() is None
 
 
+def test_open_session_surfaces_analysis_warning(tmp_path, monkeypatch):
+    """A 0-function open must carry an honest warning, not a bare success."""
+    sample = tmp_path / "s.bin"
+    sample.write_bytes(b"x")
+    sup = IdalibSupervisor(supmod.McpServer("test"))
+    monkeypatch.setattr(supmod._discovery, "discover_instances", lambda: [])
+    proc = _FakeWorkerProc(next(_pid_counter))
+    worker = supmod.WorkerSession(
+        session_id="__schema__", input_path="", filename="", process=proc,
+        backend="worker", owned=True, pid=proc.pid, stdin=1, stdout=1,
+    )
+    monkeypatch.setattr(sup, "_allocate_worker_locked", lambda: worker)
+    monkeypatch.setattr(
+        sup, "call_worker_tool",
+        lambda w, name, arguments=None, tool_timeout=None: {
+            "success": True,
+            "session": {"input_path": str(sample), "filename": "s.bin", "metadata": {}},
+            "function_count": 0, "segment_count": 21, "imagebase": "0x0",
+            "analysis_warning": "Auto-analysis finished with 0 functions.",
+        },
+    )
+    try:
+        session = sup.open_session(str(sample), session_id="s")
+        stats = session.metadata.get("open_stats") or {}
+        assert stats.get("function_count") == 0
+        assert "analysis_warning" in stats
+    finally:
+        sup.shutdown()
+
+
+def test_supervisor_singleton_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(supmod, "_supervisor_lock_path", lambda: str(tmp_path / "sup.lock"))
+    # Disabled -> no-op, no lock written.
+    monkeypatch.setenv("IDA_MCP_IDALIB_SINGLETON", "0")
+    assert supmod._enforce_supervisor_singleton() == []
+    assert not (tmp_path / "sup.lock").exists()
+    # Enabled with no prior lock -> writes our pid, kills nothing.
+    monkeypatch.setenv("IDA_MCP_IDALIB_SINGLETON", "1")
+    assert supmod._enforce_supervisor_singleton() == []
+    assert (tmp_path / "sup.lock").exists()
+    # Re-running with our own pid recorded must NOT self-kill.
+    assert supmod._enforce_supervisor_singleton() == []
+
+
 def test_worker_job_construct_assign_close_are_safe():
     # Must never raise regardless of platform; assign(None)/double-close are no-ops.
     job = supmod._WorkerJob(None)
