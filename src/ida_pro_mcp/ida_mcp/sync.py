@@ -168,11 +168,36 @@ def _sync_wrapper(ff, keep_batch=False):
             except queue.Empty:
                 pass
 
-    idaapi.execute_sync(runned, idaapi.MFF_WRITE)
+    if _idalib_executor is not None:
+        # Headless idalib mode: dispatch through the MainThreadExecutor instead
+        # of idaapi.execute_sync().  The main thread is free (running
+        # executor.run_forever()), so the submit picks up the work
+        # immediately on the main OS thread.
+        submit = getattr(_idalib_executor, "submit")
+        submit(runned)
+    else:
+        idaapi.execute_sync(runned, idaapi.MFF_WRITE)
     res = res_container.get()
     if isinstance(res, Exception):
         raise res
     return res
+
+
+# ── idalib executor integration ──────────────────────────────────────────────
+# In headless idalib mode, the MCP stdio server runs on a background thread and
+# the main OS thread is idled so it can service execute_sync() requests.  The
+# idalib server's MainThreadExecutor is registered here at startup.  When set,
+# all @idasync calls dispatch through it instead of using the native
+# idaapi.execute_sync(), which would block forever because the main thread is
+# occupied by the stdio read loop.
+
+_idalib_executor: object | None = None
+
+
+def _set_executor(executor: object) -> None:
+    """Register a MainThreadExecutor for headless idalib mode."""
+    global _idalib_executor  # noqa: PLW0603
+    _idalib_executor = executor
 
 
 def _normalize_timeout(value: object) -> float | None:
