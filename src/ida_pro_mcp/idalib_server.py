@@ -642,6 +642,52 @@ def main():
     trace.install_tracer()
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
+    # Per-request hang watchdog. The idalib worker is single-threaded, and a
+    # blocking C-level IDA call (e.g. function enumeration that stalls) cannot
+    # be interrupted by the Python-level tool timeout (sys.setprofile only fires
+    # on Python events, never inside a C call). So we arm faulthandler around
+    # every dispatched request: if a call runs longer than the threshold, all
+    # thread stacks — including the blocking C frame — are dumped to the worker
+    # stderr log, turning an opaque "tool hangs forever" into a precise trace.
+    # Set IDA_MCP_IDALIB_HANG_KILL=1 to also hard-exit the wedged worker after
+    # the dump (the supervisor then reports a clean worker-crash + the session
+    # can be reopened, instead of every later call blocking on the dead worker).
+    import faulthandler
+    try:
+        faulthandler.enable()  # dump C+Python stack on a fatal signal/crash too
+    except Exception:
+        pass
+    try:
+        _hang_dump_sec = float(os.environ.get("IDA_MCP_IDALIB_HANG_DUMP_SEC", "75") or 75)
+    except (TypeError, ValueError):
+        _hang_dump_sec = 75.0
+    _hang_kill = os.environ.get("IDA_MCP_IDALIB_HANG_KILL", "").strip().lower() in ("1", "true", "yes", "on")
+    if _hang_dump_sec > 0:
+        _orig_dispatch = MCP_SERVER.registry.dispatch
+        _watchdog_stderr = sys.stderr
+
+        def _dispatch_with_hang_watchdog(request):
+            try:
+                faulthandler.dump_traceback_later(
+                    _hang_dump_sec, repeat=False, file=_watchdog_stderr, exit=_hang_kill
+                )
+            except Exception:
+                pass
+            try:
+                return _orig_dispatch(request)
+            finally:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception:
+                    pass
+
+        MCP_SERVER.registry.dispatch = _dispatch_with_hang_watchdog
+        logger.info(
+            "Hang watchdog armed: dump after %.0fs%s",
+            _hang_dump_sec,
+            " then exit (KILL mode)" if _hang_kill else "",
+        )
+
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
     if not "IDA_MCP_URL" in os.environ:
         set_download_base_url(f"http://127.0.0.1:0")

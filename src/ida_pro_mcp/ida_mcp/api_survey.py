@@ -10,7 +10,7 @@ from typing import Annotated, TypedDict
 from .rpc import tool
 from .sync import idasync, tool_timeout
 from . import compat
-from .api_core import _get_strings_cache
+from .api_core import _get_strings_cache, _is_auto_analysis_running
 from .utils import get_image_size, tool_error
 
 
@@ -463,6 +463,15 @@ def survey_binary(
     import idautils
 
     try:
+        if _is_auto_analysis_running():
+            return tool_error(
+                RuntimeError(
+                    "Auto-analysis is still running; survey enumerates functions and "
+                    "can block the worker. Retry shortly, or call analysis_status() "
+                    "to check, then re-run."
+                ),
+                "survey_binary",
+            )
         minimal = detail_level == "minimal"
 
         # Collect all function addresses once, cap at _MAX_FUNC_ITER for large binaries.

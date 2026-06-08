@@ -202,9 +202,35 @@ _BINARY_CLASS_INITIALIZED: bool = False
 _FUNC_COUNT_CACHE: int = 0  # set by _ensure_binary_class / _build_health_payload
 
 
+def _is_auto_analysis_running() -> bool:
+    """True while IDA's auto-analyzer is still working.
+
+    Function-enumeration APIs (``get_func_qty``, ``get_next_func`` /
+    ``idautils.Functions()``) can block until the analyzer drains its queue —
+    especially in the headless idalib worker, whose single thread has no UI
+    pump to service a mid-analysis query. Probes and enumeration tools call
+    this first and skip/defer rather than block.
+
+    Defaults to ``False`` (assume idle) when the auto-state API is unavailable,
+    so a probe never hard-fails just because it could not read the state. This
+    function was referenced by the health/size paths but never defined — its
+    absence raised NameError, which the callers swallowed and reported
+    ``function_count: 0`` for every session (idalib validation-gate Issue 1).
+    """
+    try:
+        import ida_auto
+        get_state = getattr(ida_auto, "get_auto_state", None)
+        if get_state is None:
+            return False
+        au_none = getattr(ida_auto, "AU_NONE", 0)
+        return get_state() != au_none
+    except Exception:
+        return False
+
+
 def _ensure_binary_class() -> None:
     """Lazy-init _BINARY_CLASS on the first call to a size-sensitive tool.
-    
+
     Called from find_regex / search_text when _BINARY_CLASS is still 'small'.
     Avoids calling slow IDA APIs at module load time.
     """
@@ -213,6 +239,10 @@ def _ensure_binary_class() -> None:
         return
     try:
         import ida_funcs, ida_segment, ida_nalt
+        if _is_auto_analysis_running():
+            # Analyzer still draining — get_func_qty() can block here. Defer
+            # classification to a later call (stays 'small' for now).
+            return
         func_count = ida_funcs.get_func_qty()
         _FUNC_COUNT_CACHE = func_count
         binary_mb = max(1.0, ida_nalt.retrieve_input_file_size() / (1024 * 1024))
@@ -953,6 +983,17 @@ def list_functions_enhanced(
     Profile: core
     """
     try:
+        if _is_auto_analysis_running():
+            return {
+                "ok": False,
+                "error": "analysis_in_progress",
+                "error_type": "AnalysisInProgress",
+                "hint": (
+                    "Auto-analysis is still running; function enumeration can block "
+                    "the worker. Retry shortly, or call analysis_status() to check, "
+                    "then re-run."
+                ),
+            }
         all_items: list[dict] = []
         for start_ea in idautils.Functions():
             fn = idaapi.get_func(start_ea)
