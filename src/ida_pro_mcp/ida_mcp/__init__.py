@@ -50,6 +50,18 @@ from . import api_flirt
 from . import api_recon
 from . import api_tasks
 
+# api_xor — the universal XOR cipher solver. Always-on (the solver core is pure
+# Python with no hard dependency; Z3 only enriches the constraint path). Wrapped
+# defensively so a single import error can never take down the whole plugin.
+try:
+    from . import api_xor
+except Exception as _e:
+    _log.warning(
+        "api_xor failed to load (%s: %s) — all xor_* solver tools unavailable.\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_xor = None  # type: ignore[assignment]
+
 # Optional analysis engine modules — load only when dependencies are present.
 # ImportError / AttributeError from missing packages is silently swallowed so
 # the plugin remains fully operational without them.
@@ -230,6 +242,7 @@ __all__ = [
     "api_sigmaker",
     "api_flirt",
     "api_recon",
+    "api_xor",
     # Optional analysis engines (None when deps absent)
     "api_triton",
     "api_miasm",

@@ -4980,12 +4980,172 @@ def trace_data_chain(
 # ============================================================================
 # Static Analysis Tools — XOR Obfuscation & Constraint Classification
 # ============================================================================
+#
+# Module-level helpers used by `find_xor_pattern` (below).
+
+
+def _collapse_xor_runs(
+    sites: list[tuple[int, str, str, list[str]]],
+    *,
+    site_kind: str,
+    loop_headers: set[int],
+) -> list:
+    """Collapse consecutive memory/accumulator XOR sites into summary entries.
+
+    A single IDA function may contain hundreds of ``xor reg, [mem]`` or
+    ``xor reg, reg`` instructions.  Rather than flooding the agent with
+    one identical entry per instruction, this collapses runs of the same
+    register+operand signature within consecutive addresses to a single
+    ``XorPatternEntry``.
+
+    ``site_kind`` is ``"memory"`` for ``xor reg, [mem]`` forms and
+    ``"accum"`` for ``xor reg, reg`` accumulator-fold forms.
+    """
+
+    def _entry(site_ea: int, count: int) -> dict:
+        """Build one XorPatternEntry dict — plain dict, no TypedDict at runtime."""
+        in_loop = any(
+            lh <= site_ea <= (lh + 256) for lh in loop_headers
+        ) if loop_headers else False
+        if site_kind == "memory":
+            return dict(
+                type="xor_memory_operand",
+                address=hex(site_ea),
+                xor_count=count,
+                confidence="high" if count >= 3 or in_loop else "medium",
+                key_byte="dynamic",
+                detail=(
+                    f"{count} memory-operand XORs "
+                    f"(e.g. `xor reg, [mem]`) "
+                    f"{'inside a loop' if in_loop else 'in linear code'} "
+                    f"— key is a *register value* (not a constant). "
+                    f"Use xor_solve_universal with "
+                    f"family='self_referential' or 'rolling' "
+                    f"rather than the fixed_single path."
+                ),
+            )
+        return dict(
+            type="xor_accumulator_fold",
+            address=hex(site_ea),
+            xor_count=count,
+            confidence="medium" if in_loop else "low",
+            key_byte="accumulator",
+            detail=(
+                f"{count} reg-reg XORs "
+                f"{'inside a loop' if in_loop else 'outside a loop'} "
+                f"— a register is being folded (likely accumulator). "
+                f"If folded with the input bytes the cipher is "
+                f"self_referential."
+            ),
+        )
+
+    out: list = []
+    if not sites:
+        return out
+    last_ea: int | None = None
+    last_sig: str | None = None
+    run_count = 0
+    for ea, _mnem, op0_s, ops in sites:
+        sig = ("[" + "|".join(ops[1:]) + "]"
+               if site_kind == "memory" else f"{op0_s}={ops[1]}")
+        if last_ea is not None and last_ea + run_count == ea and last_sig == sig:
+            run_count += 1
+        else:
+            if last_ea is not None and run_count > 0:
+                out.append(_entry(last_ea, run_count))
+            last_ea = ea
+            last_sig = sig
+            run_count = 1
+    if last_ea is not None and run_count > 0:
+        out.append(_entry(last_ea, run_count))
+    return out
+    last_ea: int | None = None
+    last_sig: str | None = None
+    run_count = 0
+    for ea, _mnem, op0_s, ops in sites:
+        sig = ("[" + "|".join(ops[1:]) + "]"
+               if site_kind == "memory" else f"{op0_s}={ops[1]}")
+        if last_ea is not None and last_ea + run_count == ea and last_sig == sig:
+            run_count += 1
+        else:
+            if last_ea is not None and run_count > 0:
+                in_loop = any(
+                    lh <= last_ea <= (lh + 256) for lh in loop_headers
+                ) if loop_headers else False
+                if site_kind == "memory":
+                    out.append(dict(
+                        type="xor_memory_operand",
+                        address=hex(last_ea),
+                        xor_count=run_count,
+                        confidence="high" if run_count >= 3 or in_loop else "medium",
+                        detail=(
+                            f"{run_count} memory-operand XORs "
+                            f"(e.g. `xor reg, [mem]`) "
+                            f"{'inside a loop' if in_loop else 'in linear code'} "
+                            f"— key is a *register value* (not a constant). "
+                            f"Use xor_solve_universal with "
+                            f"family='self_referential' or 'rolling' "
+                            f"rather than the fixed_single path."
+                        ),
+                    ))
+                else:
+                    out.append(dict(
+                        type="xor_accumulator_fold",
+                        address=hex(last_ea),
+                        xor_count=run_count,
+                        confidence="medium" if in_loop else "low",
+                        detail=(
+                            f"{run_count} reg-reg XORs "
+                            f"{'inside a loop' if in_loop else 'outside a loop'} "
+                            f"— a register is being folded (likely accumulator). "
+                            f"If folded with the input bytes the cipher is "
+                            f"self_referential."
+                        ),
+                    ))
+            last_ea = ea
+            last_sig = sig
+            run_count = 1
+    if last_ea is not None and run_count > 0:
+        in_loop = any(
+            lh <= last_ea <= (lh + 256) for lh in loop_headers
+        ) if loop_headers else False
+        if site_kind == "memory":
+            out.append(dict(
+                type="xor_memory_operand",
+                address=hex(last_ea),
+                xor_count=run_count,
+                confidence="high" if run_count >= 3 or in_loop else "medium",
+                detail=(
+                    f"{run_count} memory-operand XORs "
+                    f"(e.g. `xor reg, [mem]`) "
+                    f"{'inside a loop' if in_loop else 'in linear code'} "
+                    f"— key is a *register value* (not a constant). "
+                    f"Use xor_solve_universal with "
+                    f"family='self_referential' or 'rolling' "
+                    f"rather than the fixed_single path."
+                ),
+            ))
+        else:
+            out.append(dict(
+                type="xor_accumulator_fold",
+                address=hex(last_ea),
+                xor_count=run_count,
+                confidence="medium" if in_loop else "low",
+                detail=(
+                    f"{run_count} reg-reg XORs "
+                    f"{'inside a loop' if in_loop else 'outside a loop'} "
+                    f"— a register is being folded (likely accumulator). "
+                    f"If folded with the input bytes the cipher is "
+                    f"self_referential."
+                ),
+            ))
+    return out
 
 
 class XorPatternEntry(TypedDict):
     type: str
     address: str
-    key_byte: str
+    key_byte: NotRequired[str]
     key_immediate: NotRequired[str]
     loop_count: NotRequired[int]
     rotate_count: NotRequired[int]
@@ -5061,31 +5221,75 @@ def find_xor_pattern(
         for block in fc:
             block_starts.add(block.start_ea)
 
+        def _is_mem_operand(op_str: str) -> bool:
+            """True when the printed operand references memory ([…] form)."""
+            return "[" in op_str and "]" in op_str
+
+        def _is_imm_operand(op_str: str) -> bool:
+            """True when the printed operand parses as an immediate byte constant."""
+            try:
+                int(op_str, 0)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        def _is_reg_reg(op0_s: str, op1_s: str) -> bool:
+            """Reg,reg (or sub-register) — the accumulator-fold / self-key signal."""
+            return (not _is_mem_operand(op0_s)) and (not _is_mem_operand(op1_s)) \
+                and (not _is_imm_operand(op1_s)) and (op0_s != op1_s)
+
+        def _group_xor(insns: list, start: int, key_val: int) -> tuple[int, int]:
+            """Count consecutive xor instructions with the same immediate key.
+
+            Returns (group_size, next_index_after_group). Stops at the first
+            xor that uses a *different* immediate key (memory-operand XORs
+            do not break the run — they are common in real code interleaved
+            with the constant-key XOR pass). Returns (0, start) if start is
+            not a xor-reg-imm.
+            """
+            if start >= len(insns):
+                return 0, start
+            item_ea0, mnem0, _, ops0 = insns[start]
+            if mnem0 != "xor" or len(ops0) < 2 or not _is_imm_operand(ops0[1]):
+                return 0, start
+            if int(ops0[1], 0) & 0xFF != key_val:
+                return 0, start
+            count = 1
+            k = start + 1
+            while k < len(insns) and k - start < 32:
+                m1 = insns[k][1]
+                if m1 == "xor" and len(insns[k][3]) >= 2 \
+                        and _is_imm_operand(insns[k][3][1]):
+                    if int(insns[k][3][1], 0) & 0xFF == key_val:
+                        count += 1
+                        k += 1
+                        continue
+                    break
+                if m1 == "xor" and _is_mem_operand(insns[k][3][1]):
+                    k += 1
+                    continue
+                break
+            return count, k
+
         patterns: list[XorPatternEntry] = []
+        # Track memory-XOR / accumulator-fold sites separately so we still
+        # report them when no constant-key XOR is present (most real crackme
+        # transforms are `xor [mem], reg` / `xor reg, [mem]`, not constant
+        # imm XOR).
+        mem_xor_sites: list[tuple[int, str, str, list[str]]] = []
+        accum_xor_sites: list[tuple[int, str, str, list[str]]] = []
+
         i = 0
         while i < len(insns):
             item_ea, mnem, op0, ops = insns[i]
 
-            # Detect xor reg, imm
-            if mnem == "xor" and len(ops) >= 2:
-                try:
-                    key_val = int(ops[1], 0) & 0xFF
-                except (ValueError, TypeError):
+            # ── Detect xor reg, imm (constant-key XOR) ─────────────────────────
+            if mnem == "xor" and len(ops) >= 2 and _is_imm_operand(ops[1]):
+                key_val = int(ops[1], 0) & 0xFF
+                xor_count, nxt = _group_xor(insns, i, key_val)
+                if xor_count == 0:
                     i += 1
                     continue
-                xor_count = 1
-                k = i + 1
-                while k < len(insns) and k - i < 32:
-                    if insns[k][1] == "xor" and len(insns[k][3]) >= 2:
-                        try:
-                            next_key = int(insns[k][3][1], 0) & 0xFF
-                        except (ValueError, TypeError):
-                            break
-                        if next_key == key_val:
-                            xor_count += 1
-                            k += 1
-                            continue
-                    break
 
                 in_loop = any(
                     lh <= item_ea <= (lh + 256) for lh in loop_headers
@@ -5103,8 +5307,28 @@ def find_xor_pattern(
                     confidence=confidence,
                     detail=f"In {'loop' if in_loop else 'linear'} code, {xor_count} XORs with key {hex(key_val)}",
                 ))
-                i = k
+                i = nxt
                 continue
+
+            # ── Detect xor reg, [mem] / xor [mem], reg / xor reg, [reg+idx] ─────
+            # This is the *most common* transform in real crackmes (the loop
+            # body XORs each buffer byte by a register-derived key, or writes
+            # the XOR back to memory). The original implementation dropped
+            # these on `int(ops[1], 0)` raising — see Bug #1 in
+            # plans/XOR_SWISS_ARMY_KNIFE_PROPOSAL.md.
+            if mnem == "xor" and len(ops) >= 2 and (
+                _is_mem_operand(ops[0] or "") or _is_mem_operand(ops[1])
+            ):
+                mem_xor_sites.append((item_ea, mnem, op0, ops))
+                i += 1
+                continue
+
+            # ── Detect xor reg, reg (accumulator fold) inside a loop ───────────
+            # Tells the self_referential / rolling family: the same dest
+            # register is folded repeatedly inside a loop. Out-of-loop
+            # `xor reg, reg` is just zeroing and is ignored below.
+            if mnem == "xor" and len(ops) >= 2 and _is_reg_reg(op0 or "", ops[1]):
+                accum_xor_sites.append((item_ea, mnem, op0, ops))
 
             # Detect ror/rol + xor combo
             if mnem in ("ror", "rol") and len(ops) >= 2:
@@ -5157,8 +5381,26 @@ def find_xor_pattern(
 
             i += 1
 
-        hint = None
-        suggested = None
+        # ── Surface memory-operand XOR and accumulator-fold sites ─────────────
+        # The two extra buckets captured during the main loop (`mem_xor_sites`,
+        # `accum_xor_sites`) become their own pattern entries so that
+        # `patterns_found` is non-empty for the *most common* real-world
+        # transform (xor reg, [mem]) — Bug #1 in
+        # plans/XOR_SWISS_ARMY_KNIFE_PROPOSAL.md. We collapse runs of the
+        # same dest register to a single pattern entry (otherwise a 500-byte
+        # function would emit 500 identical entries).
+        #
+        # `_collapse_runs` is the module-level helper below; we use it here.
+        # (An earlier revision defined a nested closure that raised
+        # ``NameError: name 'site_kind' is not defined`` on the first
+        # call — see test_api_analysis.py::test_find_xor_pattern_runs.)
+        patterns.extend(_collapse_xor_runs(mem_xor_sites, site_kind="memory",
+                                           loop_headers=loop_headers))
+        patterns.extend(_collapse_xor_runs(accum_xor_sites, site_kind="accum",
+                                           loop_headers=loop_headers))
+
+        hint: str
+        suggested: str
         if not patterns:
             hint = (
                 "No XOR patterns found. The function may use a different obfuscation "
@@ -5167,7 +5409,23 @@ def find_xor_pattern(
             )
             suggested = "check_constraint_type"
         else:
-            suggested = "xor_invert"
+            # Prefer the universal solver — it knows about self_referential /
+            # rolling / multi-byte / table_lookup. Only suggest xor_invert when
+            # we found a single-byte constant XOR in a loop (the classic case).
+            saw_const_xor = any(p.get("type", "").startswith("xor_") and
+                                p.get("type") != "xor_memory_operand" and
+                                p.get("type") != "xor_accumulator_fold"
+                                for p in patterns)
+            if saw_const_xor and len(patterns) == 1:
+                suggested = "xor_invert"
+            else:
+                suggested = "xor_solve_universal"
+            # Build a short hint summarising what was found.
+            types = sorted({p.get("type", "?") for p in patterns})
+            hint = (
+                f"Detected {len(patterns)} XOR pattern group(s): {', '.join(types)}. "
+                f"Use '{suggested}' next."
+            )
 
         return {
             "ok": True,
@@ -5180,7 +5438,26 @@ def find_xor_pattern(
         }
 
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        # The schema requires address / function_name / patterns_found /
+        # total_instructions_scanned even on the error path. Returning
+        # `{"ok": False, "error": str(e)}` alone fails the validator and
+        # the caller sees a generic "Structured content does not match
+        # the tool's output schema" — losing the actual error. Always
+        # populate the required fields with placeholders so the validator
+        # lets the error through to the agent.
+        return {
+            "ok": False,
+            "address": hex(func.start_ea) if "func" in locals() and func else "",
+            "function_name": "",
+            "patterns_found": [],
+            "total_instructions_scanned": 0,
+            "error": f"{type(e).__name__}: {e}",
+            "hint": (
+                "find_xor_pattern crashed during analysis. The error is in the "
+                "error field; please report it upstream. As a fallback, use "
+                "xor_model_from_disassembly which has a separate code path."
+            ),
+        }
 
 
 class XorInvertResult(TypedDict):
@@ -5515,6 +5792,16 @@ def check_constraint_type(
                 hint="Could not classify. Decompile the function and examine the validation logic manually.",
             ))
 
+        # Pick the primary entry: highest confidence, then first appended.
+        # This is what the recommendation logic and the top-level
+        # `constraint_type` field key off. Without this assignment, every
+        # subsequent `primary["constraint_type"]` access would raise
+        # `NameError: name 'primary' is not defined` and the entire
+        # function would return an error dict via the outer try/except
+        # (Bug #2 in plans/XOR_SWISS_ARMY_KNIFE_PROPOSAL.md).
+        _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+        primary = max(entries, key=lambda e: _CONFIDENCE_RANK.get(e["confidence"], 0))
+
         # ── Build cipher-type-aware recommendation ────────────────────────────
         if not detects_xor:
             recommendation = (
@@ -5746,12 +6033,22 @@ def find_alphabet_encoder(
                 detail=f"Probable alphabet table at {hex(table_addr)}: {table_size} bytes, {sum(1 for b in ida_bytes.get_bytes(table_addr, min(table_size, 128)) or b'' if 0x20 <= b < 0x7F)} printable",
             ))
 
-        hint = None
+        # Always populate `hint` as a concrete string. Returning `None` here
+        # is the original Bug #3 (schema says `NotRequired[str]` and a strict
+        # validator will reject a `None` value even when the key is present).
         if not unique_encoders:
             hint = (
                 "No custom alphabet encoder patterns found. The function may use "
                 "direct arithmetic on bytes (e.g., +x, -y) without lookup tables, "
                 "or may use a VM-based cipher. Try decompiling to identify the exact transform."
+            )
+        else:
+            n = len(unique_encoders)
+            hint = (
+                f"Found {n} encoder/lookup-table candidate{'s' if n != 1 else ''}. "
+                "If this is a custom alphabet cipher (base64-like, base32-like, "
+                "modular transform), see the detail of each entry for the specific "
+                "operation; the solver side is xor_solve_universal with family='auto'."
             )
 
         return FindAlphabetEncoderResult(

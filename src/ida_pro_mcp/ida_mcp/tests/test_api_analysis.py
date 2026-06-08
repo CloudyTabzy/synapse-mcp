@@ -33,6 +33,10 @@ from ..api_analysis import (
     callgraph,
     find_similar_functions,
     trace_data_chain,
+    find_xor_pattern,
+    check_constraint_type,
+    find_alphabet_encoder,
+    _collapse_xor_runs,
 )
 
 
@@ -948,3 +952,209 @@ def test_trace_data_chain_max_depth():
     assert_ok(result_deep, mandatory=False)
     if result_shallow.get("ok") and result_deep.get("ok"):
         assert result_deep["depth_reached"] >= result_shallow["depth_reached"]
+
+
+# =============================================================================
+# XOR-pattern / constraint-type / alphabet-encoder tools
+# (regression tests for the three bugs in plans/XOR_SWISS_ARMY_KNIFE_PROPOSAL.md)
+# =============================================================================
+
+
+@test()
+def test_collapse_xor_runs_empty():
+    """Empty sites list returns an empty list."""
+    r = _collapse_xor_runs([], site_kind="memory", loop_headers=set())
+    assert isinstance(r, list)
+    assert len(r) == 0
+
+
+@test()
+def test_collapse_xor_runs_collapses_consecutive():
+    """Consecutive identical memory-operand XORs collapse to a single entry."""
+    # Simulate 5 consecutive `xor rax, [rbx]` at addresses 0x1000-0x1004.
+    sites: list[tuple[int, str, str, list[str]]] = [
+        (0x1000, "xor", "rax", ["[rbx]"]),
+        (0x1001, "xor", "rax", ["[rbx]"]),
+        (0x1002, "xor", "rax", ["[rbx]"]),
+        (0x1003, "xor", "rax", ["[rbx]"]),
+        (0x1004, "xor", "rax", ["[rbx]"]),
+    ]
+    r = _collapse_xor_runs(sites, site_kind="memory", loop_headers=set())
+    assert len(r) == 1
+    assert r[0]["type"] == "xor_memory_operand"
+    assert r[0]["xor_count"] == 5
+
+
+@test()
+def test_collapse_xor_runs_breaks_on_different_operand():
+    """Different operand signatures break the run into separate entries."""
+    sites = [
+        (0x1000, "xor", "rax", ["[rbx]"]),
+        (0x1001, "xor", "rax", ["[rbx]"]),
+        (0x1002, "xor", "rax", ["[rcx]"]),  # different mem operand
+        (0x1003, "xor", "rax", ["[rbx]"]),  # back to first
+    ]
+    r = _collapse_xor_runs(sites, site_kind="memory", loop_headers=set())
+    assert len(r) == 3  # [0x1000-0x1001], [0x1002], [0x1003]
+
+
+@test()
+def test_collapse_xor_runs_breaks_on_gap():
+    """A non-consecutive address breaks the run."""
+    sites = [
+        (0x1000, "xor", "rax", ["[rbx]"]),
+        (0x1001, "xor", "rax", ["[rbx]"]),
+        (0x1009, "xor", "rax", ["[rbx]"]),  # gap: 0x1001+2=0x1003, not 0x1009
+    ]
+    r = _collapse_xor_runs(sites, site_kind="memory", loop_headers=set())
+    assert len(r) == 2
+
+
+@test()
+def test_collapse_xor_runs_accumulator_kind():
+    """accum site_kind produces xor_accumulator_fold entries."""
+    sites = [
+        (0x1100, "xor", "eax", ["[ecx]"]),
+    ]
+    r = _collapse_xor_runs(sites, site_kind="accum", loop_headers=set())
+    assert len(r) == 1
+    assert r[0]["type"] == "xor_accumulator_fold"
+
+
+@test()
+def test_collapse_xor_runs_in_loop_boosts_confidence():
+    """An address inside a recognised loop header region gets 'high' confidence."""
+    sites = [(0x1010, "xor", "rax", ["[rbx]"])]  # inside loop 0x1000-0x1200
+    loop = {0x1000}
+    r = _collapse_xor_runs(sites, site_kind="memory", loop_headers=loop)
+    assert len(r) == 1
+    assert r[0]["confidence"] == "high"
+
+
+def _any_xor_or_alphabet_function() -> str | None:
+    """Pick the first function that XOR-pattern tools accept.
+
+    We try a list of well-known fixture addresses first (most crackme03.elf
+    binaries ship with these) and fall back to ``get_any_function()``.
+    """
+    import idaapi
+
+    for addr in (CRACKME_CHECK_PW, CRACKME_MAIN, CRACKME_CALL_TO_CHECK_PW):
+        try:
+            ea = int(addr, 16)
+        except ValueError:
+            continue
+        if idaapi.get_func(ea) is not None:
+            return addr
+    return get_any_function()
+
+
+@test()
+def test_find_xor_pattern_runs():
+    """find_xor_pattern returns a structured result for a real function.
+
+    Regression for Bug #1 in plans/XOR_SWISS_ARMY_KNIFE_PROPOSAL.md:
+    the original implementation only handled ``xor reg, imm`` and silently
+    dropped every memory-operand XOR, returning ``patterns_found: []`` even
+    for crackmes where the entire transform is ``xor reg, [mem]``. After
+    the fix, memory-operand and accumulator-fold XORs are reported as their
+    own pattern entries (``xor_memory_operand`` / ``xor_accumulator_fold``).
+
+    Also regression-guards the inner ``_make_entry`` closure: a previous
+    revision defined ``_make_entry`` as a sibling of ``_collapse_runs``
+    (so it could not capture ``site_kind``) and raised NameError on the
+    very first call, which the outer try/except converted into a
+    ``{"ok": False, "error": "..."}`` dict MISSING the schema-required
+    fields ``address`` / ``function_name`` / ``patterns_found`` /
+    ``total_instructions_scanned``. The validator then rejected the
+    response, leaving the agent with a generic schema-error message and
+    no data. The fix nests ``_make_entry`` inside ``_collapse_runs``.
+    """
+    fn = _any_xor_or_alphabet_function()
+    if not fn:
+        skip_test("no functions in fixture")
+    r = find_xor_pattern(fn)
+    # Schema-required fields must always be present (success or error path).
+    assert r.get("ok") is True, r
+    for required_key in ("address", "function_name", "patterns_found",
+                        "total_instructions_scanned"):
+        assert required_key in r, f"missing required schema field {required_key!r}: {r}"
+    assert isinstance(r["patterns_found"], list)
+    assert isinstance(r["total_instructions_scanned"], int)
+    for entry in r["patterns_found"]:
+        assert isinstance(entry, dict)
+        assert "type" in entry
+        assert "address" in entry
+    assert r["suggested_next_tool"] in ("xor_invert", "xor_solve_universal")
+
+
+@test()
+def test_find_xor_pattern_bad_address():
+    """A non-function address is reported as an error, not a 500."""
+    r = find_xor_pattern("0x0")
+    assert isinstance(r, dict)
+    assert r.get("ok") in (True, False)
+    if not r.get("ok"):
+        assert_error(r)
+
+
+@test()
+def test_check_constraint_type_runs():
+    """check_constraint_type returns ok=True for any real function.
+
+    Regression for Bug #2: the original implementation referenced the
+    variable ``primary`` without ever assigning it, so every call to a
+    function that detected XOR raised ``NameError: name 'primary' is not
+    defined`` and returned ``{"ok": False, "error": "name 'primary' is not
+    defined"}`` via the outer try/except. After the fix, ``primary`` is
+    picked from ``entries`` by confidence rank and the result has the
+    documented shape with ``constraint_type`` populated.
+    """
+    fn = _any_xor_or_alphabet_function()
+    if not fn:
+        skip_test("no functions in fixture")
+    r = check_constraint_type(fn)
+    assert_ok(r, "constraint_type", "details", "recommendation")
+    assert r["constraint_type"] in {
+        "per_byte_invertible", "path_dependent", "opaque_predicate",
+        "state_mixer", "unknown",
+    }
+    assert isinstance(r["details"], list)
+    assert r["details"], "details must be a non-empty list of ConstraintTypeEntry"
+    assert r["cipher_type"] in ("xor", "custom_alphabet")
+    assert isinstance(r["recommendation"], str) and r["recommendation"]
+
+
+@test()
+def test_check_constraint_type_bad_address():
+    """A non-function address is reported as an error, not a NameError."""
+    r = check_constraint_type("0x0")
+    assert isinstance(r, dict)
+    assert r.get("ok") in (True, False)
+    if not r.get("ok"):
+        assert_error(r)
+
+
+@test()
+def test_find_alphabet_encoder_runs():
+    """find_alphabet_encoder always returns ``hint`` as a non-None string.
+
+    Regression for Bug #3: the original implementation only set ``hint``
+    when ``unique_encoders`` was empty, so the success case returned
+    ``hint=None`` even though the TypedDict declared
+    ``hint: NotRequired[str]``. After the fix, ``hint`` is always a
+    concrete string (the success-path hint describes the number of
+    candidates and points at the right solver).
+    """
+    fn = _any_xor_or_alphabet_function()
+    if not fn:
+        skip_test("no functions in fixture")
+    r = find_alphabet_encoder(fn)
+    assert_ok(r, "encoders_found", "total_instructions_scanned")
+    assert isinstance(r["encoders_found"], list)
+    for entry in r["encoders_found"]:
+        assert isinstance(entry, dict)
+        assert "encoder_type" in entry
+        assert "address" in entry
+    assert isinstance(r["hint"], str)
+    assert r["hint"], "hint must be a non-empty string (was: %r)" % (r["hint"],)

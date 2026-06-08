@@ -1787,6 +1787,7 @@ all = [
     { name = "triton-library" },
     { name = "unicorn" },
     { name = "yara-python" },
+    { name = "z3-solver" },
 ]
 angr = [
     { name = "angr", version = "9.2.213", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1823,6 +1824,9 @@ triton = [
 ]
 unicorn = [
     { name = "unicorn" },
+]
+xor = [
+    { name = "z3-solver" },
 ]
 yara = [
     { name = "yara-python" },
@@ -1867,8 +1871,10 @@ requires-dist = [
     { name = "unicorn", marker = "extra == 'unicorn'", specifier = ">=2.1.0" },
     { name = "yara-python", marker = "extra == 'all'", specifier = ">=4.3.0" },
     { name = "yara-python", marker = "extra == 'yara'", specifier = ">=4.3.0" },
+    { name = "z3-solver", marker = "extra == 'all'", specifier = ">=4.12.0" },
+    { name = "z3-solver", marker = "extra == 'xor'", specifier = ">=4.12.0" },
 ]
-provides-extras = ["triton", "miasm", "construct", "cstruct", "lief", "yara", "angr", "networkx", "unicorn", "numpy", "elf", "toon", "all"]
+provides-extras = ["triton", "miasm", "construct", "cstruct", "lief", "yara", "angr", "networkx", "unicorn", "numpy", "elf", "xor", "toon", "all"]
 
 [package.metadata.requires-dev]
 dev = [

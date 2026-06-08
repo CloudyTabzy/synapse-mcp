@@ -47,6 +47,11 @@ unicorn  = ["unicorn>=2.1.0"]
 # (entropy maps, byte distribution / chi-square). Included in 'all'.
 numpy    = ["numpy>=2.0.0"]
 elf      = ["pyelftools>=0.31"]
+# Z3 powers the optional constraint-solving path of xor_solve_universal (api_xor)
+# for multi-byte keys under charset/regex constraints. The solver's algebraic +
+# brute-force families work fine without it; this just unlocks the Z3 strategy.
+# Often already present transitively via triton/angr. Pure-wheel install.
+xor      = ["z3-solver>=4.12.0"]
 # TOON: server-side token-efficient encoding for large list tool responses.
 # Installed into the MCP server's Python (not IDA's Python).
 # Install: pip install toon_format  OR  uv add toon_format
@@ -64,6 +69,7 @@ all      = [
     "unicorn>=2.1.0",
     "numpy>=2.0.0",
     "pyelftools>=0.31",
+    "z3-solver>=4.12.0",
 ]
 
 [dependency-groups]
