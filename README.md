@@ -1,6 +1,6 @@
 # Synapse MCP
 
-> **One MCP server. Twelve analysis engines. 300+ tools. Zero configuration overhead.**
+> **One MCP server. Fourteen analysis engines. 360+ tools. Zero configuration overhead.**
 
 A synapse is not a wire. It is a gap — a microscopic, dynamic space that only conducts a signal when the moment demands it. Your brain does not fire every neuron to brush your teeth; it activates exactly the motor pathways required, then returns to quiet. **Synapse MCP** applies the same principle to binary analysis: twelve distinct engines and over three hundred tools exist in the server, but only the ones relevant to the current task ever cross into the agent's context window.
 
@@ -11,18 +11,19 @@ This is not a monolithic "powerhouse" that blasts every capability into memory r
 | Engine | Status | Tools |
 |--------|--------|-------|
 | 🧠 Triton Symbolic Execution | `pip install triton-library` | 51 |
-| 🔬 Miasm IR Analysis | `pip install miasm` | 21 |
+| 🔬 Miasm IR Analysis | `pip install miasm` | 22 |
 | 🐍 Angr Symbolic Execution | `pip install angr` | 23 |
 | 🦄 Unicorn Concrete Emulation | `pip install unicorn` | 14 |
 | 📦 Construct Format Parsing | `pip install construct` | 10 |
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
-| 🔍 LIEF Binary Analysis | `pip install lief` | 24 |
+| 🔍 LIEF Binary Analysis | `pip install lief` | 26 |
 | 🐘 ELF/DWARF Debug Info (pyelftools) | `pip install pyelftools>=0.31` | 6 |
 | 🎯 YARA Signature Scanning | `pip install yara-python` | 11 |
 | 🕸️ NetworkX Graph Metrics | `pip install networkx>=3.0` | 24 |
 | 🔢 NumPy Numerical Analysis | `pip install numpy>=2.0.0` | 9 |
-| 🛡️ Native IDA (core + recon + hybrid) | Built-in | 124 |
+| 🔐 XOR Cipher Solver (self_referential, rolling, multi-byte…) | `pip install z3-solver` (optional — Z3 enriches constraint path) | 3 |
+| 🛡️ Native IDA (core + recon + hybrid + modify + types + composite) | Built-in | 154 |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
 
@@ -136,6 +137,11 @@ Install optional analysis engines? (space=toggle, enter=confirm):
 [✓] lief      — binary format analysis, checksec, signatures, imphash, version info, debug dir, load config
 [✓] elf       — ELF/DWARF debug info: functions, line info, types, IDB sync (pyelftools, pure-Python)
 [✓] yara      — signature scanning, threat detection, IDB annotation
+[✓] networkx  — call/CFG graph metrics, centrality, community detection
+[✓] numpy     — entropy maps, XOR key recovery, similarity, opcode profiling
+[✓] unicorn   — concrete CPU emulation, decrypt-and-patch, shellcode sandbox
+[✓] elf       — ELF/DWARF debug info (pyelftools, pure-Python)
+[✓] xor       — Z3 constraint enrichment for xor_solve_universal (z3-solver)
 ```
 
 ### Verify
@@ -150,6 +156,9 @@ lief_status        → {"ok": true, "available": true, "version": "0.17.x", ...}
 elf_status         → {"ok": true, "available": true, "version": "0.31", ...}
 yara_status        → {"ok": true, "available": true, ...}
 nx_status          → {"ok": true, "available": true, ...}
+numpy_status       → {"ok": true, "available": true, ...}
+unicorn_status     → {"ok": true, "available": true, ...}
+xor_status         → {"ok": true, "available": true, "families": [...], "z3": true, ...}
 ```
 
 ---
@@ -220,50 +229,51 @@ flowchart TB
 
 ## 🎯 Capability Matrix
 
-| Capability | Triton | Miasm | Angr | Unicorn | Construct | cstruct | filetype | LIEF | pyelftools | Native |
-|-----------|:------:|:-----:|:----:|:-------:|:---------:|:-------:|:--------:|:----:|:------:|
-| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Concrete CPU emulation** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Decrypt stub execution (no debugger)** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Stackstring recovery** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **API-hash import resolution** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Shellcode syscall sandbox** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Dynamic execution trace / loop detect | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ✅ | ⚪ | ✅ | ⚪ | ⚪ |
-| Protocol parsing (TCP/UDP/DNS/TLS) | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| C-syntax struct definitions | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
-| Magic-byte file identification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
-| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Rich Header compiler fingerprinting | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Imphash / malware family clustering | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| PE version info / resource analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| PDB path / GUID / symbol-server key | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| LoadConfig / GuardFlags / CastGuard | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Section / import surgery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
-| **DWARF function/type/line recovery** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| **DWARF → IDB name sync** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| **GNU symbol versioning** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
-| VTable candidate scanning | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Indirect call discovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Stripped binary recon | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| FLIRT signature application | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Byte signature generation | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Call-graph analysis | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| CFG metrics / dominators | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Community detection | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
-| Graph diff / ROP gadget graph | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| Capability | Triton | Miasm | Angr | Unicorn | LIEF | YARA | XOR |
+|-----------|:------:|:-----:|:----:|:-------:|:----:|:----:|:---:|
+| Symbolic execution | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Concrete CPU emulation** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| **Decrypt stub execution (no debugger)** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| **Stackstring recovery** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| **API-hash import resolution** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| **Shellcode syscall sandbox** | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| SMT constraint solving | ✅ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Taint analysis | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| IR lifting / SSA | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dead-code elimination | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Cross-arch assembly | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| CFG recovery (static) | ⚪ | ✅ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Dynamic execution trace / loop detect | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ |
+| Stdin/argv symbolic modeling | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Backward slicing | ⚪ | ⚪ | ✅ | ⚪ | ⚪ | ⚪ | ⚪ |
+| **Self-referential XOR solving** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| **Rolling / cumulative / table-lookup XOR** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| **Algebraic inconsistency detection** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ |
+| PE/ELF header parsing | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Authenticode / cert chain verification | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Rich Header compiler fingerprint | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Imphash / malware family clustering | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| PE version info / resource analysis | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| PDB path / GUID / symbol-server key | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Security mitigations (checksec) | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Section / import surgery (`@unsafe`) | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| **Per-function YARA annotation** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| **Built-in crypto constant scanning** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| **Built-in packer / threat detection** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| **Rule generation from IDA bytes** | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ |
+| CFG guard table analysis | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Overlay / packer detection | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| Raw-file vs IDB diff | ⚪ | ⚪ | ⚪ | ⚪ | ✅ | ⚪ | ⚪ |
+| DWARF function/type/line recovery | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| Construct / cstruct / filetype / NumPy / NetworkX / pyelftools | See footnotes below |
+
+**Additional engine capabilities:**
+- **Construct** (`construct_*`): Declarative PE/ELF/protocol parsing, safe DSL template evaluator, IDA struct bridge, array/table scanning, protocol header extraction.
+- **dissect.cstruct** (`cstruct_*`): C-syntax struct/enum/typedef parsing from memory, IDA struct bridge, serialization.
+- **filetype** (`filetype_*`): Magic-byte file identification for raw buffers and segments.
+- **NumPy** (`numpy_*`): Block-level entropy maps, byte distribution (256-bucket + chi-square), repeating-XOR key recovery (IoC length detection + frequency), function/binary similarity (EMBER byte-entropy, NCC, JS distance), opcode histogram profiling.
+- **NetworkX** (`nx_*`): Call-graph / CFG / xref-graph construction, PageRank/betweenness/degree centrality, Louvain community detection, SCC/cycle detection, k-hop neighborhood, graph diff, topological sort.
+- **pyelftools** (`elf_*`): DWARF function/type/line recovery from ELF files, symbol table reading with GNU symbol versioning, IDB name sync (`hybrid_elf_sync_dwarf_to_idb`).
 
 ---
 
@@ -906,7 +916,7 @@ In lazy mode, `tools/list` returns only **4 meta-tools** instead of all 250+ too
 | `describe_tool(name)` | Full JSON schema for a single tool |
 | `invoke_tool(tool, args)` | Invoke any tool by name |
 
-**Why use it:** Agents with limited context windows fail when 290 tool schemas consume 40–60K tokens before any analysis begins. Lazy mode defers schema loading until the agent actually needs a tool.
+**Why use it:** Agents with limited context windows fail when 360 tool schemas consume 40–60K tokens before any analysis begins. Lazy mode defers schema loading until the agent actually needs a tool.
 
 **Cache behavior:** The proxy caches the IDA tool list after the first `list_modules` / `list_tools` call. If IDA reloads a new binary mid-session, `invoke_tool` automatically clears the cache and retries on "not found" errors. Agents can also force a refresh with `invoke_tool("__reset_cache__")`.
 
@@ -1007,30 +1017,31 @@ uv run coverage report --show-missing
 
 ---
 
-## 🔮 Refinement & Improvement Plan
+## 🔮 Stability & Consolidation Phase
 
-Feature freeze is in effect. The focus is now on **stability, accuracy, and hardening** of the existing 290+ tools rather than adding new engines.
+The emphasis is now on **correctness, schema robustness, and edge-case coverage** across the existing 360+ tools rather than adding new engine integrations.
 
 ### Active Focus Areas
 
 | Priority | Area | What needs work |
 |----------|------|----------------|
-| **P0** | NetworkX address resolution | Bare-hex fallback is implemented but not yet stress-tested across large call graphs with real malware samples. |
-| **P1** | Triton workflow polish | `workflow_solve_crackme` could benefit from a Triton-only fallback path when angr is unavailable or broken. |
-| **P1** | Schema robustness | One malformed tool must never crash `tools/list` — defensive wrapping already in `zeromcp`, but keep auditing new tools. |
-| **P2** | HTTP handler polish | Optional: URL-level `?profile=` filtering to reduce tool schema payload for lightweight clients. |
-| **P2** | Test coverage | Standalone pytest tests (no IDA) cover transport and protocol compliance; IDA-side tests need more edge cases for composite/hybrid workflows. |
+| **P0** | Schema robustness | One malformed TypedDict return or closure-scope `NameError` must never crash `tools/list` (defensive `try/except` in `_generate_tool_schema` is already in place; keep auditing new tools). |
+| **P1** | XOR tool verification | `xor_solve_universal` is deployed but the `self_consistency` heuristic for self-referential families could produce false positives on ambiguous buffers. A `unicorn_call_function` verification pipeline (step 5 of proposal) would confirm candidates via concrete emulation. |
+| **P1** | NetworkX stress-testing | Core graph construction (call graph, CFG, xref graph) and metrics (centrality, communities, cycles) are implemented with bare-hex address resolution, but have not been battle-tested across very large call graphs (>50K nodes). |
+| **P2** | Standalone pytest coverage | Non-IDA tests cover transport/protocol compliance and the xor solver core; more edge cases for composite/hybrid workflows and the optional engines are welcome. |
+| **P2** | angr DDG-backed slicing | `angr_backward_slice(use_cfg_only=False)` runs in-process and is slow on large binaries; the out-of-process worker path used by `CFGFast` cannot yet pickle the DDG. |
 
-### Deferred / Backlog
+### Recently Shipped
 
-These ideas are documented but **not scheduled**. They will only be picked up if a concrete use-case demands them.
-
-- ✅ **Numpy integration — DONE.** Shipped as `api_numpy.py` (9 tools: entropy maps, byte histograms, XOR key recovery, function/binary similarity, opcode profiling, typed value scanning, memmap pattern search) plus `summary` enrichment on bulk tools. See the **🔢 NumPy** section above. *SciPy spectral analysis for crypto constants was evaluated and intentionally not built — YARA's `yara_scan_builtin_crypto` is far more reliable than FFT on code bytes.*
-- **Capstone / Keystone** — independent disassembly/assembly outside IDA's state.
-- **Unicorn Engine** — concrete emulation of decrypt stubs and VM interpreters.
-- **Standalone Z3 bridge** — direct SMT solving without pulling in Triton or Angr.
-- **angr DDG-backed slicing** — full `CFGEmulated` + CDG + DDG path for `angr_backward_slice` (`use_cfg_only=False`); currently the precise mode runs in-process and is slow on large binaries.
-- **angr Unicorn hybrid** — `hybrid_angr_unicorn_concrete` (concrete Unicorn prefix + angr symbolic suffix); pending Phase 6.3.
+| Item | What was delivered |
+|------|-------------------|
+| ✅ **XOR Swiss Army Knife** (`api_xor.py`) | 8-family universal cipher solver (fixed, repeating, self-referential, rolling, position-dependent, two-layer, table-lookup, cumulative) with algebraic simplification, Z3 constraint path, and algebraic-inconsistency diagnostic. 3 tools: `xor_status`, `xor_solve_universal`, `xor_model_from_disassembly`. |
+| ✅ **NumPy integration** (`api_numpy.py`) | 9 tools: entropy maps, byte histograms, XOR key recovery, function/binary similarity, opcode profiling, typed value scanning, memmap pattern search. Plus `summary` enrichment (mean/median/stdev/percentiles) on bulk tool results. |
+| ✅ **LIEF upgrade** | 26 tools covering checksec, Authenticode chain verification, Rich Header decompilation, PE version-info anomaly heuristics, TLS callback enumeration, resource analysis with entropy/filetype guesses, section/import surgery, and three hybrid workflows. |
+| ✅ **YARA annotation engine** (`api_yara.py`) | 11 tools: built-in crypto constant rules (AES s-box, SHA IVs, CRC32 poly…), built-in threat detection (packers, C2 frameworks, shellcode), IDB annotation with auto-rename of `sub_*` stubs to `yara_<rule_name>`. |
+| ✅ **Unicorn concrete emulation** (`api_unicorn.py`) | 14 tools: emulation, trace, decrypt-and-patch, shellcode sandboxing, stackstring recovery, API-hash brute-force mapping, cross-engine workflows. |
+| ✅ **angr out-of-process worker** | angr runs in a dedicated process, not on IDA's main thread — no pickle crashes, no IDA-freeze on heavy exploration. LRU project cache (max 3) with blob-backend fallback for raw binaries. |
+| ✅ **Algebraic inconsistency diagnostic** | `xor_solve_universal` returns a `diagnostic` field when the self-referential model has no self-consistent solution (odd-length buffer with non-zero XOR) — the exact scenario that tripped up the `selfkey` crackme. |
 
 ### Contributing
 
@@ -1055,21 +1066,24 @@ The following optional analysis engines are **not** bundled with this project. T
 | Triton | `triton-library` | [Apache-2.0](https://github.com/JonathanSalwan/Triton/blob/master/LICENSE) | |
 | Miasm | `miasm` | [GPL-2.0](https://github.com/cea-sec/miasm) | Dynamically loaded; does not affect this plugin's license |
 | Angr | `angr` | [BSD-2-Clause](https://github.com/angr/angr/blob/master/LICENSE) | ~200 MB install with native C extensions |
+| Unicorn | `unicorn` | [GPL-2.0](https://github.com/unicorn-engine/unicorn/blob/master/LICENSE) | Dynamically loaded; same GPL-2.0 dynamic-exception rationale as Miasm |
 | Construct | `construct` | [MIT](https://github.com/construct/construct) | |
 | dissect.cstruct | `dissect.cstruct` | [Apache-2.0](https://github.com/fox-it/dissect.cstruct/blob/main/LICENSE) | |
 | filetype | `filetype` | [MIT](https://github.com/h2non/filetype.py) | |
 | LIEF | `lief` | [Apache-2.0](https://github.com/lief-project/LIEF/blob/main/LICENSE) (standard tier); commercial for LIEF Extended | |
 | YARA | `yara-python` | [Apache-2.0](https://github.com/VirusTotal/yara-python) | |
 | NetworkX | `networkx` | [BSD-3-Clause](https://github.com/networkx/networkx/blob/main/LICENSE) | Pure Python; small footprint |
+| NumPy | `numpy` | [BSD-3-Clause](https://github.com/numpy/numpy/blob/main/LICENSE) | |
+| pyelftools | `pyelftools` | [Public domain](https://github.com/eliben/pyelftools) (Unlicense) | |
+| Z3 (optional, solver enrichment) | `z3-solver` | [MIT](https://github.com/Z3Prover/z3) | |
 
 **Transitive dependencies of note:
 
 | Package | License | Why it matters |
 |---------|---------|---------------|
-| `z3-solver` | [MIT](https://github.com/Z3Prover/z3) | SMT solver used by both Triton and Angr (via Claripy) |
 | `claripy` | [BSD-2-Clause](https://github.com/angr/claripy) | Angr's AST/constraint layer; bundled with angr |
 | `pyvex` | [BSD-2-Clause](https://github.com/angr/pyvex) | Angr's VEX IR lifter; bundled with angr |
 | `cle` | [BSD-2-Clause](https://github.com/angr/cle) | Angr's binary loader; bundled with angr |
 
-> **Note:** Miasm is licensed under GPL-2.0. Because this project loads Miasm as an unmodified, independently-installed optional dependency (dynamic import at runtime, no source modification, no static linking), the GPL-2.0 terms apply to Miasm itself and any derivative works of Miasm, but do not extend to this plugin or to the user's own analysis scripts. If you redistribute a modified version of Miasm itself, GPL-2.0 obligations would apply to that modification.
+> **Note:** Miasm and Unicorn are licensed under GPL-2.0. Because this project loads them as unmodified, independently-installed optional dependencies (dynamic import at runtime, no source modification, no static linking), the GPL-2.0 terms apply to the engines themselves but do not extend to this plugin or to the user's own analysis scripts. If you redistribute a modified version of Miasm or Unicorn, GPL-2.0 obligations would apply to that modification.
 >
