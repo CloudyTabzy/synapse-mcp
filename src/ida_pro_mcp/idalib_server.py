@@ -888,3 +888,7 @@ def main():
         logger.info("Main thread shutting down")
     finally:
         mcp_thread.join(timeout=5)
+
+
+if __name__ == "__main__":
+    main()
