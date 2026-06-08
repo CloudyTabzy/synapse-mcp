@@ -642,51 +642,142 @@ def main():
     trace.install_tracer()
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
-    # Per-request hang watchdog. The idalib worker is single-threaded, and a
-    # blocking C-level IDA call (e.g. function enumeration that stalls) cannot
-    # be interrupted by the Python-level tool timeout (sys.setprofile only fires
-    # on Python events, never inside a C call). So we arm faulthandler around
-    # every dispatched request: if a call runs longer than the threshold, all
-    # thread stacks — including the blocking C frame — are dumped to the worker
-    # stderr log, turning an opaque "tool hangs forever" into a precise trace.
-    # Set IDA_MCP_IDALIB_HANG_KILL=1 to also hard-exit the wedged worker after
-    # the dump (the supervisor then reports a clean worker-crash + the session
-    # can be reopened, instead of every later call blocking on the dead worker).
-    import faulthandler
-    try:
-        faulthandler.enable()  # dump C+Python stack on a fatal signal/crash too
-    except Exception:
-        pass
-    try:
-        _hang_dump_sec = float(os.environ.get("IDA_MCP_IDALIB_HANG_DUMP_SEC", "75") or 75)
-    except (TypeError, ValueError):
-        _hang_dump_sec = 75.0
-    _hang_kill = os.environ.get("IDA_MCP_IDALIB_HANG_KILL", "").strip().lower() in ("1", "true", "yes", "on")
-    if _hang_dump_sec > 0:
-        _orig_dispatch = MCP_SERVER.registry.dispatch
-        _watchdog_stderr = sys.stderr
+    # ── Per-request dispatch gate ─────────────────────────────────────────────
+    # The idalib worker has a single main thread. When auto-analysis is
+    # running, every tool call (even a lightweight `lookup_funcs`) blocks on
+    # `execute_sync` because the main thread is busy draining the analysis
+    # queue. Without gating, the agent sees the call hang for the full
+    # supervisor-side `_worker_rpc` timeout (60 s) and gets back a cryptic
+    # ``TimeoutError`` — no actionable feedback, just a wasted minute.
+    #
+    # This pre-dispatch check runs on the stdio *reader* thread, before the
+    # request ever reaches `@idasync` / `execute_sync`. It returns a fast
+    # ``analysis_in_progress`` error the moment auto-analysis is still active,
+    # so the agent can poll ``analysis_status()`` and retry.
+    #
+    # Management tools (open/close/health/save/switch), status probes, and
+    # the explicit ``analysis_status`` tool are whitelisted so that the agent
+    # can always check on the session even during analysis.
+    # ──────────────────────────────────────────────────────────────────────────
 
-        def _dispatch_with_hang_watchdog(request):
-            try:
-                faulthandler.dump_traceback_later(
-                    _hang_dump_sec, repeat=False, file=_watchdog_stderr, exit=_hang_kill
-                )
-            except Exception:
-                pass
-            try:
-                return _orig_dispatch(request)
-            finally:
-                try:
-                    faulthandler.cancel_dump_traceback_later()
-                except Exception:
-                    pass
+    import ida_auto
 
-        MCP_SERVER.registry.dispatch = _dispatch_with_hang_watchdog
-        logger.info(
-            "Hang watchdog armed: dump after %.0fs%s",
-            _hang_dump_sec,
-            " then exit (KILL mode)" if _hang_kill else "",
-        )
+    _ANALYSIS_WHITELIST: frozenset[str] = frozenset({
+        "idalib_open", "idalib_close", "idalib_switch", "idalib_unbind",
+        "idalib_list", "idalib_current", "idalib_save", "idalib_health",
+        "idalib_warmup", "idalib_task_poll", "idalib_cancel_task",
+        "idalib_cleanup_zombies", "idalib_start_analysis",
+        "server_health", "server_warmup",
+    })
+    _ANALYSIS_WHITELIST_PREFIXES: tuple[str, ...] = (
+        "idalib_", "server_",
+    )
+
+    _ANALYSIS_BLOCKED_RESPONSE = json.dumps({
+        "jsonrpc": "2.0",
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({
+                "ok": False,
+                "error": "analysis_in_progress",
+                "error_type": "AnalysisInProgress",
+                "message": (
+                    "Auto-analysis is still running on the idalib worker. "
+                    "Tools are blocked until it finishes. Call analysis_status() "
+                    "to check — once is_complete is true, retry this call."
+                ),
+            })}],
+            "isError": True,
+        },
+    })
+
+    def _analysis_is_running() -> bool:
+        """True when the auto-analyzer is active (safe to call from any thread)."""
+        try:
+            return not ida_auto.auto_is_ok()
+        except Exception:
+            return False  # fail-open: let calls through if we can't check
+
+    def _analysis_status_fast_response() -> dict:
+        """Build an analysis_status response without touching @idasync.
+
+        ``analysis_status`` is the one tool agents MUST be able to call during
+        analysis (to know when it's done), but the normal path goes through
+        ``@idasync`` → ``execute_sync`` which blocks while analysis is
+        active — defeating the whole purpose.  We short-circuit it here on
+        the reader thread instead.
+        """
+        try:
+            state = ida_auto.get_auto_state()
+        except Exception:
+            state = -1
+        au_none = getattr(ida_auto, "AU_NONE", 0)
+        is_complete = (state == au_none)
+        result: dict[str, Any] = {"ok": True, "is_complete": is_complete}
+        if is_complete:
+            result["phase"] = "idle"
+        else:
+            result["phase"] = f"phase_{state}"
+            result["hint"] = (
+                f"IDA is still running auto-analysis (phase_{state}). "
+                "Function counts, xref data, and type info may be incomplete. "
+                "Call analysis_status() again before depending on those results."
+            )
+        return result
+
+    def _is_analysis_blocked(tool_name: str) -> bool:
+        """True when auto-analysis is active and the tool must be gated."""
+        if tool_name in _ANALYSIS_WHITELIST:
+            return False
+        if tool_name == "analysis_status":
+            return False  # handled specially below
+        if tool_name.endswith("_status"):
+            return False
+        if any(tool_name.startswith(p) for p in _ANALYSIS_WHITELIST_PREFIXES):
+            return False
+        if tool_name in IDALIB_MANAGEMENT_TOOLS:
+            return False
+        return _analysis_is_running()
+
+    _orig_dispatch = MCP_SERVER.registry.dispatch
+
+    def _dispatch_gated(request) -> dict | None:
+        """Intercept tools/call and either block or short-circuit before
+        the request ever enters ``@idasync`` / ``execute_sync``."""
+        if not isinstance(request, dict):
+            return _orig_dispatch(request)
+        method = request.get("method", "")
+        if method != "tools/call":
+            return _orig_dispatch(request)
+        params = request.get("params") or {}
+        tool_name = params.get("name", "")
+        rid = request.get("id")
+
+        # ── analysis_status: answer directly on the reader thread ──────────
+        if tool_name == "analysis_status":
+            # If analysis IS running, serve a fast response (avoids the
+            # execute_sync deadlock). If analysis is done, fall through to
+            # the normal path so the real tool can enrich the response with
+            # phase labels etc.
+            if _analysis_is_running():
+                resp = json.loads(json.dumps({
+                    "jsonrpc": "2.0",
+                    "result": {"content": [{"type": "text", "text": json.dumps(
+                        _analysis_status_fast_response()
+                    )}]},
+                }))
+                resp["id"] = rid
+                return resp
+            return _orig_dispatch(request)
+
+        # ── normal tool call: gate if analysis is running ──────────────────
+        if not _is_analysis_blocked(tool_name):
+            return _orig_dispatch(request)
+        resp = json.loads(_ANALYSIS_BLOCKED_RESPONSE)
+        resp["id"] = rid
+        logger.debug("Blocked tool '%s' — analysis not yet complete", tool_name)
+        return resp
+
+    MCP_SERVER.registry.dispatch = _dispatch_gated
 
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
     if not "IDA_MCP_URL" in os.environ:
