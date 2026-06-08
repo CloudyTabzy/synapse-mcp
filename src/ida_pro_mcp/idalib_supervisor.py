@@ -1143,7 +1143,11 @@ def databases_resource() -> dict:
 def _handle_tools_list(request_obj: dict[str, Any]) -> dict[str, Any]:
     sup = _require_supervisor()
     local_tools = mcp._mcp_tools_list().get("tools", [])
-    worker_tools = sup.worker_tools()
+    try:
+        worker_tools = sup.worker_tools()
+    except Exception as e:
+        logger.warning("Worker schema discovery failed: %s — falling back to local tools only", e)
+        worker_tools = []
     return _jsonrpc_result(request_obj.get("id"), {"tools": worker_tools + local_tools})
 
 
