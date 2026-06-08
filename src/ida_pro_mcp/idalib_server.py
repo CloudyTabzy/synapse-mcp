@@ -724,6 +724,46 @@ def main():
             )
         return result
 
+    # Tools that return a result directly on the reader thread, never entering
+    # @idasync → execute_sync.  The idalib worker's main thread is consumed by
+    # the stdio read loop, so execute_sync can deadlock even on idle databases.
+    # These two tools are the ones agents MUST be able to call to check state.
+    _SHORT_CIRCUIT_TOOLS: frozenset[str] = frozenset({
+        "analysis_status", "server_health",
+    })
+
+    def _server_health_fast_response() -> dict:
+        """Minimal server_health response — reader-thread safe."""
+        result: dict[str, Any] = {"ok": True}
+        try:
+            state = ida_auto.get_auto_state()
+            au_none = getattr(ida_auto, "AU_NONE", 0)
+            result["auto_analysis_ready"] = (state == au_none)
+            result["analysis_complete"] = (state == au_none)
+            if state != au_none:
+                result["analysis_phase"] = f"phase_{state}"
+        except Exception:
+            result["auto_analysis_ready"] = None
+        return result
+
+    # ── analysis_in_progress error response ──────────────────────────────────
+    _ANALYSIS_BLOCKED_RESPONSE: str = json.dumps({
+        "jsonrpc": "2.0",
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({
+                "ok": False,
+                "error": "analysis_in_progress",
+                "error_type": "AnalysisInProgress",
+                "message": (
+                    "Auto-analysis is still running on the idalib worker. "
+                    "Tools are blocked until it finishes. Call analysis_status() "
+                    "to check — once is_complete is true, retry this call."
+                ),
+            })}],
+            "isError": True,
+        },
+    })
+
     def _is_analysis_blocked(tool_name: str) -> bool:
         """True when auto-analysis is active and the tool must be gated."""
         if tool_name in _ANALYSIS_WHITELIST:
@@ -752,22 +792,20 @@ def main():
         tool_name = params.get("name", "")
         rid = request.get("id")
 
-        # ── analysis_status: answer directly on the reader thread ──────────
-        if tool_name == "analysis_status":
-            # If analysis IS running, serve a fast response (avoids the
-            # execute_sync deadlock). If analysis is done, fall through to
-            # the normal path so the real tool can enrich the response with
-            # phase labels etc.
-            if _analysis_is_running():
-                resp = json.loads(json.dumps({
-                    "jsonrpc": "2.0",
-                    "result": {"content": [{"type": "text", "text": json.dumps(
-                        _analysis_status_fast_response()
-                    )}]},
-                }))
-                resp["id"] = rid
-                return resp
-            return _orig_dispatch(request)
+        # ── Short-circuited tools: answer directly on the reader thread ────
+        # These never enter @idasync → execute_sync, which hangs in headless
+        # mode because the idalib main thread is consumed by the stdio loop.
+        if tool_name in _SHORT_CIRCUIT_TOOLS:
+            if tool_name == "analysis_status":
+                inner = _analysis_status_fast_response()
+            else:
+                inner = _server_health_fast_response()
+            resp = json.loads(json.dumps({
+                "jsonrpc": "2.0",
+                "result": {"content": [{"type": "text", "text": json.dumps(inner)}]},
+            }))
+            resp["id"] = rid
+            return resp
 
         # ── normal tool call: gate if analysis is running ──────────────────
         if not _is_analysis_blocked(tool_name):

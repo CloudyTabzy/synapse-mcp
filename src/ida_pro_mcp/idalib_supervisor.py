@@ -2900,6 +2900,20 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     forwarded.setdefault("params", {})["arguments"] = arguments
     try:
         return sup.forward_raw(session, forwarded)
+    except TimeoutError:
+        return _jsonrpc_result(request_id, _call_tool_result({
+            "error": "worker_unresponsive",
+            "error_type": "WorkerUnresponsive",
+            "message": (
+                f"The idalib worker for session '{session.session_id}' did not "
+                f"respond to '{tool_name}'. This is a known headless-mode "
+                f"limitation — the worker's main thread may be blocked. "
+                f"Check analysis_status() to verify the database state, or "
+                f"reopen the database with idalib_open(). If the problem "
+                f"persists, use the GUI plugin mode instead."
+            ),
+            "session_id": session.session_id,
+        }, is_error=True))
     except WorkerCrashedError as e:
         diag = sup.handle_worker_crash(e.worker, action=f"tool '{tool_name}'")
         return _jsonrpc_result(request_id, _call_tool_result(diag, is_error=True))
