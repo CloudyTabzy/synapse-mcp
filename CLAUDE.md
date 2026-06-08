@@ -1,166 +1,112 @@
-# CLAUDE.md
+# CLAUDE.md — Developer Guide
 
-Guidance for working in this repository.
+Guidance for contributors and AI agents building tools in this repository.
+
+---
 
 ## What this project is
 
-Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that evolves IDA Pro into a **comprehensive binary analysis powerhouse** for AI agents. Built-in symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, and cross-engine hybrid workflows — all as native MCP tool modules, with no separate servers required.
+Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that extends IDA Pro with **14 analysis engines** and **360+ tools** — all registered through the same `@tool @idasync` machinery.
 
-Main pieces:
-- `src/ida_pro_mcp/server.py`: MCP server entrypoint (proxy to IDA plugin)
-- `src/ida_pro_mcp/idalib_server.py`: headless idalib server
-- `src/ida_pro_mcp/idalib_supervisor.py`: multi-worker supervisor for headless mode
-- `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs (25 modules, 160+ tools)
-- `src/ida_pro_mcp/installer.py`: MCP client config generation and plugin installation
+**Main pieces:**
+- `src/ida_pro_mcp/server.py` — MCP server entrypoint (proxy dispatcher; lazy mode lives here)
+- `src/ida_pro_mcp/idalib_supervisor.py` — headless idalib worker supervisor
+- `src/ida_pro_mcp/idalib_server.py` — headless idalib server
+- `src/ida_pro_mcp/ida_mcp/` — IDA/plugin-side APIs (all `api_*.py` modules)
+- `src/ida_pro_mcp/installer.py` — MCP client config generation and plugin installation
+- `tests/` — standalone pytest tests (no IDA needed): protocol compliance + server transport
+- `skills/` — ~13 workflow playbooks teaching agents how to use the tools
 
-Core API modules (upstream + enhanced):
-- `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries; `list_functions_enhanced` (is_thunk/is_library/is_noret/has_prototype/is_external flags); `list_classes` (C++ namespace/class inventory from mangled names)
-- `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling; `decompile_batch`; `get_function_callers` / `callees` for bidirectional caller-callee lookup; `get_function_signature` (IDB type + Hex-Rays fallback); `get_function_jump_targets` (control-flow triage without full CFG); `get_function_hash` + `get_bulk_function_hashes` (SHA-256 of normalised opcodes — stable across rebase, useful for cross-binary matching); `analyze_function_completeness` + `batch_analyze_completeness` (0–100 documentation score: custom name, type, comment, named stack vars, inline comments); `diff_functions` (unified diff of two decompiled functions with similarity score)
-- `api_memory.py`: bytes/ints/strings read and patch, typed integer I/O
-- `api_types.py`: structs, type inference, type application, enum management, constructor analysis (`analyze_constructor` — extracts field layout from `*(this+N)=value` patterns, detects vtable pointer writes, memset/memcpy zero-regions, and delegating constructor calls); `struct_recovery` (single-function struct layout inference — decompiles a function, walks the ctree, and automatically surfaces ALL pointer variables with field accesses at ≥2 distinct offsets; complements `type_propagate` which requires naming a specific variable)
-- `api_modify.py`: comments, renaming, asm patching, function definition, forced range analysis (`analyze_range`), bulk function creation (`scan_and_define_funcs`), user xref creation (`add_xref`)
-- `api_stack.py`: stack frame operations
-- `api_sigmaker.py`: signature creation, scanning, xref-based signature generation
-- `api_debug.py`: debugger control, breakpoints, `sync_debugger_to_idb` (live memory → IDB patch + analysis), unsafe / low priority for tests
-- `api_python.py`: execute Python in IDA context
-- `api_resources.py`: `ida://`, `triton://`, `miasm://` MCP resources
-- `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates (`find_vtable_candidates` auto-detects bitness), `dump_vtable` (read a full vtable by address or class name pattern), indirect calls with diagnostic output, cleanup/method resolution, function prologue detection; `resolve_com_vtable` (built-in COM/DirectX vtable database — IUnknown/IDXGISwapChain/1/2/3/4, IDirect3DDevice9, ID3D11Device, ID3D12CommandQueue; lookup by interface+slot, reverse-lookup by method name, or cross-reference vtable address against known layouts); `find_render_loop` (ASM-level scan for IDXGISwapChain::Present, IDXGISwapChain1::Present1, IDirect3DDevice9::Present, ID3D12CommandQueue::ExecuteCommandLists — returns containing function + call site address)
-- `api_flirt.py`: FLIRT signature management tools — apply signatures, load type libraries, and suggest names for unidentified functions via structural similarity scoring (prologue match, callee Jaccard, string xref overlap)
-- `api_survey.py`: one-call binary triage (metadata, segments, imports, strings, statistics)
-- `api_composite.py`: multi-step composite operations and cross-engine workflows
-- `api_discovery.py`: instance discovery and proxying (`list_instances`, `select_instance`, `get_active_instance` — unambiguously shows which IDB is currently active)
-- `api_tasks.py`: async task queue for long-running operations
+**Server name:** The server identifies itself as `synapse-mcp`, defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME`.
 
-Optional analysis engine modules (this fork):
-- `api_triton.py`: Triton symbolic execution — context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, snapshots, instruction trace replay, IDA annotation. Requires `pip install triton-library`.
-- `api_miasm.py`: Miasm IR analysis — IR lifting, SSA, CFG analysis, dead-code elimination, symbolic emulation, data-flow tracing, cross-arch assembly/patching, CFG summary, path constraint solving, IDA annotation. Requires `pip install miasm future`.
-- `api_composite.py`: Hybrid cross-engine workflows — `hybrid_analyze_function` (Miasm deobfuscation + Triton symbolic execution), `hybrid_deobfuscate_and_patch` (dead-code detection + safe patching), and `hybrid_iterative_deobfuscate` (iterative Miasm simplification loop with Triton equivalence verification until convergence).
-- `api_construct.py`: Declarative binary format parsing — PE/ELF/protocol header extraction, custom struct templates, safe DSL evaluator, IDA struct bridge, heuristic guessing, struct scanning. Requires `pip install construct`.
-- `api_cstruct.py`: C-syntax binary structure parsing — C-style struct/enum/typedef definitions, pre-built Windows & ELF headers, serialization round-trips, per-endian registry isolation. Requires `pip install dissect.cstruct`.
-- `api_filetype.py`: Magic-byte file type identification — 79+ format detection from buffers, IDA addresses, or segments. Requires `pip install filetype`.
-- `api_lief.py`: LIEF binary format analysis — `lief_info`, `lief_checksec`, `lief_sections`, `lief_imports`, `lief_exports`, `lief_strings`, `lief_tls_callbacks`, `lief_verify_signature` (Authenticode chain verification), `lief_rich_header` (PE compiler fingerprinting), `lief_pe_overlay` (packed/SFX detection), `lief_guard_functions` (CFG table), `lief_compare_to_idb` (raw file vs IDB diff), `lief_add_section`, `lief_patch_import`, `lief_strip_metadata`, `hybrid_lief_yara_section_scan`, `hybrid_lief_checksec_exploit_assess`, `hybrid_lief_sync_symbols`. Requires `pip install lief`. Extended features (DWARF/PDB debug symbols) require LIEF Extended (commercial).
-- `api_yara.py`: YARA signature-based scanning — `yara_scan` (custom rules against IDB range, whole binary, or raw file), `yara_scan_builtin_crypto` (AES/MD5/SHA/CRC32/RC4 constants, no external files), `yara_scan_builtin_threats` (packers, C2 frameworks, hack tools, shellcode), `yara_rule_validate` (syntax check without scanning), `yara_generate_rule` (generate rule from IDA function bytes with pointer wildcarding ⭐), `yara_idb_annotate` (scan all functions + auto-annotate/rename with YARA-derived names ⭐ KILLER FEATURE), `yara_function_classifier` (per-function category heat map), `hybrid_yara_lief_profile` (section-isolated YARA + LIEF checksec → threat profile), `hybrid_yara_triton_verify_crypto` (YARA finds crypto → Triton confirms via symbolic execution), `hybrid_yara_miasm_deobfuscate` (YARA detects packer stubs → Miasm lifts and simplifies). Requires `pip install yara-python`.
-- `api_angr.py`: Angr symbolic execution engine — `angr_status`, `angr_load_segment`, `angr_cfg_fast`, `angr_cfg_from_ida`, `angr_diff_cfg`, `angr_find_paths` (⭐ KILLER FEATURE — stdin/argv symbolic modeling solves serial-key crackmes Triton cannot), `angr_enumerate_reachable`, `angr_state_evaluate`, `angr_hook_function` (skip/observe SimProcedures), `angr_backward_slice` (CFG-only fast path or DDG-backed precise mode), `angr_value_set`, `angr_snapshot_save`/`angr_snapshot_restore`, `hybrid_angr_triton_solve` (angr finds the path → Triton enriches with deep register-level state), `hybrid_angr_stdin_fuzz` (char-class-constrained input enumeration), `hybrid_angr_miasm_path`, `hybrid_angr_triton_decompile`, `hybrid_angr_z3_formula` (export SMT-LIB2 path constraints), `hybrid_angr_unicorn_concrete` ⚠️ (Unicorn decrypts packed section → angr loads + CFGs the revealed code — Phase 6.4), `workflow_solve_crackme` (⭐ one-call end-to-end serial solver with auto-detect via IDB string xrefs), `workflow_trace_data_flow`, `workflow_find_gadgets` (ROP/JOP), `workflow_enum_code_hints` (prefix constraints across paths). Requires `pip install angr` (~200 MB; NOT in `--install-deps all`).
-- `api_unicorn.py`: Unicorn concrete CPU emulation — `unicorn_status`, `unicorn_emulate` (IDA-segment bridge, deadline-timer, anti-debug bypass), `unicorn_trace` (block/insn/full trace + loop detection), `unicorn_call_function` (SysV x64/MSVC x64/cdecl calling convention), `unicorn_emulate_and_patch` ⚠️ (decrypt stub → patch IDB — the encrypted-section killer tool), `unicorn_diff_memory` (dry-run before/after diff), `unicorn_emulate_shellcode` (Linux syscall interception), `unicorn_recover_stackstrings` (stack-write interception → ASCII/UTF-16LE), `unicorn_find_memory_accesses` (all R/W + hot-region detection), `unicorn_resolve_api_hash` (brute-map hash function vs ~200 WinAPI names), `workflow_unicorn_decrypt_analyze` ⚠️ (emulate→patch→analyze→define one-call), `hybrid_unicorn_triton_analyze` (Unicorn concrete prefix → Triton symbolic suffix), `hybrid_unicorn_miasm_hot_blocks` (exec trace → Miasm lifts hot blocks only), `hybrid_unicorn_networkx_exec_graph` (multi-trace → NetworkX dispatcher/loop detection). Requires `pip install unicorn` (included in `--install-deps all`).
-- `api_networkx.py`: Graph analysis engine — `nx_status`, `nx_call_graph` (cached LRU), `nx_function_cfg`, `nx_xref_graph`, `nx_subgraph`, `nx_graph_metrics`, `nx_central_functions` (PageRank + betweenness + degree centrality ranking), `nx_shortest_path`, `nx_all_paths`, `nx_cycles`, `nx_strongly_connected`, `nx_neighborhood`, `nx_dominators` (with natural loop header detection), `nx_communities` (Louvain / label-prop / modularity), `nx_topological_order`, `nx_graph_diff` (with name_alignment for cross-binary diffs), `nx_export_graph` (DOT/GraphML/GML/JSON), `hybrid_nx_angr_target_ranking` (centrality-driven symex target recommendations), `hybrid_nx_yara_cluster_detection` (YARA categories + community detection → behavior-labeled clusters), `hybrid_nx_lief_import_graph` (module-centrality), `hybrid_nx_triton_taint_graph`, `workflow_reveng_overview` (⭐ KILLER FEATURE — one-call first-pass binary overview: ranked function importance + SCCs + Louvain communities + YARA labels + prioritized recommendations), `workflow_find_critical_paths` (entry → dangerous-import paths), `workflow_binary_diff_summary` (structural diff with similarity score). Requires `pip install networkx>=3.0` (small, pure-Python; included in `--install-deps all`).
-- `api_numpy.py`: NumPy-accelerated numerical binary analysis — `numpy_status`, `numpy_entropy_map` (block-level Shannon entropy heatmap with contiguous high-entropy run detection — ⭐ packed/encrypted section triage; reveals the internal structure a single per-section entropy value hides), `numpy_byte_histogram` (256-bucket byte distribution + chi-square uniformity test — distinguishes AES/stream-cipher output from XOR obfuscation from plaintext/code in one call), `numpy_xor_key_recovery` (⭐ repeating-XOR key recovery — index-of-coincidence key-length detection via GCD-of-peaks + per-column frequency analysis, validated by a printable/null-run/entropy composite fitness; handles single-byte through multi-byte keys on text and binary plaintext), `numpy_function_similarity` (bytecode-level cosine / EMBER byte-entropy / NCC similarity — complements `find_similar_functions` semantic search by catching byte-level clones), `numpy_opcode_histogram` (instruction mnemonic frequency profile + branch/call/arith/nop ratios + mnemonic-distribution entropy + obfuscation anomaly flags — triage junk/obfuscation without a full decompile), `numpy_memmap_scan` (memory-mapped byte-pattern search with `??` wildcards over any file on disk — large files without RAM limits; not IDA-bound), `numpy_binary_similarity` (whole-file byte-distribution similarity between two binaries — "is this dropped payload / sibling DLL a variant?"; either path defaults to the active IDB source, so you can compare against a file without loading it), `numpy_value_scan` (interpret a raw/decrypted region as a typed integer/float array and classify it — pointer_table / counter_or_sequence / constant / mixed_data — for triaging blobs IDA hasn't typed). `lief_sections`, `get_bulk_function_hashes`, and `func_query` now also carry a `summary` block (mean/median/stdev/min/max/percentiles via the pure-Python `summary_stats` helper in `utils.py`). NumPy's value here is additive — these operate on large agent-chosen regions (tens of thousands of entropy blocks) where vectorization delivers a real 10–50× win; the existing pure-Python entropy/similarity helpers run on tiny inputs and are intentionally left alone. Shared availability guard + canonical `np_entropy` live in `ida_mcp/numpy_compat.py`. Requires `pip install numpy>=2.0.0` (included in `--install-deps all`).
+---
 
-**Instruction trace (Triton):** Each session maintains a `deque` of executed instruction addresses (max 10,000). On `triton_snapshot_save`, the trace is stored in the snapshot. On `triton_snapshot_restore`, it is replayed to rebuild the path predicate. The `triton_replay_instructions` tool gives AI agents manual control over custom instruction sequences.
+## Adding a new tool
 
-**Server name:** The MCP server identifies itself to clients as `synapse-mcp`. The canonical name is defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME` and imported by `server.py`, `idalib_supervisor.py`, and `installer.py` — no duplication.
+1. Choose the right `api_*.py` module.
+2. Define a `TypedDict` for the return type.
+3. Apply `@tool` then `@idasync` (in that order — `@tool` is the outer decorator).
+4. The docstring becomes the MCP tool description — write it for an AI reader, not a human dev.
+5. Add a test in `tests/test_api_*.py`.
 
-**Return-type design principle:**
-Every tool in this fork returns a **structured `dict` / `TypedDict`**, never raw strings or untyped lists. This is intentional:
-- AI agents parse fields programmatically without regex.
-- Consistent error shape: `{"ok": false, "error": "..."}` across all modules.
-- Downstream tools can chain outputs directly.
-
-If you find a tool that returns a plain string where a dict is expected, that's a bug — fix it.
-
-Workflow skills (`skills/`):
-- `binary-survey`: Initial reconnaissance — metadata, segments, imports, strings, function triage
-- `stripped-binary-recovery`: Recover semantics from stripped binaries — FLIRT signatures, code gaps, string xrefs, constant matching, call-graph hub analysis, structural similarity
-- `function-deep-dive`: Thorough single-function analysis — decompile, disasm, xrefs, control flow, stack frame, rename, type, comment
-- `triton-symbolic-exec`: Symbolic execution workflows — one-shot, instruction-by-instruction, taint analysis, branch-target solving
-- `miasm-ir-analysis`: IR analysis workflows — CFG metrics, SSA, deobfuscation, data-flow tracing, path solving
-- `hybrid-deobfuscate`: Cross-engine deobfuscation — Miasm simplification → Triton analysis → optional patching
-- `vuln-hunter-static`: Static vulnerability hunting — dangerous API enumeration, xref analysis, input validation checks
-- `idapython`: IDAPython scripting workflows — py_eval patterns, common IDA API idioms
-
-## Optional-import pattern
-
-All optional modules guard their tool registrations so the plugin loads cleanly when the engine is absent:
-
-```python
-try:
-    import triton as _triton_lib
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-
-# One status probe tool is always registered (outside the guard)
-# It returns a dict so AI agents can check availability programmatically
-@tool
-@idasync
-def triton_status() -> dict: ...
-
-# All other tools are inside the guard
-if TRITON_AVAILABLE:
-    @tool
-    @idasync
-    def triton_init(...): ...
-```
-
-`__init__.py` imports all modules inside `try/except Exception: pass` so a bad install can't break the plugin.
-
-## Core implementation rules
-
-### IDA thread safety
-All IDA SDK calls must run on the main thread.
-Use:
 ```python
 from .rpc import tool
 from .sync import idasync
 
+class MyResult(TypedDict):
+    ok: bool
+    value: str
+
+@tool
+@idasync
+def my_new_tool(
+    address: Annotated[str, "Target address (hex or symbol name)"],
+) -> MyResult:
+    """One-sentence description of what this tool does for an AI agent."""
+    ea = parse_address(address)
+    ...
+    return {"ok": True, "value": ...}
+```
+
+### Adding a new optional-engine module
+
+1. Create `api_<engine>.py`.
+2. Guard tool registrations with `if ENGINE_AVAILABLE:` block.
+3. Register a `*_status` probe tool **outside** the guard so it always reports availability.
+4. In `__init__.py`, import the module inside `try/except Exception: pass` so a missing dependency doesn't break the plugin.
+5. In `pyproject.toml`, add the dependency to `[project.optional-dependencies]` and the `all` group.
+6. Add a `*_status` entry to `_TOOL_MODULE_PREFIXES` in `rpc.py` for lazy-mode grouping.
+7. Sync + restart + verify.
+
+---
+
+## Core implementation rules
+
+### IDA thread safety
+
+All IDA SDK calls must execute on the main thread. Use:
+
+```python
 @tool
 @idasync
 def my_tool(...):
     ...
 ```
 
-Decorator order matters: `@tool` is outer, `@idasync` is inner.
+`@idasync` wraps the call in `ida_auto.execute_sync()`. Do not call IDA APIs outside of `@idasync`-decorated functions.
 
-For unsafe operations:
-```python
-from .rpc import tool, unsafe
+### Return-type convention
 
-@unsafe
-@tool
-@idasync
-def dangerous_op(...):
-    ...
-```
-
-### API conventions
-- Prefer batch-first APIs.
-- Many functions accept either a comma-separated string or a list.
-- Use full type hints and `Annotated[...]` descriptions.
-- The function docstring becomes the MCP tool description.
-
-Example:
-```python
-def my_api(addrs: Annotated[str, "Addresses (0x401000, main) or list"]) -> list[dict]:
-    ...
-```
+Every tool returns a **structured `dict` / `TypedDict`** — never raw strings or untyped lists:
+- Success: `{"ok": true, ...}`
+- Failure: `{"ok": false, "error": "descriptive message"}`
+- **Never `raise IDAError(...)`** from within a tool function body — the exception propagates as an ugly JSON-RPC traceback. Return the error dict instead.
+- The internal `_MiasmManager` methods and `_trace_data_flow_internal` helper may still raise, but all `@tool @idasync` public functions must return error dicts.
 
 ### Canonical parameter names
 
-Use these names consistently. The server proxy normalizes common aliases (e.g. `address`→`addr`, `max_results`→`limit`) for backward compat, but new tools must use the canonical name.
+The server proxy normalizes old aliases for backward compat, but **new tools must use the canonical name**:
 
 | Concept | Canonical name | Notes |
 |---------|---------------|-------|
-| Single address (hex or symbol) | `addr` | Not `address`, not `ea`, not `func_addr` unless the param is exclusively a function address |
+| Single address (hex or symbol) | `addr` | Not `address`, `ea`, or `func_addr` |
 | List of addresses | `addrs` | Accepts comma-separated string or Python list via `normalize_list_input()` |
-| Address range start | `start` | Pair with `end`; these are address params, not pagination |
-| Address range end | `end` | Exclusive upper bound |
-| Hard cap on results returned | `limit` | Not `max_results`, `max_entries`, or `count` |
-| Paginated list size | `count` | Used in list_*/query tools alongside `offset` |
-| Page start position | `offset` | Not `start` (which is an address), not `skip` |
-| Pagination resume token | `cursor` | Opaque value from previous response; used in `search_text` and streaming tools |
-| Name/glob filter | `filter` | For glob patterns against entity names in core list/query tools |
-| Text/pattern search | `pattern` | For regex, glob, or substring search across content |
-| Binary file path | `file_path` | Not `path`, not `binary_path` |
-| Output file path | `output_path` | Not `out_path`, not `output` |
+| Address range start/end | `start` / `end` | These are address params, not pagination |
+| Hard cap on results | `limit` | Not `max_results`, `max_entries`, or `count` |
+| Paginated list size | `count` | Used in `list_*/query` tools alongside `offset` |
+| Page start position | `offset` | Not `start` (which is an address) or `skip` |
+| Pagination resume token | `cursor` | Opaque value from previous response |
+| Name/glob filter | `filter` | For glob patterns against entity names |
+| Text/pattern search | `pattern` | For regex, glob, or substring search |
+| Binary file path | `file_path` | Not `path` or `binary_path` |
+| Output file path | `output_path` | Not `out_path` or `output` |
 
-Aliases accepted by the proxy (old → canonical): `address`→`addr`, `addresses`→`addrs`, `max_results`→`limit`, `max_entries`→`limit`, `search_text.start`→`search_text.cursor`.
-
-### Common helpers
-- Parse addresses with `parse_address()`
-- Normalize batch input with `normalize_list_input()` / `normalize_dict_list()`
-- Use shared pagination / filtering helpers from `utils.py`
+Aliases accepted by the proxy (old → canonical): `address`→`addr`, `addresses`→`addrs`, `max_results`→`limit`, `max_entries`→`limit`.
 
 ### Unsafe operations
-Debugger or destructive operations should be marked unsafe:
+
+Destructive or debugger operations use `@unsafe`:
+
 ```python
 from .rpc import tool, unsafe
 
@@ -171,133 +117,100 @@ def dangerous_op(...):
     ...
 ```
 
+Unsafe tools are disabled by default and require the `--unsafe` flag. `miasm_patch_instruction` and `hybrid_deobfuscate_and_patch` (with `dry_run=False`) are examples.
+
+### Output size
+
+Responses >50 KB are auto-truncated with an `output_id` and served via download URL. Handled by `rpc.py` — no per-tool handling needed.
+
+### Error handling principle
+
+Every tool returns a structured `dict`. On success, it includes `{"ok": true, ...}`. On failure, it returns `{"ok": false, "error": "descriptive message"}`. **Never `raise IDAError(...)` from within a tool function body** — the exception propagates as an ugly JSON-RPC traceback to the AI client. Return the error dict instead. The internal `_MiasmManager` methods and `_trace_data_flow_internal` helper may still raise, but all `@tool @idasync` public functions must return error dicts.
+
+### Lazy-mode grouping
+
+When the server runs with `--lazy`, `tools/list` returns only 4 meta-tools. Every new tool must be grouped:
+
+- **Prefix-based**: If the tool has a distinctive prefix (e.g., `triton_`, `miasm_`, `lief_`), add it to `_TOOL_MODULE_PREFIXES` in `rpc.py`. This auto-maps all tools with that prefix to a group.
+- **Exact-name**: For tools without a prefix, add to `_TOOL_MODULE_EXACT` in `rpc.py`.
+- **Fallback**: Tools that fall through to `core` trigger a startup warning from `_validate_groups()`.
+
+---
+
 ## Development commands
 
-### Run
+### Run the MCP server
+
 ```bash
-# Normal mode — exposes all 160+ tools (default; backward compatible)
+# Normal mode (all tools)
 uv run ida-pro-mcp
 
-# Lazy mode — exposes 4 meta-tools only (~95% context reduction, recommended for agents)
+# Lazy mode (4 meta-tools, ~95% context reduction)
 uv run ida-pro-mcp --lazy
-
-# Override a saved --lazy config back to full tools for one session
-uv run ida-pro-mcp --no-lazy
 
 # HTTP transport
 uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
-uv run ida-pro-mcp --lazy --transport http://127.0.0.1:8744/sse
 
-# Headless idalib
+# Headless
 uv run idalib-mcp --stdio path/to/binary
-uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/binary
-uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/binary
 
-# Unsafe mode (enables debugger tools etc.)
+# Unsafe mode (debugger tools)
 uv run ida-pro-mcp --unsafe
 ```
 
-### Lazy mode meta-tools
-When running with `--lazy`, the server exposes exactly 4 tools instead of 160+:
+### Install optional engines
 
-| Tool | Purpose |
-|---|---|
-| `list_modules` | List tool groups with live counts. Description embeds the full group directory (top tool names per group) so agents can skip calling this and go straight to `invoke_tool` if they know the name. |
-| `list_tools(module=..., search=..., limit=50, offset=0)` | List tools with one-line descriptions. Use `search=` for keyword lookup across all groups — much cheaper than browsing. Use `module=` to see a full group. Both can be combined. |
-| `describe_tool(name)` | Get the full input schema for a specific tool. Response includes `module` field. |
-| `invoke_tool(tool, args)` | Call any tool by name. Put ALL tool arguments inside `args={...}`. Never place tool inputs beside `tool` at the top level — they are silently ignored. |
+```bash
+# Single engine
+uv run ida-pro-mcp --install-deps triton
+uv run ida-pro-mcp --install-deps yara
+uv run ida-pro-mcp --install-deps xor   # z3-solver
 
-**Optimized discovery paths (cheapest first):**
-1. Know the name → `invoke_tool` directly (0 discovery calls)
-2. Know a keyword → `list_tools(search='keyword')` → `invoke_tool` (1 call)
-3. Know the group → `list_tools(module='analysis')` → `invoke_tool` (1 call)
-4. Exploring → `list_modules` → `list_tools(module=...)` → `invoke_tool` (2 calls)
+# All at once (excludes angr which is ~200 MB)
+uv run ida-pro-mcp --install-deps all
+```
 
-**Cache behaviour:** Populated on first `list_tools`, `describe_tool`, or `invoke_tool` call. The `list_modules` description is built with live counts at startup. Call `invoke_tool(tool='__reset_cache__')` to force a refresh (e.g. after IDA loads a new IDB).
+### MCP client config
+
+```bash
+uv run ida-pro-mcp --config
+uv run ida-pro-mcp --config --lazy
+```
 
 ### MCP inspector
+
 ```bash
 uv run mcp dev src/ida_pro_mcp/server.py
 ```
 
-### Generate MCP client config
-```bash
-# Normal mode config (all tools)
-uv run ida-pro-mcp --config
-
-# Lazy mode config (4 meta-tools, --lazy in args)
-uv run ida-pro-mcp --config --lazy
-```
-
 ### Install / uninstall plugin
+
 ```bash
 uv run ida-pro-mcp --install
-uv run ida-pro-mcp --install --lazy   # writes --lazy into the generated MCP client config
 uv run ida-pro-mcp --uninstall
 ```
 
-### Install optional analysis engines
-```bash
-# Triton symbolic execution
-uv run ida-pro-mcp --install-deps triton
-# Miasm IR analysis
-uv run ida-pro-mcp --install-deps miasm
-# Construct declarative parsing
-uv run ida-pro-mcp --install-deps construct
-# dissect.cstruct + filetype
-uv run ida-pro-mcp --install-deps cstruct
-# LIEF binary format analysis
-uv run ida-pro-mcp --install-deps lief
-# YARA signature scanning
-uv run ida-pro-mcp --install-deps yara
-# NetworkX graph analysis (small; INCLUDED in --install-deps all)
-uv run ida-pro-mcp --install-deps networkx
-# Angr symbolic execution (~200 MB; NOT in --install-deps all)
-pip install angr
-# Unicorn concrete emulation (included in --install-deps all)
-uv run ida-pro-mcp --install-deps unicorn
-# All at once (excludes angr)
-uv run ida-pro-mcp --install-deps all
-# TOON token-efficient encoding. Install into the Python that serializes responses:
-#   direct HTTP transport  -> IDA's Python (the one idapyswitch points at)
-#   stdio proxy            -> the MCP server's Python
-# Installing in both is safe.
-pip install toon_format
-```
+---
 
-### Verify installation
-After connecting your MCP client, call the probe tools:
-```
-triton_status      # → {"ok": true, "available": true, ...}
-miasm_status       # → {"ok": true, "available": true, ...}
-construct_status   # → {"ok": true, "available": true, ...}
-cstruct_status     # → {"ok": true, "available": true, ...}
-filetype_status    # → {"ok": true, "available": true, ...}
-lief_status        # → {"ok": true, "available": true, "version": "0.17.x", ...}
-yara_status        # → {"ok": true, "available": true, "version": "4.5.x", ...}
-angr_status        # → {"ok": true, "available": true, "version": "9.2.x", "claripy_version": "9.2.x", ...}
-nx_status          # → {"ok": true, "available": true, "version": "3.x", "cached_graphs": 0, ...}
-unicorn_status     # → {"ok": true, "available": true, "version": "2.1.x", "archs": [...], ...}
-```
+## Testing
 
-## Testing and coverage
+### IDA-side tests (headless)
 
-### Run tests
-Use the headless test runner:
 ```bash
 uv run ida-mcp-test tests/crackme03.elf -q
 uv run ida-mcp-test tests/typed_fixture.elf -q
 uv run ida-mcp-test tests/crackme03.elf -c api_analysis
-uv run ida-mcp-test tests/typed_fixture.elf -p "*stack*"
+uv run ida-mcp-test tests/crackme03.elf -p "*xor*"
 ```
 
-Notes:
-- Use `uv run ...`
-- Non-interactive output should show failures only plus a summary
-- Binary-specific tests should use `@test(binary="...")` with the executable basename
+### Standalone pytest (no IDA)
+
+```bash
+uv run pytest tests/ -q
+```
 
 ### Coverage
-Measure coverage across both maintained fixtures:
+
 ```bash
 uv run coverage erase
 uv run coverage run -m ida_pro_mcp.test tests/crackme03.elf -q
@@ -305,82 +218,87 @@ uv run coverage run --append -m ida_pro_mcp.test tests/typed_fixture.elf -q
 uv run coverage report --show-missing
 ```
 
-Current fixture intent:
-- `tests/crackme03.elf`: compact general regression fixture
-- `tests/typed_fixture.elf`: typed globals / structs / locals / stack coverage fixture
+### Test conventions
 
-### Test expectations
-- Prefer semantic assertions, not weak "field exists" checks
-- Prefer round-trip tests for mutating APIs
-- If tests expose clearly wrong API behavior, fix the API instead of weakening the test
-- Focus on IDA-facing modules, not server/config plumbing
-- Expect some IDA / Hex-Rays variance; guarded assertions or runtime skips are acceptable when justified
+- Use `@test()` decorator from `framework.py`.
+- Use `@test(binary="crackme03.elf")` for fixture-specific tests.
+- Guard optional-engine tests: `pytestmark = pytest.mark.skipif(not MIASM_AVAILABLE, ...)`.
+- Prefer semantic assertions over weak "field exists" checks.
+- Prefer round-trip tests for mutating APIs.
+- If tests expose clearly wrong API behaviour, fix the API instead of weakening the test.
+- Expect some IDA / Hex-Rays variance; guarded assertions or runtime skips are acceptable.
+- When adding generic tests, also try a non-fixture binary to avoid ELF-specific assumptions.
 
-### Generic-test sanity check
-When adding generic tests, also try a non-fixture binary to avoid ELF-specific assumptions:
-```bash
-uv run ida-mcp-test "C:\CodeBlocks\x64dbg\bin\x64\x64dbg.dll" -q
-```
+---
+
+## Module index
+
+| Module | Tools | Purpose |
+|--------|------:|---------|
+| `api_core.py` | 18 | IDB metadata, functions, strings, imports, entity queries |
+| `api_analysis.py` | 35 | Decompilation, disassembly, xrefs, callgraph, feature analysis, XOR pattern detection |
+| `api_memory.py` | 7 | Bytes/ints/strings read and patch |
+| `api_types.py` | 12 | Structs, type inference, type application, enum management |
+| `api_modify.py` | 12 | Comments, renaming, asm patching, function definition |
+| `api_stack.py` | 3 | Stack frame variables |
+| `api_sigmaker.py` | 5 | Signature creation and scanning |
+| `api_debug.py` | 24 | Debugger control, breakpoints, `sync_debugger_to_idb` (unsafe) |
+| `api_python.py` | 2 | Execute Python in IDA context |
+| `api_recon.py` | 11 | Stripped binary recon, vtable scanning, indirect call detection |
+| `api_flirt.py` | 4 | FLIRT signature application |
+| `api_survey.py` | 1 | One-call binary triage |
+| `api_composite.py` | 11 | Multi-step composite + cross-engine workflows |
+| `api_discovery.py` | 6 | Instance discovery and proxying |
+| `api_tasks.py` | 4 | Async task queue |
+| `api_triton.py` | 51 | Symbolic execution, taint, SMT solving |
+| `api_miasm.py` | 22 | IR lifting, SSA, deobfuscation, cross-arch assembly |
+| `api_construct.py` | 10 | Declarative format parsing |
+| `api_cstruct.py` | 7 | C-syntax struct parsing |
+| `api_filetype.py` | 4 | Magic-byte file type identification |
+| `api_lief.py` | 26 | Binary format analysis, checksec, signatures |
+| `api_yara.py` | 11 | Signature scanning, crypto/threat detection |
+| `api_angr.py` | 23 | Symbolic execution, stdin/argv solving |
+| `api_networkx.py` | 24 | Graph metrics, centrality, communities |
+| `api_numpy.py` | 9 | Entropy maps, byte histograms, XOR recovery, similarity |
+| `api_unicorn.py` | 14 | Concrete CPU emulation, decrypt-and-patch |
+| `api_xor.py` | 3 | Universal XOR cipher solver (always-on) |
+
+---
 
 ## Scope priorities
 
-High priority:
-- `api_analysis.py`
-- `api_types.py`
-- `api_modify.py`
-- `api_stack.py`
-- `api_memory.py`
-- `api_core.py`
-- `api_resources.py`
-- `api_triton.py`
-- `api_miasm.py`
-- `api_composite.py` (hybrid tools)
-- `api_construct.py`
-- `api_cstruct.py`
-- `api_filetype.py`
-- `api_recon.py`
-- `api_tasks.py`
-- `utils.py`
-- `framework.py`
+**High:** `api_analysis.py`, `api_types.py`, `api_modify.py`, `api_memory.py`, `api_core.py`, `api_triton.py`, `api_miasm.py`, `api_construct.py`, `api_cstruct.py`, `api_filetype.py`, `api_lief.py`, `api_yara.py`, `api_angr.py`, `api_networkx.py`, `api_numpy.py`, `api_unicorn.py`, `api_xor.py`, `api_recon.py`, `api_tasks.py`, `api_composite.py`, `utils.py`, `framework.py`
 
-Medium priority:
-- `api_sigmaker.py`
-- `api_flirt.py`
-- `api_survey.py`
-- `api_discovery.py`
+**Medium:** `api_sigmaker.py`, `api_flirt.py`, `api_survey.py`, `api_discovery.py`, `api_stack.py`
 
-Lower priority:
-- `api_debug.py`
-- MCP transport / hosting details
-- install / config mutation logic
+**Lower:** `api_debug.py`, MCP transport / hosting internals, install / config mutation logic
+
+---
 
 ## Practical notes
 
-- Server/plugin Python: 3.11+
-- IDA Pro 8.3+; 9.0 recommended
-- IDA Free is not supported
-- If IDA uses the wrong Python, use `idapyswitch`
+- **Python**: 3.11+ required (server and plugin side).
+- **IDA Pro**: 8.3+; 9.x recommended. IDA Free is **not supported**.
+- **Package manager**: Use `uv run`, not `python` directly.
+- **Python interpreter**: If IDA uses the wrong one, run `idapyswitch`.
+- **Dependencies**:
+  - `triton-library`: Prebuilt wheels on Windows. On Linux/macOS you may need to build from source or use Conda.
+  - `miasm>=0.1.5`: Pure-Python core. JIT compilation is optional and disabled by default on Windows.
+  - `construct>=2.10.68`: Pure-Python.
+  - `dissect.cstruct>=4.0`: Pure-Python.
+  - `filetype>=1.2.0`: Pure-Python.
+  - `yara-python>=4.3.0`: C-extension binding. Built-in crypto and threat rules are embedded as Python string constants — no external `.yar` files needed.
+  - `networkx>=3.0`: Pure-Python.
+  - `toon_format>=0.9.0`: Token-efficient response encoding. Install into whichever Python serializes responses (IDA's Python for HTTP transport, server's Python for stdio proxy). Installing in both is safe.
+  - All engines are optional. The plugin loads cleanly without them.
 
-### Dependency notes
-- `triton-library`: Prebuilt wheels available on Windows. On Linux/macOS you may need to build from source or use Conda.
-- `miasm>=0.1.5`: Pure-Python core. The `future` package is an additional dependency (bundled with `--install-deps miasm`). JIT compilation is optional and disabled by default on Windows.
-- `construct>=2.10.68`: Pure-Python, works everywhere. Provides declarative binary format parsing.
-- `dissect.cstruct>=4.0`: Pure-Python. C-syntax struct/enum parsing with per-endian registry isolation.
-- `filetype>=1.2.0`: Pure-Python. Magic-byte detection (79+ formats).
-- `yara-python>=4.3.0`: C-extension YARA binding. Built-in crypto and threat rules are embedded as Python string constants — no external `.yar` files needed. The `yara_idb_annotate` killer feature maps matches back to IDA virtual addresses and cannot be replicated by standalone YARA.
-- `networkx>=3.0`: Pure-Python graph algorithms. Powers call-graph centrality (PageRank, betweenness), community detection (Louvain), SCC analysis, shortest paths, dominators, graph diff. The `workflow_reveng_overview` killer feature combines all of these into a one-call structural binary analysis with prioritized recommendations.
-- `toon_format>=0.9.0`: token-efficient response encoding. Install it into **whichever Python serializes tool responses**:
-  - **Direct HTTP transport** (MCP client → IDA plugin on :13337, the common setup): install into **IDA's Python**. The encoding runs in the plugin (`ida_mcp/toon_encode.py`, wired via `MCP_SERVER.result_post_processor` in `ida_mcp/rpc.py`).
-  - **stdio proxy** (MCP client → `synapse-mcp` → IDA): install into the **server's Python**. `server.py`'s proxy post-processor handles it as a fallback.
-  - Installing it in both Pythons is safe — the second pass sees TOON text (not JSON) and no-ops.
+### Sync script
 
-  When present, responses containing a uniform flat array of ≥20 rows are auto-encoded into TOON tabular form, yielding ~40% fewer context tokens. On encode, the result's text content becomes TOON and `structuredContent` is omitted so the full JSON doesn't still ship. Qualifying tools: `lief_exports`, `list_functions_enhanced`, `get_bulk_function_hashes`, `find_global_writers`, `find_function_prologues`, `find_indirect_calls`, and others returning large flat lists. Encoded responses start with `_format: TOON_TABULAR` so agents immediately know the encoding. Falls back to JSON silently when the response doesn't qualify or when an error occurs. **Single source of truth:** qualification + encoding logic lives in `ida_mcp/toon_encode.py`; both transports import it.
-- All engines are optional. The plugin loads cleanly without them; only the `*_status` probe tools report `"available": false`.
+`C:\Dev\IDA_Pro_Plugin\ida-mcp-sync.ps1` copies all `.py` files from `src\ida_pro_mcp\ida_mcp\` → `AppData\ida_mcp\`, clears bytecode, and launches IDA. Use `-NoLaunch` to skip the IDA launch.
 
-### Return-type design principle
-Every tool in this fork returns a **structured `dict` / `TypedDict`**, never raw strings or untyped lists. This is intentional:
-- AI agents parse fields programmatically without regex.
-- Consistent error shape: `{"ok": false, "error": "..."}` across all modules.
-- Downstream tools can chain outputs directly.
+### Post-sync validation
 
-If you find a tool that returns a plain string, that's a bug — fix it.
+The sync script does **not** check Python syntax. Run this after syncing:
+```bash
+python -m py_compile src/ida_pro_mcp/ida_mcp/api_*.py
+```
