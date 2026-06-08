@@ -1,11 +1,14 @@
 import argparse
 import json
 import logging
+import queue
 import signal
 import sys
+import threading
 import os
+import functools
 from pathlib import Path
-from typing import Annotated, Any, NotRequired, Optional, TypedDict
+from typing import Annotated, Any, Callable, NotRequired, Optional, TypedDict, Union
 
 # idapro must go first to initialize idalib
 import idapro
@@ -161,10 +164,21 @@ def _install_context_activation_hooks() -> None:
 
     original_tools_call = MCP_SERVER.registry.methods["tools/call"]
 
+    _FILE_TOOL_PREFIXES = ("lief_", "elf_", "numpy_memmap_", "construct_")
+    _STATUS_TOOLS = ("lief_status", "elf_status", "construct_status")
+
     def tools_call_with_context(
         name: str, arguments: Optional[dict] = None, _meta: Optional[dict] = None
     ) -> dict:
         if name not in IDALIB_MANAGEMENT_TOOLS:
+            # File-analysis tools with an explicit file_path don't need a bound
+            # IDA session — they operate on the raw file directly. Status probes
+            # also work without a session.
+            has_file_path = bool((arguments or {}).get("file_path"))
+            if name in _STATUS_TOOLS or (
+                has_file_path and any(name.startswith(p) for p in _FILE_TOOL_PREFIXES)
+            ):
+                return original_tools_call(name, arguments, _meta)
             try:
                 manager = get_session_manager()
                 context_id = _resolve_effective_context_id()
@@ -209,6 +223,7 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    processor: Annotated[Optional[str], "IDA processor module short name (e.g. 'mipsr5900l', 'ppcvle')"] = None,
 ) -> IdalibOpenResult:
     """Open a binary and bind it to the active idalib context policy."""
 
@@ -216,10 +231,10 @@ def idalib_open(
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
         opened_session_id = manager.open_binary(
-            Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id
+            Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id, processor=processor
         )
         session = manager.bind_context(context_id, opened_session_id, activate=True)
-        return {
+        result = {
             "success": True,
             **_context_response_fields(context_id),
             "session": session.to_dict(),
@@ -228,6 +243,29 @@ def idalib_open(
                 f"({opened_session_id})"
             ),
         }
+        # Honest post-open stats so callers aren't told "success" while the
+        # database is silently empty (the false-positive open from the stress
+        # reports: success=true but function_count=0 / analysis failed).
+        try:
+            import idaapi
+            import ida_funcs
+            import ida_segment
+
+            func_count = int(ida_funcs.get_func_qty())
+            result["function_count"] = func_count
+            result["segment_count"] = int(ida_segment.get_segm_qty())
+            result["imagebase"] = hex(idaapi.get_imagebase())
+            is_idb = str(input_path).lower().endswith((".i64", ".idb"))
+            if run_auto_analysis and not is_idb and func_count == 0:
+                result["analysis_warning"] = (
+                    "Auto-analysis finished with 0 functions. The database may be "
+                    "empty, or the loader/processor mis-detected the binary. Try "
+                    "idalib_start_analysis(session_id), analyze_range over the code "
+                    "segment, or reopen with an explicit processor=... ."
+                )
+        except Exception:
+            pass
+        return result
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         return {"error": str(e)}
     except Exception as e:
@@ -478,19 +516,213 @@ def idalib_warmup(
         return {"ready": False, "error": str(e)}
 
 
+_idalib_executor: "MainThreadExecutor | None" = None  # type: ignore[name-defined]
+_SENTINEL = object()
+
+
+class MainThreadExecutor:
+    """Execute callables on the main OS thread via a work queue.
+
+    The main thread calls :meth:`run_forever` which blocks, pulling work
+    items from the queue and running them.  Other threads submit work via
+    :meth:`submit`.  Uses ``get(timeout=1.0)`` so that POSIX signals are
+    delivered between iterations on the main thread.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue = queue.Queue()
+
+    def submit(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Blocking submit — run *fn* on the main thread, return its result."""
+        reply_q: queue.Queue = queue.Queue()
+        self._q.put((functools.partial(fn, *args, **kwargs), reply_q))
+        result = reply_q.get()
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def run_forever(self) -> None:
+        """Block on the main thread, processing submitted work items."""
+        while True:
+            try:
+                item = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is _SENTINEL:
+                break
+            fn, reply_q = item
+            try:
+                result = fn()
+            except BaseException as e:
+                reply_q.put(e)
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+            else:
+                reply_q.put(result)
+
+    def shutdown(self) -> None:
+        self._q.put(_SENTINEL)
+
+
+# ── Pre-dispatch analysis gate (installed in main()) ──────────────────────
+# Separate function so it's testable and doesn't clutter main().
+
+
+def _install_analysis_gate() -> None:
+    """Install the pre-dispatch gate on MCP_SERVER.registry.dispatch.
+
+    The gate checks ``ida_auto.auto_is_ok()`` before routing a tool call
+    to ``@idasync``.  If auto-analysis is still running, the request is
+    blocked immediately with ``analysis_in_progress`` (on the MCP reader
+    thread, never touching the main thread).
+
+    Management tools (idalib_*, server_health) and status probes (*_status)
+    are whitelisted. ``analysis_status`` and ``server_health`` are
+    short-circuited to answer directly without ever entering ``@idasync``.
+    """
+    import ida_auto as _ida_auto
+
+    _ANALYSIS_WHITELIST: frozenset[str] = frozenset({
+        "idalib_open", "idalib_close", "idalib_switch", "idalib_unbind",
+        "idalib_list", "idalib_current", "idalib_save", "idalib_health",
+        "idalib_warmup", "idalib_task_poll", "idalib_cancel_task",
+        "idalib_cleanup_zombies", "idalib_start_analysis",
+        "server_health", "server_warmup",
+    })
+    _ANALYSIS_WHITELIST_PREFIXES: tuple[str, ...] = (
+        "idalib_", "server_",
+    )
+
+    _ANALYSIS_BLOCKED_RESPONSE = json.dumps({
+        "jsonrpc": "2.0",
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({
+                "ok": False,
+                "error": "analysis_in_progress",
+                "error_type": "AnalysisInProgress",
+                "message": (
+                    "Auto-analysis is still running on the idalib worker. "
+                    "Tools are blocked until it finishes. Call analysis_status() "
+                    "to check — once is_complete is true, retry this call."
+                ),
+            })}],
+            "isError": True,
+        },
+    })
+
+    def _analysis_is_running() -> bool:
+        try:
+            return not _ida_auto.auto_is_ok()
+        except Exception:
+            return False
+
+    def _analysis_status_fast_response() -> dict:
+        try:
+            state = _ida_auto.get_auto_state()
+        except Exception:
+            state = -1
+        au_none = getattr(_ida_auto, "AU_NONE", 0)
+        is_complete = (state == au_none)
+        result: dict[str, Any] = {"ok": True, "is_complete": is_complete}
+        if is_complete:
+            result["phase"] = "idle"
+        else:
+            result["phase"] = f"phase_{state}"
+            result["hint"] = (
+                f"IDA is still running auto-analysis (phase_{state}). "
+                "Function counts, xref data, and type info may be incomplete. "
+                "Call analysis_status() again before depending on those results."
+            )
+        return result
+
+    _SHORT_CIRCUIT_TOOLS: frozenset[str] = frozenset({
+        "analysis_status", "server_health",
+    })
+
+    def _server_health_fast_response() -> dict:
+        result: dict[str, Any] = {"ok": True}
+        try:
+            state = _ida_auto.get_auto_state()
+            au_none = getattr(_ida_auto, "AU_NONE", 0)
+            result["auto_analysis_ready"] = (state == au_none)
+            result["analysis_complete"] = (state == au_none)
+            if state != au_none:
+                result["analysis_phase"] = f"phase_{state}"
+        except Exception:
+            result["auto_analysis_ready"] = None
+        return result
+
+    # Second inlined analysis_blocked response for the gate closure
+    _ANALYSIS_BLOCKED_RESPONSE2: str = json.dumps({
+        "jsonrpc": "2.0",
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({
+                "ok": False,
+                "error": "analysis_in_progress",
+                "error_type": "AnalysisInProgress",
+                "message": (
+                    "Auto-analysis is still running on the idalib worker. "
+                    "Tools are blocked until it finishes. Call analysis_status() "
+                    "to check — once is_complete is true, retry this call."
+                ),
+            })}],
+            "isError": True,
+        },
+    })
+
+    def _is_analysis_blocked(tool_name: str) -> bool:
+        if tool_name in _ANALYSIS_WHITELIST:
+            return False
+        if tool_name == "analysis_status":
+            return False
+        if tool_name.endswith("_status"):
+            return False
+        if any(tool_name.startswith(p) for p in _ANALYSIS_WHITELIST_PREFIXES):
+            return False
+        if tool_name in IDALIB_MANAGEMENT_TOOLS:
+            return False
+        return _analysis_is_running()
+
+    _orig_dispatch = MCP_SERVER.registry.dispatch
+
+    def _dispatch_gated(request) -> dict | None:
+        if not isinstance(request, dict):
+            return _orig_dispatch(request)
+        method = request.get("method", "")
+        if method != "tools/call":
+            return _orig_dispatch(request)
+        params = request.get("params") or {}
+        tool_name = params.get("name", "")
+        rid = request.get("id")
+
+        if tool_name in _SHORT_CIRCUIT_TOOLS:
+            if tool_name == "analysis_status":
+                inner = _analysis_status_fast_response()
+            else:
+                inner = _server_health_fast_response()
+            resp = json.loads(json.dumps({
+                "jsonrpc": "2.0",
+                "result": {"content": [{"type": "text", "text": json.dumps(inner)}]},
+            }))
+            resp["id"] = rid
+            return resp
+
+        if not _is_analysis_blocked(tool_name):
+            return _orig_dispatch(request)
+        resp = json.loads(_ANALYSIS_BLOCKED_RESPONSE2)
+        resp["id"] = rid
+        logger.debug("Blocked tool '%s' — analysis not yet complete", tool_name)
+        return resp
+
+    MCP_SERVER.registry.dispatch = _dispatch_gated
+
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for IDA Pro via idalib")
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show debug messages"
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host to listen on, default: 127.0.0.1",
-    )
-    parser.add_argument(
-        "--port", type=int, default=8745, help="Port to listen on, default: 8745"
     )
     parser.add_argument(
         "--isolated-contexts",
@@ -616,20 +848,46 @@ def main():
     trace.install_tracer()
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
-    # NOTE: npx -y @modelcontextprotocol/inspector for debugging
-    # TODO: with background=True the main thread does not fake any
-    # work from @idasync, so we deadlock.
-    if not "IDA_MCP_URL" in os.environ:
-        # IDA_MCP_URL is used to set download base url by environment,
-        # so we only update download base url if this env var is not
-        # present
-        #
-        # It should be noted that this url ONLY affects the literal string
-        # returned by MCP response, does NOT affect the actual socket
-        # endpoint this server listens to
-        set_download_base_url(f"http://{args.host}:{args.port}")
-    MCP_SERVER.serve(host=args.host, port=args.port, background=False,
-                     request_handler=IdaMcpHttpRequestHandler)
+    # ── Threading model (matches re-mcp-ida's proven architecture) ────────
+    # MAIN THREAD  runs _idalib_executor.run_forever() → processes IDA work
+    # MCP THREAD   runs MCP_SERVER.stdio() → reads stdin, dispatches tools
+    #
+    # Every @idasync call goes through _idalib_executor.submit(), which
+    # queues the work for execution on the main OS thread (idapro is
+    # thread-affine).  The main thread picks it up and runs it directly —
+    # the same thing the GUI event loop does for execute_sync in plugin mode.
+    # ────────────────────────────────────────────────────────────────────────
+
+    global _idalib_executor
+    _idalib_executor = MainThreadExecutor()
+
+    # Wire the executor into sync.py so @idasync dispatches through it.
+    from ida_pro_mcp.ida_mcp import sync as _sync
+    _sync._set_executor(_idalib_executor)
+
+    # Install the pre-dispatch analysis gate + short-circuit tools.
+    _install_analysis_gate()
+
+    def _start_mcp() -> None:
+        """Run the MCP stdio server on this (background) thread."""
+        try:
+            if "IDA_MCP_URL" not in os.environ:
+                set_download_base_url("http://127.0.0.1:0")
+            MCP_SERVER.stdio()
+        finally:
+            _idalib_executor.shutdown()
+
+    mcp_thread = threading.Thread(target=_start_mcp, daemon=True, name="mcp-server")
+    mcp_thread.start()
+    logger.info("MCP server started on background thread (main thread free for IDA)")
+
+    # Main thread: block here processing IDA work.
+    try:
+        _idalib_executor.run_forever()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Main thread shutting down")
+    finally:
+        mcp_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
