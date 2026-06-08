@@ -610,6 +610,12 @@ OPTIONAL_PACKAGES = {
         "display": "pyelftools — ELF/DWARF: symbols, functions, line info, types, IDB sync",
         "min_version": "0.31",
     },
+    "xor": {
+        "pip_name": "z3-solver",
+        "import_name": "z3",
+        "display": "Z3      — xor_solve_universal constraint path (multi-byte keys + regex/charset)",
+        "min_version": "4.12.0",
+    },
 }
 
 

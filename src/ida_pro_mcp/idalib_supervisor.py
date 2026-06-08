@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -293,11 +294,35 @@ class IdalibSupervisor:
             *self.worker_args,
         ]
         logger.info("Spawning idalib worker on 127.0.0.1:%d", port)
+
+        stderr_log = Path(tempfile.gettempdir()) / "idalib-worker-logs"
+        stderr_log.mkdir(exist_ok=True)
+        stderr_path = stderr_log / f"worker-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.stderr"
+        stderr_fh = open(stderr_path, "w")
+
+        env = os.environ.copy()
+        if "IDADIR" not in env:
+            ida_dir = os.environ.get("IDADIR")
+            if ida_dir is None:
+                for candidate in [
+                    r"C:\Program Files\IDA Professional 9.3",
+                    r"C:\Program Files\IDA Pro 9.3",
+                    r"C:\Program Files (x86)\IDA Professional 9.3",
+                ]:
+                    if Path(candidate).exists():
+                        ida_dir = candidate
+                        break
+            if ida_dir is not None:
+                env["IDADIR"] = ida_dir
+                env["PATH"] = f"{ida_dir};{env.get('PATH', '')}"
+                logger.info("Setting worker IDADIR=%s", ida_dir)
+
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_fh,
+            env=env,
         )
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
@@ -313,6 +338,14 @@ class IdalibSupervisor:
         try:
             self._wait_worker_ready(worker)
         except Exception:
+            stderr_fh.flush()
+            stderr_fh.close()
+            try:
+                stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+                if stderr_text.strip():
+                    logger.error("Worker stderr (%s):\n%s", stderr_path, stderr_text)
+            except Exception:
+                pass
             self._terminate_worker(worker)
             raise
         return worker
@@ -928,6 +961,7 @@ def idalib_open(
 ) -> IdalibOpenResult:
     """Open a binary in its own idalib worker process and bind it to this context."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         session = sup.open_session(
@@ -943,7 +977,7 @@ def idalib_open(
             "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), **sup.context_fields(context_id)}
 
 
 @mcp.tool
@@ -962,6 +996,7 @@ def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibClo
 def idalib_switch(session_id: Annotated[str, "Session ID to bind to active context"]) -> IdalibSwitchResult:
     """Bind the active idalib context to an existing database worker."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         session = sup.resolve_session(session_id)
@@ -973,13 +1008,14 @@ def idalib_switch(session_id: Annotated[str, "Session ID to bind to active conte
             "message": f"Bound context to session: {session.session_id} ({session.filename})",
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), **sup.context_fields(context_id)}
 
 
 @mcp.tool
 def idalib_unbind() -> IdalibUnbindResult:
     """Unbind the active idalib context from any database."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         if sup.unbind_context(context_id):
@@ -994,13 +1030,14 @@ def idalib_unbind() -> IdalibUnbindResult:
             "error": "No bound session for this context.",
         }
     except Exception as e:
-        return {"error": f"Failed to unbind context: {e}"}
+        return {"error": f"Failed to unbind context: {e}", **sup.context_fields(context_id)}
 
 
 @mcp.tool
 def idalib_list() -> IdalibListResult:
     """List database workers with context-binding metadata."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         sessions = sup.list_sessions(context_id)
@@ -1011,13 +1048,14 @@ def idalib_list() -> IdalibListResult:
             "current_context_session_id": sup.context_bindings.get(context_id),
         }
     except Exception as e:
-        return {"error": f"Failed to list sessions: {e}"}
+        return {"error": f"Failed to list sessions: {e}", **sup.context_fields(context_id)}
 
 
 @mcp.tool
 def idalib_current() -> IdalibCurrentResult:
     """Return the database bound to the active idalib context."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         session_id = sup.context_bindings.get(context_id)
@@ -1029,7 +1067,7 @@ def idalib_current() -> IdalibCurrentResult:
         session = sup.resolve_session(session_id)
         return {**session.to_dict(), **sup.context_fields(context_id)}
     except Exception as e:
-        return {"error": f"Failed to get current session: {e}"}
+        return {"error": f"Failed to get current session: {e}", **sup.context_fields(context_id)}
 
 
 @mcp.tool
@@ -1039,6 +1077,7 @@ def idalib_save(
 ) -> IdalibSaveResult:
     """Save the selected database worker's IDB."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         session = sup.resolve_session(session_id)
@@ -1050,7 +1089,7 @@ def idalib_save(
             return {**result, **sup.context_fields(context_id)}
         return {"ok": False, **sup.context_fields(context_id), "error": "Unexpected save result"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), **sup.context_fields(context_id)}
 
 
 @mcp.tool
@@ -1059,6 +1098,7 @@ def idalib_health(
 ) -> IdalibHealthResult:
     """Health/ready probe for a database worker."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         session = sup.resolve_session(session_id)
@@ -1078,7 +1118,7 @@ def idalib_health(
             return {**result, **sup.context_fields(context_id)}
         return {"ready": False, **sup.context_fields(context_id), "session": None, "health": None, "error": "Unexpected health result"}
     except Exception as e:
-        return {"ready": False, "error": str(e)}
+        return {"ready": False, "error": str(e), **sup.context_fields(context_id)}
 
 
 @mcp.tool
@@ -1090,6 +1130,7 @@ def idalib_warmup(
 ) -> IdalibWarmupResult:
     """Warm up selected database worker and core subsystems."""
     sup = _require_supervisor()
+    context_id = SHARED_FALLBACK_CONTEXT_ID
     try:
         context_id = sup.resolve_context_id()
         session = sup.resolve_session(session_id)
@@ -1125,7 +1166,7 @@ def idalib_warmup(
             return {**result, **sup.context_fields(context_id)}
         return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
     except Exception as e:
-        return {"ready": False, "error": str(e)}
+        return {"ready": False, "error": str(e), **sup.context_fields(context_id)}
 
 
 @mcp.resource("ida://databases")

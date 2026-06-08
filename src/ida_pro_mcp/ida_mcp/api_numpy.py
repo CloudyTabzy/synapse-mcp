@@ -159,6 +159,7 @@ class NumpyXorResult(TypedDict, total=False):
     addr: str
     size_analyzed: int
     analysis_capped: bool
+    crib_used: bool
     ciphertext_entropy: float
     top_key_length_candidates: list[KeyLengthCandidate]
     key_candidates: list[XorKeyCandidate]
@@ -402,6 +403,41 @@ def _recover_xor_key(arr, key_len: int, assumed_byte: int):
         col = arr[pos::key_len]
         key[pos] = (int(np.argmax(np.bincount(col, minlength=256))) ^ assumed_byte) & 0xFF
     return key
+
+
+def _crib_pins(arr, key_len: int, prefix: bytes, suffix: bytes) -> dict[int, int]:
+    """Key columns pinned by known plaintext at the region's start/end.
+
+    A known plaintext byte ``p`` at offset ``i`` pins ``key[i % key_len] =
+    cipher[i] ^ p`` for a repeating key. The prefix maps from the front, the
+    suffix from the back of the analysed region. Later writes win on conflict —
+    for a genuine repeating key the pins agree.
+    """
+    n = int(arr.size)
+    pins: dict[int, int] = {}
+    for i, b in enumerate(prefix):
+        if i < n:
+            pins[i % key_len] = int(arr[i]) ^ b
+    for j, b in enumerate(suffix):
+        off = n - len(suffix) + j
+        if 0 <= off < n:
+            pins[off % key_len] = int(arr[off]) ^ b
+    return pins
+
+
+def _parse_crib_arg(value: str) -> bytes:
+    """Parse a crib argument: 'hex:..' / '0x..' / bare-even-hex / plain text."""
+    if not value:
+        return b""
+    v = value.strip()
+    if v.startswith("hex:"):
+        return bytes.fromhex(v[4:].replace(" ", "").replace("0x", ""))
+    if v.startswith("0x") and len(v) > 2:
+        return bytes.fromhex(v[2:].replace(" ", ""))
+    s = v.replace(" ", "")
+    if len(s) >= 4 and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+        return bytes.fromhex(s)
+    return v.encode("utf-8")
 
 
 # --- Function similarity helpers ---------------------------------------------
@@ -1088,8 +1124,18 @@ if NUMPY_AVAILABLE:
         top_candidates: Annotated[
             int, "Number of ranked key candidates to return (default: 5)"
         ] = 5,
+        known_prefix: Annotated[
+            str,
+            "Crib: known plaintext at the START of the region (text, or 'hex:..'). "
+            "Pins key columns directly — when it covers a full key cycle the key "
+            "is recovered exactly, no statistical guess.",
+        ] = "",
+        known_suffix: Annotated[
+            str,
+            "Crib: known plaintext at the END of the region (text, or 'hex:..').",
+        ] = "",
     ) -> NumpyXorResult:
-        """Recover a repeating-XOR key from an obfuscated region via statistics.
+        """Recover a repeating-XOR key from an obfuscated region via statistics + cribs.
 
         Two-stage classical attack, fully vectorized:
 
@@ -1104,18 +1150,29 @@ if NUMPY_AVAILABLE:
            decrypting a 4 KB window and scoring it (printable-ASCII ratio for
            text, null-run ratio for binary, plus entropy reduction).
 
-        Candidates are ranked by that composite score, ties broken toward the
-        shortest key. Note a single-byte XOR does not change entropy at all (it
-        is a byte permutation), so the printable/null signal — not entropy — is
-        what identifies it. The ``key`` and ``key ^ 0x20`` solutions are
+        **Crib-dragging** — supply ``known_prefix`` and/or ``known_suffix`` when
+        you know any plaintext (e.g. a magic header, ``flag{``, a filename).
+        Each known byte pins ``key[i % L] = cipher[i] ^ plaintext[i]`` directly;
+        when the crib covers a whole key cycle the key is recovered *exactly*
+        with no frequency guess, and that candidate is ranked first. This is what
+        lets the tool solve short or non-English plaintext that pure frequency
+        analysis cannot.
+
+        Candidates are ranked by a composite score (cribs win when present),
+        ties broken toward the shortest key. A single-byte XOR does not change
+        entropy (it is a byte permutation), so the printable/null signal — not
+        entropy — identifies it. The ``key`` and ``key ^ 0x20`` solutions are
         genuinely ambiguous for some data; inspect ``sample_decrypted_ascii`` of
-        the top candidates to confirm which plaintext assumption is right.
+        the top candidates to confirm.
 
         Typical use — an obfuscated C2 string or config blob:
             numpy_xor_key_recovery(addr='0x140089000', size=0x400)
+            numpy_xor_key_recovery(addr='0x2060', size=0x80, known_prefix='flag{')
 
         See also: numpy_byte_histogram (is this even XOR? look for a dominant
-        byte), yara_scan_builtin_crypto (known crypto constants).
+        byte), yara_scan_builtin_crypto (known crypto constants), and
+        xor_solve_universal for non-repeating XOR variants (self-key, rolling,
+        position-dependent) this statistical attack does not model.
 
         Profile: analysis
         """
@@ -1150,39 +1207,61 @@ if NUMPY_AVAILABLE:
             vlen = min(n, _XOR_VALIDATE)
             vwin = arr[:vlen]
 
+            crib_prefix = _parse_crib_arg(known_prefix)
+            crib_suffix = _parse_crib_arg(known_suffix)
+            crib_used = bool(crib_prefix or crib_suffix)
+
+            def _make_candidate(key, asm_label: str, L: int, bonus: float = 0.0):
+                """Score a recovered key over the validation window → candidate dict."""
+                dec = (vwin ^ np.resize(key, vlen)).astype(np.uint8)
+                de = np_entropy(dec.tobytes())
+                printable = float(np.count_nonzero((dec >= 0x20) & (dec < 0x7F)) / vlen)
+                null_ratio = float(np.count_nonzero(dec == 0) / vlen)
+                reduction = max(0.0, cipher_entropy - de)
+                score = max(printable, 1.2 * null_ratio) + 0.5 * reduction + bonus
+                if score > 2.4 and (printable > 0.85 or null_ratio > 0.5):
+                    conf = "high"
+                elif score > 1.2:
+                    conf = "medium"
+                else:
+                    conf = "low"
+                dec_bytes = dec.tobytes()
+                return {
+                    "key_hex": " ".join(f"0x{b:02x}" for b in key.tolist()),
+                    "key_length": int(L),
+                    "assumed_plaintext": asm_label,
+                    "plaintext_entropy_after": round(de, 4),
+                    "entropy_reduction": round(reduction, 4),
+                    "printable_ratio": round(printable, 3),
+                    "null_ratio": round(null_ratio, 3),
+                    "sample_decrypted_hex": dec_bytes[:64].hex(" ", 1),
+                    "sample_decrypted_ascii": dec_bytes[:64].decode("ascii", errors="replace"),
+                    "confidence": conf,
+                    "_score": round(score, 4),  # internal sort key, popped below
+                }
+
             cands: list[XorKeyCandidate] = []
             for L in cand_lengths:
                 if L > n // 2:
                     continue
                 for asm in assumptions:
-                    P = _XOR_ASSUMPTIONS[asm]
-                    key = _recover_xor_key(arr, L, P)
-                    dec = (vwin ^ np.resize(key, vlen)).astype(np.uint8)
-                    de = np_entropy(dec.tobytes())
-                    printable = float(np.count_nonzero((dec >= 0x20) & (dec < 0x7F)) / vlen)
-                    null_ratio = float(np.count_nonzero(dec == 0) / vlen)
-                    reduction = max(0.0, cipher_entropy - de)
-                    score = max(printable, 1.2 * null_ratio) + 0.5 * reduction
-                    if score > 2.4 and (printable > 0.85 or null_ratio > 0.5):
-                        conf = "high"
-                    elif score > 1.2:
-                        conf = "medium"
-                    else:
-                        conf = "low"
-                    dec_bytes = dec.tobytes()
-                    cands.append({
-                        "key_hex": " ".join(f"0x{b:02x}" for b in key.tolist()),
-                        "key_length": int(L),
-                        "assumed_plaintext": asm,
-                        "plaintext_entropy_after": round(de, 4),
-                        "entropy_reduction": round(reduction, 4),
-                        "printable_ratio": round(printable, 3),
-                        "null_ratio": round(null_ratio, 3),
-                        "sample_decrypted_hex": dec_bytes[:64].hex(" ", 1),
-                        "sample_decrypted_ascii": dec_bytes[:64].decode("ascii", errors="replace"),
-                        "confidence": conf,
-                        "_score": round(score, 4),  # internal sort key, popped below
-                    })
+                    key = _recover_xor_key(arr, L, _XOR_ASSUMPTIONS[asm])
+                    cands.append(_make_candidate(key, asm, L))
+                # Crib candidate: pin key columns from known plaintext, fill the
+                # rest statistically. A crib covering a full cycle determines the
+                # key exactly and is given a decisive score bonus so it ranks
+                # first; a partial crib still gets a smaller boost.
+                if crib_used:
+                    pins = _crib_pins(arr, L, crib_prefix, crib_suffix)
+                    if pins:
+                        key = _recover_xor_key(arr, L, _XOR_ASSUMPTIONS["space"]).copy()
+                        for col, kb in pins.items():
+                            key[col] = kb & 0xFF
+                        full = len(pins) >= L
+                        cands.append(_make_candidate(
+                            key, "crib" if full else "crib_partial", L,
+                            bonus=1.5 if full else 0.4,
+                        ))
 
             # Pick the winner with the verified near-tie rule (within 0.02 of the
             # best score, prefer the shortest key — a longer key that ties only
@@ -1212,6 +1291,8 @@ if NUMPY_AVAILABLE:
                 "top_key_length_candidates": top_lengths,
                 "key_candidates": cands,
             }
+            if crib_used:
+                result["crib_used"] = True
             if size > _XOR_MAX_ANALYZE:
                 result["analysis_capped"] = True
 
