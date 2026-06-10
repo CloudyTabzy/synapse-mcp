@@ -9,15 +9,22 @@ Architecture:
 - sync.py: IDA synchronization decorator (@idasync)
 - utils.py: Shared helpers and TypedDict definitions
 - api_*.py: Modular API implementations (75 tools + 24 resources)
+- api_triton.py: Triton symbolic execution tools (optional, requires triton-library)
+- api_miasm.py: Miasm IR analysis tools (optional, requires miasm)
+- api_construct.py: Construct declarative parsers (optional, requires construct)
 """
 
 # Ignore SIGPIPE to prevent IDA from being killed when an MCP client
 # disconnects while the HTTP server is writing a response. IDA's embedded
 # Python may not preserve CPython's default SIG_IGN for SIGPIPE.
+import logging as _logging
 import signal
+import traceback as _traceback
 
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+_log = _logging.getLogger(__name__)
 
 # Import infrastructure modules
 from . import rpc
@@ -36,14 +43,179 @@ from . import api_python
 from . import api_resources
 from . import api_survey
 from . import api_composite
+from . import api_discovery
 from . import trace as trace
 from . import api_sigmaker
+from . import api_flirt
+from . import api_recon
+from . import api_tasks
+
+# api_xor — the universal XOR cipher solver. Always-on (the solver core is pure
+# Python with no hard dependency; Z3 only enriches the constraint path). Wrapped
+# defensively so a single import error can never take down the whole plugin.
+try:
+    from . import api_xor
+except Exception as _e:
+    _log.warning(
+        "api_xor failed to load (%s: %s) — all xor_* solver tools unavailable.\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_xor = None
+
+# Optional analysis engine modules — load only when dependencies are present.
+# ImportError / AttributeError from missing packages is silently swallowed so
+# the plugin remains fully operational without them.
+try:
+    from . import api_triton
+except Exception as _e:
+    _log.warning(
+        "api_triton failed to load (%s: %s) — all triton_* tools unavailable. "
+        "Install with: pip install triton-library\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_triton = None
+
+try:
+    from . import api_miasm
+except Exception as _e:
+    _log.warning(
+        "api_miasm failed to load (%s: %s) — all miasm_* tools unavailable. "
+        "Install with: pip install miasm\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_miasm = None
+
+try:
+    from . import api_construct
+except Exception as _e:
+    _log.warning(
+        "api_construct failed to load (%s: %s) — all construct_* tools unavailable. "
+        "Install with: pip install construct\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_construct = None
+
+try:
+    from . import api_cstruct
+except Exception as _e:
+    _log.warning(
+        "api_cstruct failed to load (%s: %s) — all cstruct_* tools unavailable. "
+        "Install with: pip install dissect.cstruct\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_cstruct = None
+
+try:
+    from . import api_filetype
+except Exception as _e:
+    _log.warning(
+        "api_filetype failed to load (%s: %s) — all filetype_* tools unavailable. "
+        "Install with: pip install filetype\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_filetype = None
+
+try:
+    from . import api_lief
+except Exception as _e:
+    _log.warning(
+        "api_lief failed to load (%s: %s) — all lief_* tools unavailable. "
+        "Install with: pip install lief\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_lief = None
+
+try:
+    from . import api_yara
+except Exception as _e:
+    _log.warning(
+        "api_yara failed to load (%s: %s) — all yara_* tools unavailable. "
+        "Install with: pip install yara-python\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_yara = None
+
+try:
+    from . import api_angr
+except Exception as _e:
+    _log.warning(
+        "api_angr failed to load (%s: %s) — all angr_* tools unavailable. "
+        "Install with: pip install angr\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_angr = None
+
+try:
+    from . import api_networkx
+except Exception as _e:
+    _log.warning(
+        "api_networkx failed to load (%s: %s) — all nx_* tools unavailable. "
+        "Install with: pip install networkx>=3.0\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_networkx = None
+
+try:
+    from . import api_unicorn
+except Exception as _e:
+    _log.warning(
+        "api_unicorn failed to load (%s: %s) — all unicorn_* tools unavailable. "
+        "Install with: pip install unicorn\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_unicorn = None
+
+try:
+    from . import api_numpy
+except Exception as _e:
+    _log.warning(
+        "api_numpy failed to load (%s: %s) — numpy_* tools unavailable. "
+        "Install with: pip install numpy\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_numpy = None
+
+try:
+    from . import api_elf
+except Exception as _e:
+    _log.warning(
+        "api_elf failed to load (%s: %s) — all elf_* tools unavailable. "
+        "Install with: pip install pyelftools>=0.31\n%s",
+        type(_e).__name__, _e, _traceback.format_exc(),
+    )
+    api_elf = None
+
+# Build tool profiles after all api_*.py modules have loaded and registered tools.
+# Profiles group tools into logical domains used by server_health and lazy mode.
+from .rpc import MCP_SERVER, register_profile, get_tool_group
+
+
+def _build_profiles() -> None:
+    all_tools = set(MCP_SERVER.tools.methods.keys())
+    groups: dict[str, set[str]] = {
+        "core": set(),
+        "analysis": set(),
+        "modify": set(),
+        "symbolic": set(),
+        "formats": set(),
+        "recon": set(),
+    }
+    for name in all_tools:
+        groups[get_tool_group(name)].add(name)
+    for group, tools in groups.items():
+        if tools:
+            register_profile(group, tools)
+    register_profile("all", all_tools)
+
+
+_build_profiles()
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
-from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
+from .rpc import MCP_UNSAFE, tool, unsafe, resource
 from .http import IdaMcpHttpRequestHandler
 from .api_core import init_caches
+from .api_discovery import set_local_instance
 
 # Tracing is always on: every tools/call is recorded into the IDB netnode.
 trace.configure_idb()
@@ -65,7 +237,24 @@ __all__ = [
     "api_resources",
     "api_survey",
     "api_composite",
+    "api_discovery",
     "api_sigmaker",
+    "api_flirt",
+    "api_recon",
+    "api_xor",
+    # Optional analysis engines (None when deps absent)
+    "api_triton",
+    "api_miasm",
+    "api_construct",
+    "api_cstruct",
+    "api_filetype",
+    "api_lief",
+    "api_yara",
+    "api_angr",
+    "api_networkx",
+    "api_unicorn",
+    "api_numpy",
+    "api_elf",
     # Re-exported components
     "idasync",
     "IDAError",
@@ -73,9 +262,14 @@ __all__ = [
     "CancelledError",
     "MCP_SERVER",
     "MCP_UNSAFE",
+    "MCP_PROFILES",
+    "MCP_DEFAULT_PROFILE",
     "tool",
     "unsafe",
     "resource",
+    "register_profile",
+    "get_tool_group",
     "IdaMcpHttpRequestHandler",
     "init_caches",
+    "set_local_instance",
 ]

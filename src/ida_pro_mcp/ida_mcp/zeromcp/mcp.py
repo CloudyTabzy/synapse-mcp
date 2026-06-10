@@ -573,6 +573,13 @@ class McpServer:
         self._enabled_extensions = threading.local()  # set[str] per request
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
         self.require_streamable_http_session = False
+        self._tools_list_cache: dict[str, list[dict]] = {}
+
+        # Optional hook: (tool_name, result) -> alternate content text | None.
+        # When it returns a string, that string becomes content[0].text while
+        # structuredContent is still included for schema validation. Used for
+        # response transforms such as TOON encoding. Defaults to None (no transform).
+        self.result_post_processor: Callable[[str, Any], str | None] | None = None
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -589,6 +596,9 @@ class McpServer:
         self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
 
     def tool(self, func: Callable) -> Callable:
+        # Invalidate schema cache when a new tool is registered so the next
+        # tools/list call reflects the current registry.
+        self._tools_list_cache.clear()
         return self.tools.method(func)
 
     def resource(self, uri: str) -> Callable[[Callable], Callable]:
@@ -774,8 +784,26 @@ class McpServer:
             },
         }
 
+    def _get_tools_list_cache_key(self) -> str:
+        """Build a cache key for the current request context.
+
+        The key is based on enabled extension groups and (when profiles are
+        active) the active profile. This makes the cache safe across requests
+        with different extension/profile filters.
+        """
+        enabled = frozenset(getattr(self._enabled_extensions, "data", set()))
+        profile = getattr(getattr(self, "_active_profile", None), "data", None)
+        parts: list[str] = [f"ext:{','.join(sorted(enabled))}"]
+        if profile:
+            parts.append(f"profile:{profile}")
+        return "|".join(parts)
+
     def _mcp_tools_list(self, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""
+        cache_key = self._get_tools_list_cache_key()
+        if cache_key in self._tools_list_cache:
+            return {"tools": self._tools_list_cache[cache_key]}
+
         enabled = getattr(self._enabled_extensions, "data", set())
         tools = []
         for func_name, func in self.tools.methods.items():
@@ -783,7 +811,17 @@ class McpServer:
             tool_group = self._get_tool_extension(func_name)
             if tool_group and tool_group not in enabled:
                 continue  # Skip tools from disabled extension groups
-            tools.append(self._generate_tool_schema(func_name, func))
+            try:
+                tools.append(self._generate_tool_schema(func_name, func))
+            except Exception as e:
+                logger.warning(
+                    "[MCP] Schema generation failed for tool '%s': %s (%s). "
+                    "Skipping this tool in tools/list.",
+                    func_name,
+                    type(e).__name__,
+                    e,
+                )
+        self._tools_list_cache[cache_key] = tools
         return {"tools": tools}
 
     def _get_tool_extension(self, func_name: str) -> str | None:
@@ -827,9 +865,29 @@ class McpServer:
                 }
 
             result = tool_response.get("result") if tool_response else None
+
+            # Optional response transform (e.g. TOON encoding). When it returns a
+            # string, that string becomes content[0].text (compact form the model
+            # reads), while structuredContent is ALWAYS kept for schema validation.
+            # Schema-enforcing clients require structuredContent when outputSchema is
+            # declared; dropping it causes -32600. Keeping both is safe: the model
+            # reads content (TOON), the client validates structuredContent (JSON).
+            structured = result if isinstance(result, dict) else {"result": result}
+            if self.result_post_processor is not None:
+                try:
+                    alt_text = self.result_post_processor(name, result)
+                except Exception:
+                    alt_text = None
+                if isinstance(alt_text, str):
+                    return {
+                        "content": [{"type": "text", "text": alt_text}],
+                        "structuredContent": structured,
+                        "isError": False,
+                    }
+
             return {
                 "content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}],
-                "structuredContent": result if isinstance(result, dict) else {"result": result},
+                "structuredContent": structured,
                 "isError": False,
             }
         finally:
@@ -1026,6 +1084,25 @@ class McpServer:
 
         return schema
 
+    def _open_output_schema(self, schema: Any) -> Any:
+        """Recursively remove additionalProperties:false from an output schema.
+
+        Tool outputs must never be rejected for having fields that weren't in
+        the schema at registration time — tools evolve and add fields.  Input
+        schemas (inputSchema) are NOT passed through here, so callers still get
+        strict param validation.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        result = {k: v for k, v in schema.items() if not (k == "additionalProperties" and v is False)}
+        if "properties" in result:
+            result["properties"] = {k: self._open_output_schema(v) for k, v in result["properties"].items()}
+        if "items" in result:
+            result["items"] = self._open_output_schema(result["items"])
+        if "anyOf" in result:
+            result["anyOf"] = [self._open_output_schema(s) for s in result["anyOf"]]
+        return result
+
     def _schema_is_object_like(self, schema: dict) -> bool:
         """Check if a JSON schema always describes a dict at runtime.
 
@@ -1062,17 +1139,23 @@ class McpServer:
 
         # list[T]
         if origin is list:
-            return {
-                "type": "array",
-                "items": self._type_to_json_schema(get_args(py_type)[0]),
-            }
+            args = get_args(py_type)
+            if args:
+                return {
+                    "type": "array",
+                    "items": self._type_to_json_schema(args[0]),
+                }
+            return {"type": "array"}
 
         # dict[str, T]
         if origin is dict:
-            return {
-                "type": "object",
-                "additionalProperties": self._type_to_json_schema(get_args(py_type)[1]),
-            }
+            args = get_args(py_type)
+            if len(args) >= 2:
+                return {
+                    "type": "object",
+                    "additionalProperties": self._type_to_json_schema(args[1]),
+                }
+            return {"type": "object"}
 
         # TypedDict
         if is_typeddict(py_type):
@@ -1093,22 +1176,68 @@ class McpServer:
 
     def _typed_dict_to_schema(self, typed_dict_class) -> dict:
         """Convert TypedDict to JSON schema"""
-        hints = get_type_hints(typed_dict_class, include_extras=True)
-        required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
+        try:
+            hints = get_type_hints(typed_dict_class, include_extras=True)
+        except Exception:
+            # PEP 563 (from __future__ import annotations) turns all annotations
+            # into strings that get_type_hints() resolves via sys.modules[__module__].
+            # IDA's plugin importer can register modules under a prefixed key that
+            # differs from __module__, making the lookup return None and causing nested
+            # TypedDict names to raise NameError. Retry with the module dict explicit.
+            mod_name = getattr(typed_dict_class, '__module__', '')
+            mod = sys.modules.get(mod_name) or next(
+                (m for k, m in sys.modules.items() if k.endswith('.' + mod_name)),
+                None,
+            )
+            try:
+                hints = get_type_hints(
+                    typed_dict_class,
+                    globalns=vars(mod) if mod is not None else {},
+                    include_extras=True,
+                )
+            except Exception as e:
+                # Genuine resolution failure — fall back to raw __annotations__.
+                logger.warning(
+                    "[MCP] get_type_hints failed for %s: %s. Falling back to __annotations__.",
+                    typed_dict_class.__name__,
+                    e,
+                )
+                hints = dict(getattr(typed_dict_class, '__annotations__', {}))
 
-        return {
+        required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
+        required = [key for key in hints.keys() if key in required_keys]
+
+        schema: dict = {
             "type": "object",
             "properties": {
                 field_name: self._type_to_json_schema(field_type)
                 for field_name, field_type in hints.items()
             },
-            "required": [key for key in hints.keys() if key in required_keys],
-            "additionalProperties": False
+            "required": required,
         }
+        # Only close the schema against extra properties when the TypedDict has
+        # required keys (total=True or mixed).  total=False dicts (all keys
+        # optional) are used for tool *outputs* that grow over time; adding
+        # additionalProperties:false there causes MCP clients to reject
+        # responses whenever a new field is added without a schema refresh.
+        if required:
+            schema["additionalProperties"] = False
+        return schema
 
     def _generate_tool_schema(self, func_name: str, func: Callable) -> dict:
         """Generate MCP tool schema from a function"""
-        hints = get_type_hints(func, include_extras=True)
+        try:
+            hints = get_type_hints(func, include_extras=True)
+        except NameError:
+            # Forward reference evaluation failed (often because @functools.wraps
+            # changes the evaluation namespace). Fall back to hints without extras
+            # so the tool remains discoverable even if Annotated descriptions are lost.
+            try:
+                hints = get_type_hints(func, include_extras=False)
+            except Exception:
+                hints = dict(getattr(func, '__annotations__', {}))
+        except Exception:
+            hints = dict(getattr(func, '__annotations__', {}))
         return_type = hints.pop("return", None)
         sig = inspect.signature(func)
 
@@ -1123,13 +1252,6 @@ class McpServer:
             param = sig.parameters.get(param_name)
             if not param or param.default is inspect.Parameter.empty:
                 required.append(param_name)
-            else:
-                try:
-                    json.dumps(param.default)
-                except TypeError:
-                    pass
-                else:
-                    properties[param_name]["default"] = param.default
 
         schema: dict[str, Any] = {
             "name": func_name,
@@ -1160,6 +1282,6 @@ class McpServer:
                 # accept the schema while anyOf still constrains the variants.
                 return_schema = {"type": "object", **return_schema}
 
-            schema["outputSchema"] = return_schema
+            schema["outputSchema"] = self._open_output_schema(return_schema)
 
         return schema

@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 import idaapi
-import ida_kernwin
 import idc
 from .rpc import McpToolError
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
@@ -15,7 +14,50 @@ from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 # IDA Synchronization & Error Handling
 # ============================================================================
 
-ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
+# Lazily-computed IDA kernel version.  Computing it at import time fails on
+# IDA 9.3+ because get_kernel_version() may only be called from the main IDA
+# thread (via execute_sync).  The HTTP server's accept thread imports this
+# module before any tool request arrives, so we defer the call.
+_ida_version_cache: tuple[int, int] | None = None
+
+
+def _get_ida_version() -> tuple[int, int]:
+    global _ida_version_cache
+    if _ida_version_cache is None:
+        _ida_version_cache = tuple(map(int, idaapi.get_kernel_version().split(".")))
+    return _ida_version_cache
+
+
+ida_major: int
+ida_minor: int
+
+_version_initialized = False
+
+
+def _ensure_version() -> None:
+    """Ensure ida_major/ida_minor are populated. Safe to call from any thread."""
+    global _version_initialized
+    if not _version_initialized:
+        maj, min_ = _get_ida_version()
+        globals()["ida_major"] = maj
+        globals()["ida_minor"] = min_
+        _version_initialized = True
+
+
+class _VersionShim:
+    """Shim that defers ida_major/ida_minor resolution until first access."""
+
+    def __get__(self, obj, objtype=None) -> tuple[int, int]:
+        _ensure_version()
+        return (ida_major, ida_minor)
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ to handle ida_major/ida_minor shim until initialized."""
+    if name in ("ida_major", "ida_minor"):
+        _ensure_version()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class IDAError(McpToolError):
@@ -40,23 +82,6 @@ class CancelledError(RequestCancelledError):
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 60.0
-
-
-# Thread-local: while a synchronized tool body is running, holds the monotonic
-# deadline (or None if no timeout). Tools can read this to self-monitor and
-# return partial results gracefully — useful when sync.py's Timer-fired
-# set_cancelled mechanism races with GIL contention on tight loops.
-_deadline_state = threading.local()
-
-
-def get_tool_deadline() -> float | None:
-    """Return the monotonic deadline for the current tool call, or None.
-
-    Only meaningful inside an @idasync function body. Tools that walk
-    large structures can check `time.monotonic() >= get_tool_deadline()`
-    to bail cleanly without depending on the global cancel flag.
-    """
-    return getattr(_deadline_state, "deadline", None)
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -181,56 +206,19 @@ def sync_wrapper(
             # not when the request was queued (avoids stale deadlines)
             deadline = time.monotonic() + timeout if timeout > 0 else None
 
-            # Native cancellation: clear any stale flag and schedule a
-            # set_cancelled() at the deadline. Many IDA SDK calls
-            # (ida_search.find_*, ida_bytes.find_bytes/bin_search,
-            # ida_hexrays.decompile*, ida_strlist.build_strlist,
-            # ida_auto.auto_wait) poll user_cancelled() and bail with
-            # BADADDR / MERR_CANCELED within one poll cycle, freeing the
-            # main thread instead of running to natural completion.
-            # set_cancelled() is THREAD_SAFE so firing it from a Timer
-            # thread is safe.
-            ida_kernwin.clr_cancelled()
-            cancel_fired_at: list[float | None] = [None]
-            native_timer: threading.Timer | None = None
-            if deadline is not None:
-                def _fire_native_cancel():
-                    cancel_fired_at[0] = time.monotonic()
-                    ida_kernwin.set_cancelled()
-                native_timer = threading.Timer(timeout, _fire_native_cancel)
-                native_timer.daemon = True
-                native_timer.start()
-
             def profilefunc(frame, event, arg):
-                # Check request-level cancellation first (higher priority)
+                # Check cancellation first (higher priority)
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("Request was cancelled")
-                # If native cancel just fired, give the tool a short grace
-                # period to format a partial response rather than racing the
-                # IDASyncError. Beyond that we still raise to bound the
-                # response time.
-                fired_at = cancel_fired_at[0]
-                if fired_at is not None and time.monotonic() < fired_at + 5.0:
-                    return
                 if deadline is not None and time.monotonic() >= deadline:
                     raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
-            # Expose the deadline so tool bodies can self-monitor and
-            # return partial results gracefully (independent of the Timer).
-            _deadline_state.deadline = deadline
             old_profile = sys.getprofile()
             sys.setprofile(profilefunc)
             try:
                 return ff()
             finally:
                 sys.setprofile(old_profile)
-                if native_timer is not None:
-                    native_timer.cancel()
-                # Sticky flag: clear unconditionally so the next tool starts
-                # with a clean state. Without this, every subsequent
-                # user_cancelled() returns True forever.
-                ida_kernwin.clr_cancelled()
-                _deadline_state.deadline = None
 
         timed_ff.__name__ = ff.__name__
         return _sync_wrapper(timed_ff, keep_batch=keep_batch)
@@ -259,8 +247,8 @@ def idasync(f):
     return wrapper
 
 
-def tool_timeout(seconds: float):
-    """Decorator to override per-tool timeout (seconds).
+def tool_timeout(seconds: float, prefer_async: bool = False):
+    """Decorator to override per-tool timeout (seconds) and optionally auto-async.
 
     IMPORTANT: Must be applied BEFORE @idasync (i.e., listed AFTER it)
     so the attribute exists when it captures the function in closure.
@@ -268,12 +256,20 @@ def tool_timeout(seconds: float):
     Correct order:
         @tool
         @idasync
-        @tool_timeout(90.0)  # innermost
+        @tool_timeout(90.0, prefer_async=True)  # innermost
         def my_func(...):
+
+    When prefer_async=True, the tools/call dispatcher in rpc.py automatically
+    submits the tool as a background task instead of executing synchronously.
+    The caller immediately receives a task_id and polls with task_poll().
+    This eliminates the trial-and-error loop where agents must discover which
+    tools are slow enough to need task_submit.
     """
 
     def decorator(func):
         setattr(func, "__ida_mcp_timeout_sec__", seconds)
+        if prefer_async:
+            setattr(func, "__ida_mcp_prefer_async__", True)
         return func
 
     return decorator
@@ -304,7 +300,9 @@ def keep_batch(func):
 def is_window_active():
     """Returns whether IDA is currently active."""
     # Source: https://github.com/OALabs/hexcopy-ida/blob/8b0b2a3021d7dc9010c01821b65a80c47d491b61/hexcopy.py#L30
-    using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
+    # Use _ida_version_shim to avoid eagerly calling get_kernel_version() from the HTTP accept thread
+    maj, min_ = _ida_version_shim
+    using_pyside6 = (maj > 9) or (maj == 9 and min_ >= 2)
 
     if using_pyside6:
         from PySide6 import QtWidgets

@@ -21,6 +21,7 @@ from .utils import (
     parse_address,
     read_bytes_bss_safe,
     read_int_bss_safe,
+    item_error,
 )
 
 
@@ -28,6 +29,8 @@ class BytesReadResult(TypedDict):
     addr: str | None
     data: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class IntReadResult(TypedDict):
@@ -35,24 +38,32 @@ class IntReadResult(TypedDict):
     ty: str
     value: int | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class StringReadResult(TypedDict):
     addr: str
     value: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class GlobalValueResult(TypedDict):
     query: str
     value: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class PatchResult(TypedDict):
     addr: str | None
     size: int
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class IntWriteResult(TypedDict):
@@ -60,6 +71,8 @@ class IntWriteResult(TypedDict):
     ty: str
     value: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 # ============================================================================
@@ -85,9 +98,129 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
             data = " ".join(f"{x:#02x}" for x in raw)
             results.append({"addr": addr, "data": data})
         except Exception as e:
-            results.append({"addr": addr, "data": None, "error": str(e)})
+            results.append({"addr": addr, "data": None, **item_error(e, f"read {size} bytes at {addr}")})
 
     return results
+
+
+class ReadLocalFileResult(TypedDict):
+    ok: bool
+    path: str
+    offset: int
+    total_bytes: int
+    has_more: bool
+    data: str
+    encoding: str
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def read_local_file(
+    path: Annotated[str, "Absolute path to the file on the IDA host machine."],
+    offset: Annotated[int, "Byte offset to start reading from."] = 0,
+    max_bytes: Annotated[
+        int, "Maximum bytes to read (default 32768, cap 50000)."
+    ] = 32768,
+    encoding: Annotated[
+        str,
+        "Text encoding to use for decoding (default 'utf-8'). Use 'base64' to "
+        "return raw bytes as a base64 string without any text decoding.",
+    ] = "utf-8",
+) -> ReadLocalFileResult:
+    """Read a file from the IDA host's local filesystem.
+
+    This tool is useful when another MCP tool writes output to a temporary
+    file (e.g. graph exports, reports) and you need to retrieve the contents.
+    Use offset/max_bytes to page through large files.
+
+    Security: the path is validated to prevent directory traversal. Only
+    absolute paths are accepted.
+    """
+    import os
+    import base64
+
+    # Security: reject relative paths and directory traversal
+    cleaned = os.path.normpath(os.path.abspath(path))
+    if ".." in cleaned.split(os.sep):
+        return {
+            "ok": False,
+            "path": path,
+            "offset": 0,
+            "total_bytes": 0,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": "Invalid path: directory traversal not allowed.",
+        }
+
+    if not os.path.isfile(cleaned):
+        return {
+            "ok": False,
+            "path": path,
+            "offset": 0,
+            "total_bytes": 0,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": f"File not found: {cleaned}",
+        }
+
+    try:
+        total = os.path.getsize(cleaned)
+    except OSError as e:
+        return {
+            "ok": False,
+            "path": path,
+            "offset": 0,
+            "total_bytes": 0,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": f"Cannot stat file: {e}",
+        }
+
+    max_bytes = min(max_bytes, 50000)
+    if offset < 0:
+        offset = 0
+    if offset > total:
+        offset = total
+
+    try:
+        with open(cleaned, "rb") as f:
+            f.seek(offset)
+            raw = f.read(max_bytes)
+    except OSError as e:
+        return {
+            "ok": False,
+            "path": path,
+            "offset": offset,
+            "total_bytes": total,
+            "has_more": False,
+            "data": "",
+            "encoding": encoding,
+            "error": f"Read failed: {e}",
+        }
+
+    if encoding.lower() == "base64":
+        data = base64.b64encode(raw).decode("ascii")
+    else:
+        try:
+            data = raw.decode(encoding, errors="replace")
+        except LookupError:
+            data = raw.decode("utf-8", errors="replace")
+
+    has_more = offset + len(raw) < total
+
+    return {
+        "ok": True,
+        "path": cleaned,
+        "offset": offset,
+        "total_bytes": total,
+        "has_more": has_more,
+        "data": data,
+        "encoding": encoding,
+    }
 
 
 _INT_CLASS_RE = re.compile(r"^(?P<sign>[iu])(?P<bits>8|16|32|64)(?P<endian>le|be)?$")
@@ -131,10 +264,19 @@ def _parse_int_value(text: str, signed: bool, bits: int) -> int:
 def get_int(
     queries: Annotated[
         list[IntRead] | IntRead,
-        "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc",
+        "Integer read requests with {addr, ty}. "
+        "ty format: <sign><bits>[<endian>] — "
+        "sign: 'i' (signed) or 'u' (unsigned); "
+        "bits: 8, 16, 32, 64; "
+        "endian: 'le' (little, default) or 'be' (big). "
+        "Examples: i8, u8, i16, u16, i32, u32, i64, u64, "
+        "i16le, u16be, i32le, u32be, i64le, u64be.",
     ],
 ) -> list[IntReadResult]:
-    """Read integer values from memory addresses"""
+    """Read integer values from memory addresses.
+
+    ty examples: ``i8`` ``u8`` ``i16`` ``u16le`` ``u32be`` ``i64`` ``u64le``
+    """
     if isinstance(queries, dict):
         queries = [queries]
 
@@ -156,7 +298,7 @@ def get_int(
                 {"addr": addr, "ty": normalized, "value": value}
             )
         except Exception as e:
-            results.append({"addr": addr, "ty": ty, "value": None, "error": str(e)})
+            results.append({"addr": addr, "ty": ty, "value": None, **item_error(e, f"read {ty} at {addr}")})
 
     return results
 
@@ -165,15 +307,26 @@ def get_int(
 @idasync
 def get_string(
     addrs: Annotated[list[str] | str, "Addresses to read strings from"],
+    max_length: Annotated[
+        int,
+        "Maximum string length in bytes (0 = IDA auto-detect, default). "
+        "Useful for truncating very long strings or reading fixed-length buffers.",
+    ] = 0,
 ) -> list[StringReadResult]:
-    """Read strings from memory addresses"""
+    """Read null-terminated strings from memory addresses.
+
+    Uses IDA's string literal detection by default (``max_length=0``).
+    Supply ``max_length`` to cap the result or to read from addresses where
+    IDA has not yet defined a string item.
+    """
     addrs = normalize_list_input(addrs)
+    ida_len = max_length if max_length > 0 else -1
     results = []
 
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            raw = idaapi.get_strlit_contents(ea, -1, 0)
+            raw = idaapi.get_strlit_contents(ea, ida_len, 0)
             if not raw:
                 results.append(
                     {"addr": addr, "value": None, "error": "No string at address"}
@@ -182,7 +335,7 @@ def get_string(
             value = raw.decode("utf-8", errors="replace")
             results.append({"addr": addr, "value": value})
         except Exception as e:
-            results.append({"addr": addr, "value": None, "error": str(e)})
+            results.append({"addr": addr, "value": None, **item_error(e, f"read string at {addr}")})
 
     return results
 
@@ -251,7 +404,7 @@ def get_global_value(
             value = get_global_variable_value_internal(ea)
             results.append({"query": query, "value": value})
         except Exception as e:
-            results.append({"query": query, "value": None, "error": str(e)})
+            results.append({"query": query, "value": None, **item_error(e, f"read global {query!r}")})
 
     return results
 
@@ -284,7 +437,7 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[PatchResult]:
             )
 
         except Exception as e:
-            results.append({"addr": patch.get("addr"), "size": 0, "error": str(e)})
+            results.append({"addr": patch.get("addr"), "size": 0, **item_error(e, f"patch bytes at {patch.get('addr', '?')}")})
 
     return results
 
@@ -333,7 +486,7 @@ def put_int(
                     "addr": addr,
                     "ty": ty,
                     "value": str(value_text) if value_text is not None else None,
-                    "error": str(e),
+                    **item_error(e, f"write {ty} at {addr}"),
                 }
             )
 

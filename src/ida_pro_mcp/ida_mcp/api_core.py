@@ -1,5 +1,6 @@
 """Core API Functions - IDB metadata and basic queries"""
 
+import ast
 import logging
 import re
 import time
@@ -10,7 +11,6 @@ import ida_bytes
 import idaapi
 import ida_funcs
 import ida_hexrays
-import ida_kernwin
 import ida_lines
 import ida_search
 import ida_segment
@@ -18,11 +18,17 @@ import idautils
 import ida_loader
 import ida_nalt
 import ida_typeinf
+import ida_name
 import idc
 
-from .rpc import tool
-from .sync import idasync, get_tool_deadline
+import json
+
+from .rpc import tool, get_cached_output, MCP_PROFILES
+from .arg_aliases import _GLOBAL_ARG_ALIASES, _TOOL_ARG_ALIASES
+from .sync import idasync, IDAError
 from .utils import (
+    tool_error,
+    item_error,
     ConvertedNumber,
     EntityQuery,
     Function,
@@ -34,11 +40,13 @@ from .utils import (
     Page,
     ImportQuery,
     get_function,
+    get_prototype,
     normalize_dict_list,
     normalize_list_input,
     parse_address,
     paginate,
     pattern_filter,
+    summary_stats,
 )
 
 
@@ -56,6 +64,15 @@ class ServerHealthResult(TypedDict):
     hexrays_ready: bool
     strings_cache_ready: bool
     strings_cache_size: int
+    profiles: NotRequired[dict[str, int]]
+    arg_aliases: NotRequired[dict]
+    alias_tips: NotRequired[list[str]]
+    binary_class: NotRequired[str]
+    binary_size_mb: NotRequired[float]
+    function_count: NotRequired[int]
+    string_count: NotRequired[int]
+    segment_count: NotRequired[int]
+    reliability_notes: NotRequired[dict[str, str]]
 
 
 class ServerWarmupStep(TypedDict, total=False):
@@ -75,6 +92,8 @@ class LookupFuncResult(TypedDict):
     query: str
     fn: Function | None
     error: str | None
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class IntConvertResult(TypedDict):
@@ -91,6 +110,8 @@ class FunctionQueryRow(Function, total=False):
 class FunctionQueryPage(TypedDict, total=False):
     data: list[FunctionQueryRow]
     next_offset: int | None
+    total: int
+    summary: dict
     error: str | None
 
 
@@ -105,18 +126,48 @@ class EntityQueryPage(TypedDict, total=False):
 class ImportsQueryPage(TypedDict):
     data: list[Import]
     next_offset: int | None
+    total: int
 
 
 class IdbSaveResult(TypedDict):
     ok: bool
     path: str | None
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
+
+
+class DemangleEntry(TypedDict, total=False):
+    raw: str
+    demangled: str | None
+    demangled_short: str | None
+    mangling_type: str   # "msvc" | "itanium" | "plain"
+    success: bool
+
+
+class DemangleResult(TypedDict, total=False):
+    ok: bool
+    results: list[DemangleEntry]
+    success_count: int
+    fail_count: int
+    error: str
+    error_type: str
 
 
 class FindRegexResult(TypedDict, total=False):
     n: int
+    total: int            # total candidates before pagination
     matches: list[dict[str, Any]]
     cursor: dict[str, Any]
+    error: str | None
+    error_type: str
+    hint: str
+
+
+class ListStringsResult(TypedDict, total=False):
+    strings: list[dict[str, Any]]
+    total: int
+    next_offset: int | None
     error: str | None
 
 
@@ -137,11 +188,72 @@ class SearchTextResult(TypedDict, total=False):
     hits: list[SearchTextHit]
     cursor: dict[str, Any]
     error: str
+    error_type: str
+    hint: str
 
 
 # Cached strings list: [(ea, text), ...]
 _strings_cache: list[tuple[int, str]] | None = None
 _server_started_at = time.time()
+# Cached binary classification — set once by _build_health_payload, used by
+# find_regex/search_text for auto-async routing on very_large binaries.
+_BINARY_CLASS: str = "small"
+_BINARY_CLASS_INITIALIZED: bool = False
+_FUNC_COUNT_CACHE: int = 0  # set by _ensure_binary_class / _build_health_payload
+
+
+def _is_auto_analysis_running() -> bool:
+    """True while IDA's auto-analyzer is still working.
+
+    Function-enumeration APIs (``get_func_qty``, ``get_next_func`` /
+    ``idautils.Functions()``) can block until the analyzer drains its queue —
+    especially in the headless idalib worker, whose single thread has no UI
+    pump to service a mid-analysis query. Probes and enumeration tools call
+    this first and skip/defer rather than block.
+
+    Defaults to ``False`` (assume idle) when the auto-state API is unavailable,
+    so a probe never hard-fails just because it could not read the state. This
+    function was referenced by the health/size paths but never defined — its
+    absence raised NameError, which the callers swallowed and reported
+    ``function_count: 0`` for every session (idalib validation-gate Issue 1).
+    """
+    try:
+        import ida_auto
+        get_state = getattr(ida_auto, "get_auto_state", None)
+        if get_state is None:
+            return False
+        au_none = getattr(ida_auto, "AU_NONE", 0)
+        return get_state() != au_none
+    except Exception:
+        return False
+
+
+def _ensure_binary_class() -> None:
+    """Lazy-init _BINARY_CLASS on the first call to a size-sensitive tool.
+
+    Called from find_regex / search_text when _BINARY_CLASS is still 'small'.
+    Avoids calling slow IDA APIs at module load time.
+    """
+    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED, _FUNC_COUNT_CACHE
+    if _BINARY_CLASS_INITIALIZED:
+        return
+    try:
+        import ida_funcs, ida_segment, ida_nalt
+        if _is_auto_analysis_running():
+            # Analyzer still draining — get_func_qty() can block here. Defer
+            # classification to a later call (stays 'small' for now).
+            return
+        func_count = ida_funcs.get_func_qty()
+        _FUNC_COUNT_CACHE = func_count
+        binary_mb = max(1.0, ida_nalt.retrieve_input_file_size() / (1024 * 1024))
+        if func_count > 50000 or binary_mb > 40:
+            _BINARY_CLASS = "very_large"
+        elif func_count > 10000 or binary_mb > 15:
+            _BINARY_CLASS = "large"
+        # else stays "small"
+    except Exception:
+        pass
+    _BINARY_CLASS_INITIALIZED = True
 
 
 def _get_strings_cache() -> list[tuple[int, str]]:
@@ -359,7 +471,7 @@ def _build_health_payload() -> dict:
     except Exception:
         idb_path = None
 
-    return {
+    result: dict = {
         "status": "ok",
         "uptime_sec": round(time.time() - _server_started_at, 3),
         "idb_path": idb_path,
@@ -371,22 +483,139 @@ def _build_health_payload() -> dict:
         "strings_cache_ready": _strings_cache is not None,
         "strings_cache_size": len(_strings_cache) if _strings_cache is not None else 0,
     }
+    if MCP_PROFILES:
+        result["profiles"] = {
+            name: len(tools) for name, tools in sorted(MCP_PROFILES.items())
+        }
+    result["arg_aliases"] = {
+        "global": dict(_GLOBAL_ARG_ALIASES),
+        "per_tool": {k: dict(v) for k, v in sorted(_TOOL_ARG_ALIASES.items())},
+    }
+    # Human-readable tips generated from the live tables — never go stale.
+    addr_single = sorted(t for t, a in _TOOL_ARG_ALIASES.items() if a.get("address") == "addr")
+    addr_batch  = sorted(t for t, a in _TOOL_ARG_ALIASES.items() if a.get("address") == "addrs")
+    tips: list[str] = []
+    if addr_single:
+        tips.append(
+            f"'addr' and 'address' are both accepted for these single-address tools: "
+            f"{', '.join(addr_single)}"
+        )
+    if addr_batch:
+        tips.append(
+            f"'addr' and 'address' are both accepted for these batch tools (mapped to 'addrs'): "
+            f"{', '.join(addr_batch)}"
+        )
+    tips.append(
+        "'src'/'start_address'/'start_ea'/'addr_a' → 'start';  "
+        "'dst'/'end_address'/'target_ea'/'addr_b' → 'end'"
+    )
+    tips.append(
+        "'max_results' and 'max_entries' → 'limit' globally "
+        "(except find_similar_functions which uses 'max_results' directly)"
+    )
+    tips.append(
+        "'max_instructions' → 'max_insns' globally; "
+        "disasm and disasm_batch reverse this automatically"
+    )
+    result["alias_tips"] = tips
+
+    # Binary-size classification so agents can self-adapt before making calls.
+    # Use APIs that work BEFORE auto-analysis completes — no full enumeration.
+    try:
+        seg_count = ida_segment.get_segm_qty()
+    except Exception:
+        seg_count = 0
+
+    # get_func_qty() may block during auto-analysis on very large
+    # binaries — skip it while analysis is running. classify by
+    # binary_mb alone in that case.
+    try:
+        if _is_auto_analysis_running():
+            func_count = 0
+        else:
+            func_count = ida_funcs.get_func_qty()
+    except Exception:
+        func_count = 0
+
+    # retrieve_input_file_size() is a fast metadata read — always safe.
+    try:
+        binary_bytes = ida_nalt.retrieve_input_file_size()
+    except Exception:
+        try:
+            binary_bytes = idaapi.inf_get_max_ea() - idaapi.inf_get_min_ea()
+        except Exception:
+            binary_bytes = 0
+
+    # String count is enumerative — skip on large binaries; the
+    # strings_cache already tracks this reliably.
+    str_count = len(_strings_cache) if _strings_cache is not None else 0
+
+    binary_mb = round(binary_bytes / (1024 * 1024), 2) if binary_bytes else 0.0
+
+    result["segment_count"] = seg_count
+    result["function_count"] = func_count
+    result["string_count"] = str_count
+    result["binary_size_mb"] = binary_mb
+
+    # Classification thresholds tuned from real-world experience across 4 binaries
+    # (6.7 MB crackme → "small", 9 MB BoneTown → "small", 30 MB Bully → "large",
+    #  49 MB GameAssembly → "very_large").
+    if func_count > 50000 or binary_mb > 40:
+        binary_class = "very_large"
+        notes = {
+            "find_regex": "Binary too large for broad regex. Use short, specific patterns (max 20 chars).",
+            "search_text": "Binary too large — will time out. Use find_regex instead.",
+            "py_eval": "Use task_submit for any scan >100KB.",
+            "decompile": "Functions >10KB may time out. Use task_submit.",
+            "analyze_function": "Functions >600 basic blocks may time out. Use task_submit.",
+            "find_similar_functions": "Binary-wide scan will time out. Limit scope with scope='.text'.",
+            "callgraph": "Full graph will time out. Use max_depth=2 and max_nodes=200.",
+        }
+    elif func_count > 10000 or binary_mb > 15:
+        binary_class = "large"
+        notes = {
+            "find_regex": "Use specific patterns to avoid timeouts.",
+            "search_text": "May be slow. Prefer find_regex for string searches.",
+            "decompile": "Large functions may be slow. Use task_submit for functions >20KB.",
+            "callgraph": "Limit depth to 3 with max_nodes=500 for large graphs.",
+        }
+    else:
+        binary_class = "small"
+        notes = {
+            "find_regex": "Safe for broad patterns.",
+            "search_text": "Safe.",
+            "decompile": "Safe for all function sizes.",
+        }
+
+    result["binary_class"] = binary_class
+    result["reliability_notes"] = notes
+
+    global _BINARY_CLASS, _BINARY_CLASS_INITIALIZED, _FUNC_COUNT_CACHE
+    _BINARY_CLASS = binary_class
+    _BINARY_CLASS_INITIALIZED = True
+    _FUNC_COUNT_CACHE = func_count
+
+    return result
 
 
 @tool
 @idasync
 def server_health() -> ServerHealthResult:
-    """Health/ready probe for MCP server and current IDB state."""
+    """Health/ready probe for MCP server and current IDB state.
+
+    Profile: core
+    """
     return _build_health_payload()
 
 
+@tool
 @idasync
 def server_warmup(
-    wait_auto_analysis: bool = True,
-    build_caches: bool = True,
-    init_hexrays: bool = True,
+    wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
+    build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
+    init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
 ) -> ServerWarmupResult:
-    """Warm up IDA subsystems. Called by idb_open; no longer exposed as an MCP tool."""
+    """Warm up IDA subsystems to reduce first-call latency and transient failures."""
     steps = []
 
     if wait_auto_analysis:
@@ -468,19 +697,70 @@ def lookup_funcs(
             else:
                 results.append({"query": query, "fn": None, "error": "Not found"})
         except Exception as e:
-            results.append({"query": query, "fn": None, "error": str(e)})
+            results.append({"query": query, "fn": None, **item_error(e, f"lookup {query!r}")})
 
     return results
+
+
+def _eval_int_expression(text: str) -> int:
+    """Safely evaluate a numeric expression containing bitwise operators.
+
+    Falls back to plain int() for simple literals. For expressions like
+    '0x3e ^ 0x5d' or '(0x10 << 2) | 3', parses via ast and evaluates with
+    a restricted namespace (no builtins, no calls, no attribute access).
+    """
+    # 1) Plain literal (hex, dec, oct, bin)
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+
+    # 2) Expression — validate AST, then eval safely
+    try:
+        tree = ast.parse(text.strip(), mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid expression: {text}") from exc
+
+    _ALLOWED = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.Pow,
+        ast.LShift,
+        ast.RShift,
+        ast.BitOr,
+        ast.BitXor,
+        ast.BitAnd,
+        ast.Invert,
+        ast.USub,
+        ast.UAdd,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED):
+            raise ValueError(
+                f"Unsupported element in expression: {type(node).__name__}"
+            )
+
+    result = eval(compile(tree, "<string>", "eval"), {"__builtins__": {}}, {})
+    return int(result)
 
 
 @tool
 def int_convert(
     inputs: Annotated[
         list[NumberConversion] | NumberConversion,
-        "Convert numbers to various formats (hex, decimal, binary, ascii)",
+        "Convert numbers to various formats (hex, decimal, binary, ascii). "
+        "Supports basic arithmetic and bitwise expressions: + - * // % ** "
+        "<< >> & | ^ ~.",
     ],
 ) -> list[IntConvertResult]:
-    """Convert numbers to different formats"""
+    """Convert numbers to different formats. Supports expressions like 0x3e ^ 0x5d."""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
     results = []
@@ -489,10 +769,10 @@ def int_convert(
         size = item.get("size")
 
         try:
-            value = int(text, 0)
-        except ValueError:
+            value = _eval_int_expression(text)
+        except Exception as exc:
             results.append(
-                {"input": text, "result": None, "error": f"Invalid number: {text}"}
+                {"input": text, "result": None, "error": f"Invalid number: {exc}"}
             )
             continue
 
@@ -544,13 +824,126 @@ def int_convert(
 
 @tool
 @idasync
+def demangle_names(
+    names: Annotated[
+        list[str] | str,
+        "One or more mangled C++ symbol names to demangle. "
+        "Accepts MSVC ?-mangled names (e.g. '??0FString@@QAE@XZ') and "
+        "Itanium/GCC _Z-mangled names (e.g. '_ZN3FooC1Ev'). "
+        "Plain names are passed through as-is with success=false.",
+    ],
+) -> DemangleResult:
+    """Batch-demangle C++ symbol names using IDA Pro's built-in demangler.
+
+    Returns both a long form (full type signature with return type and calling
+    convention) and a short form (ClassName::method only) for each name.
+    IDA's demangler handles MSVC ?-mangled names (Engine.dll, Core.dll, etc.)
+    and Itanium _Z-mangled names (Linux shared libraries).
+
+    Use this tool when you have a list of mangled names from any source
+    (vtable dumps, export tables, YARA matches, memory scans) and need
+    human-readable class::method names for analysis or documentation.
+
+    Profile: analysis
+    """
+    try:
+        name_list = normalize_list_input(names)
+        entries: list[DemangleEntry] = []
+        success_count = 0
+        fail_count = 0
+
+        for raw in name_list:
+            if not raw or not isinstance(raw, str):
+                entries.append({"raw": str(raw), "demangled": None, "demangled_short": None,
+                                 "mangling_type": "plain", "success": False})
+                fail_count += 1
+                continue
+
+            # Detect mangling convention from name prefix
+            if raw.startswith("?"):
+                mangling_type = "msvc"
+            elif raw.startswith("_Z") or raw.startswith("__Z"):
+                mangling_type = "itanium"
+            else:
+                mangling_type = "plain"
+
+            # Long form: full signature with return type and calling convention
+            long_form: str | None = None
+            try:
+                r = ida_name.demangle_name(raw, ida_name.MNG_LONG_FORM)
+                if r and r != raw:
+                    long_form = r
+            except Exception:
+                pass
+
+            # Short form: class::method without return type or calling convention.
+            # MNG_NODEFINIT (0x8) + MNG_NORETTYPE (0x80) suppress those parts.
+            # MNG_NORETTYPE may not be present on all IDA versions; fall back to 0x80.
+            _MNG_NORETTYPE = getattr(ida_name, "MNG_NORETTYPE", 0x80)
+            short_form: str | None = None
+            try:
+                r = ida_name.demangle_name(raw, ida_name.MNG_NODEFINIT | _MNG_NORETTYPE)
+                if r and r != raw:
+                    short_form = r
+            except Exception:
+                pass
+
+            # If IDA couldn't produce a distinct short form, derive it from the
+            # long form by stripping access specifier + return type prefix
+            # (everything before the last token that contains "::").
+            if long_form and not short_form:
+                # e.g. "public: void __thiscall Foo::Bar(int)" → "Foo::Bar(int)"
+                paren = long_form.find("(")
+                prefix = long_form[:paren] if paren != -1 else long_form
+                tokens = prefix.split()
+                for i, tok in enumerate(tokens):
+                    if "::" in tok:
+                        short_form = " ".join(tokens[i:])
+                        if paren != -1:
+                            short_form += long_form[paren:]
+                        break
+
+            success = long_form is not None or short_form is not None
+            if success:
+                success_count += 1
+            else:
+                fail_count += 1
+
+            entries.append({
+                "raw": raw,
+                "demangled": long_form,
+                "demangled_short": short_form,
+                "mangling_type": mangling_type,
+                "success": success,
+            })
+
+        return {
+            "ok": True,
+            "results": entries,
+            "success_count": success_count,
+            "fail_count": fail_count,
+        }
+    except Exception as e:
+        return {**tool_error(e), "ok": False}
+
+
+@tool
+@idasync
 def list_funcs(
     queries: Annotated[
         list[ListQuery] | ListQuery,
         "List functions with optional filtering and pagination",
     ],
 ) -> list[Page[Function]]:
-    """List functions with optional filtering and offset/count pagination."""
+    """List functions with optional name-glob filtering and offset/count pagination.
+
+    **When to use:** simple name-pattern browsing, paginated dumps.
+    For size/type/regex constraints use ``func_query``.
+    For a multi-entity catalog (functions + globals + imports + strings in one call)
+    use ``entity_query``.
+    For richer per-function flags (is_thunk, is_library, has_prototype) use
+    ``list_functions_enhanced``.
+    """
     queries = normalize_dict_list(queries)
     all_functions = [get_function(addr) for addr in idautils.Functions()]
 
@@ -572,13 +965,177 @@ def list_funcs(
 
 @tool
 @idasync
+def list_functions_enhanced(
+    filter: Annotated[str, "Glob filter on function name (empty = all)"] = "",
+    offset: Annotated[int, "Start index for pagination (default: 0)"] = 0,
+    count: Annotated[int, "Max functions to return (default: 100, 0 = all)"] = 100,
+    include_prototype: Annotated[
+        bool,
+        "Include type/prototype string per function. Slower — skips IDB-untyped functions.",
+    ] = False,
+) -> dict:
+    """List functions with extended classification flags.
+
+    Returns ``is_thunk``, ``is_library``, ``is_noret``, ``has_prototype``, and
+    ``is_external`` per function — flags that ``list_funcs`` omits.  Aggregate
+    counts in the top-level result let you gauge annotation coverage at a glance.
+
+    Profile: core
+    """
+    try:
+        if _is_auto_analysis_running():
+            return {
+                "ok": False,
+                "error": "analysis_in_progress",
+                "error_type": "AnalysisInProgress",
+                "hint": (
+                    "Auto-analysis is still running; function enumeration can block "
+                    "the worker. Retry shortly, or call analysis_status() to check, "
+                    "then re-run."
+                ),
+            }
+        all_items: list[dict] = []
+        for start_ea in idautils.Functions():
+            fn = idaapi.get_func(start_ea)
+            if not fn:
+                continue
+            flags = fn.flags
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            has_type = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), start_ea))
+            item: dict = {
+                "addr": hex(start_ea),
+                "name": name,
+                "size": hex(fn.end_ea - start_ea),
+                "is_thunk": bool(flags & ida_funcs.FUNC_THUNK),
+                "is_library": bool(flags & ida_funcs.FUNC_LIB),
+                "is_noret": bool(flags & ida_funcs.FUNC_NORET),
+                "has_prototype": has_type,
+                "is_external": False,
+            }
+            try:
+                seg = idaapi.getseg(start_ea)
+                if seg and (
+                    seg.type == idaapi.SEG_XTRN
+                    or any(
+                        n in (idc.get_segm_name(start_ea) or "").lower()
+                        for n in (".plt", ".idata", "__stubs", "extern")
+                    )
+                ):
+                    item["is_external"] = True
+            except Exception:
+                pass
+            if include_prototype:
+                item["prototype"] = get_prototype(fn) if has_type else None
+            all_items.append(item)
+
+        filtered = pattern_filter(all_items, filter, "name") if filter and filter not in ("*", "") else all_items
+        page = paginate(filtered, offset, count if count > 0 else len(filtered))
+        return {
+            "ok": True,
+            **page,
+            "total_functions": len(filtered),
+            "thunk_count": sum(1 for r in all_items if r.get("is_thunk")),
+            "library_count": sum(1 for r in all_items if r.get("is_library")),
+            "noret_count": sum(1 for r in all_items if r.get("is_noret")),
+            "typed_count": sum(1 for r in all_items if r.get("has_prototype")),
+            "external_count": sum(1 for r in all_items if r.get("is_external")),
+        }
+    except Exception as e:
+        return tool_error(e, context="list_functions_enhanced")
+
+
+@tool
+@idasync
+def list_classes(
+    filter: Annotated[str, "Glob filter on class/namespace name (empty = all)"] = "",
+    offset: Annotated[int, "Start index (default: 0)"] = 0,
+    count: Annotated[int, "Max classes to return (default: 100, 0 = all)"] = 100,
+    min_methods: Annotated[int, "Minimum method count to include a class (default: 1)"] = 1,
+    include_methods: Annotated[
+        bool, "Include per-class method list (default: True)"
+    ] = True,
+) -> dict:
+    """Extract class and namespace names from IDB symbols.
+
+    Scans all named addresses for C++ mangling patterns (``::`` separator,
+    ``_ZN``/``??`` prefixes) and groups methods by their class prefix.  Works
+    on any binary where RTTI, PDB symbols, or user renaming has introduced
+    ``ClassName::method`` style names.
+
+    Profile: core
+    """
+    try:
+        class_map: dict[str, list[dict]] = {}
+        for ea, raw_name in idautils.Names():
+            if not raw_name:
+                continue
+            demangled = (
+                ida_name.demangle_name(raw_name, ida_name.MNG_LONG_FORM) or raw_name
+            )
+            if "::" not in demangled:
+                continue
+            # Strip argument list to get the "ReturnType Class::method" prefix
+            name_part = demangled.split("(")[0].rstrip()
+            last_sep = name_part.rfind("::")
+            if last_sep < 0:
+                continue
+            raw_class = name_part[:last_sep].strip()
+            method_short = name_part[last_sep + 2:].strip()
+            # Strip leading return-type words (e.g. "int" in "int ClassName")
+            ws = raw_class.rfind(" ")
+            class_name = raw_class[ws + 1:] if ws >= 0 else raw_class
+            if not class_name or not method_short:
+                continue
+            entry = {
+                "addr": hex(ea),
+                "name": demangled,
+                "short_name": method_short,
+            }
+            class_map.setdefault(class_name, []).append(entry)
+
+        classes: list[dict] = []
+        for cls_name, methods in sorted(class_map.items(), key=lambda x: x[0].lower()):
+            if len(methods) < min_methods:
+                continue
+            rec: dict = {
+                "class_name": cls_name,
+                "method_count": len(methods),
+            }
+            if include_methods:
+                rec["methods"] = sorted(methods, key=lambda m: m["short_name"])
+            classes.append(rec)
+
+        filtered_cls = (
+            pattern_filter(classes, filter, "class_name")
+            if filter and filter not in ("*", "")
+            else classes
+        )
+        total = len(filtered_cls)
+        page = paginate(filtered_cls, offset, count if count > 0 else total)
+        return {
+            "ok": True,
+            **page,
+            "total_classes": total,
+        }
+    except Exception as e:
+        return tool_error(e, context="list_classes")
+
+
+@tool
+@idasync
 def func_query(
     queries: Annotated[
         list[FunctionQuery] | FunctionQuery,
         "Richer function query (size/type/name filters + pagination)",
     ],
 ) -> list[FunctionQueryPage]:
-    """Query functions with richer filtering than list_funcs."""
+    """Query functions with size, type, and regex-name constraints.
+
+    **When to use:** you need to filter by function size, whether it has a type, or
+    match names with a full regex. For simple glob filtering use ``list_funcs``.
+    For a multi-entity catalog (functions + globals + imports + strings) use
+    ``entity_query``. For richer per-function flags use ``list_functions_enhanced``.
+    """
     queries = normalize_dict_list(queries)
 
     all_functions: list[dict] = []
@@ -646,7 +1203,11 @@ def func_query(
             filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
 
         page = paginate(filtered, offset, count)
+        # Summarize the size distribution before stripping the numeric size_int.
+        size_summary = summary_stats(page["data"], "size_int", label_field="name")
         page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        if size_summary is not None:
+            page["summary"] = {"size": size_summary}
         results.append(page)
 
     return results
@@ -691,7 +1252,27 @@ def entity_query(
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[EntityQueryPage]:
-    """Query IDB entities with typed filters, projection, and pagination."""
+    """Universal query tool for functions, globals, imports, strings, and names.
+
+    **When to use:** you need to enumerate multiple entity kinds in one call, or want
+    projection/sorting over any entity type. For function-only queries:
+    - Name glob only → ``list_funcs``
+    - Size / type / regex constraints → ``func_query``
+    - Richer per-function flags (is_thunk, is_library) → ``list_functions_enhanced``
+
+    Common queries:
+      - All strings: {"kind": "strings", "count": 0}
+      - All functions: {"kind": "functions", "count": 0}
+      - Functions matching a name pattern: {"kind": "functions", "filter": "sub_41*", "count": 100}
+      - Imports from a specific DLL: {"kind": "imports", "filter": "kernel32*", "count": 0}
+      - All named globals: {"kind": "globals", "count": 0}
+
+    Supports projection (fields), sorting (sort_by), and pagination (offset/count).
+
+    See also: list_funcs (name-glob function list), func_query (size/type/regex),
+    list_functions_enhanced (function flags), list_globals (global catalog),
+    imports_query (import catalog), find_regex (regex search across strings/names).
+    """
     queries = normalize_dict_list(queries)
     results: list[dict] = []
 
@@ -833,11 +1414,7 @@ def imports_query(
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> IdbSaveResult:
-    """Save active IDB to disk, optionally to a provided path.
-
-    Always packs into a single compressed .i64/.idb, removing the loose
-    .id0/.id1/.id2/.nam/.til working files.
-    """
+    """Save active IDB to disk, optionally to a provided path."""
     try:
         save_path = path.strip() if path else ""
         if not save_path:
@@ -845,57 +1422,189 @@ def idb_save(
         if not save_path:
             return {"ok": False, "path": None, "error": "Could not resolve IDB path"}
 
-        flags = ida_loader.DBFL_KILL | ida_loader.DBFL_COMP
-        ok = bool(ida_loader.save_database(save_path, flags))
+        ok = bool(ida_loader.save_database(save_path, 0))
         result: dict = {"ok": ok, "path": save_path}
         if not ok:
             result["error"] = "save_database returned false"
         return result
     except Exception as e:
-        return {"ok": False, "path": path or None, "error": str(e)}
+        return {**tool_error(e), "path": path or None}
+
+
+@tool
+@idasync
+def list_strings(
+    limit: Annotated[int, "Max strings to return (default: 1000, 0 = all)"] = 1000,
+    offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    min_length: Annotated[int, "Minimum string length (default: 4)"] = 4,
+    filter_pattern: Annotated[str, "Optional glob/regex filter on string text (empty = all)"] = "",
+) -> ListStringsResult:
+    """List all strings in the binary with optional length filtering.
+
+    This is a convenience wrapper around the internal string cache.
+    For advanced filtering, projection, and sorting, use entity_query(kind='strings')
+    directly.
+
+    See also: entity_query (advanced string queries), find_regex (pattern search),
+    search_text (disassembly/comment search).
+    """
+    try:
+        candidates = []
+        for ea, text in _get_strings_cache():
+            if len(text) < min_length:
+                continue
+            if filter_pattern and not pattern_filter([{"text": text}], filter_pattern, "text"):
+                continue
+            candidates.append({"addr": hex(ea), "text": text})
+
+        page = paginate(candidates, offset, limit if limit > 0 else len(candidates))
+        return {
+            "strings": page["data"],
+            "total": page["total"],
+            "next_offset": page["next_offset"],
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "strings": [],
+            "total": 0,
+            "next_offset": None,
+            **item_error(e, "list_strings"),
+        }
 
 
 @tool
 @idasync
 def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
-    limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
+    limit: Annotated[int, "Max matches (default: 50, max: 500)"] = 50,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    search_strings: Annotated[bool, "Search string literals (default: true)"] = True,
+    search_names: Annotated[bool, "Search function and symbol names (default: true)"] = True,
+    scan_raw: Annotated[
+        bool,
+        "Also scan raw bytes of data segments for matches not in IDA's string table. "
+        "Useful for encrypted/packed regions or unpacked shellcode where IDA has not "
+        "yet defined string items. Slower; use only when normal string search is empty.",
+    ] = False,
 ) -> FindRegexResult:
-    """Search strings by case-insensitive regex with offset/limit pagination."""
+    """Search by case-insensitive regex across string literals and symbol names.
+
+    By default searches both the string table (literal char* data) and all named
+    symbols (functions, globals, labels). Use ``search_strings``/``search_names`` to
+    narrow the scope.
+
+    **Search semantics:** operates on IDA's internal string database — the strings
+    IDA identified and created items for during analysis. It does NOT scan raw file
+    bytes. Strings in packed/encrypted sections, or in DLLs that are not loaded into
+    the active IDB, will not appear here. For raw byte scanning of files on disk
+    (including DLLs not in the IDB), use ``lief_strings(file_path=...)`` instead.
+
+    For searching the **disassembly listing or comments**, use ``search_text`` instead.
+    For searching **raw bytes in data segments** (e.g. decrypted regions where IDA has
+    not created string items), set ``scan_raw=true``.
+
+    For a simple list of all strings without a regex, use ``list_strings`` or
+    ``entity_query(kind='strings')``.
+
+    See also: lief_strings (raw file bytes, works on any file on disk),
+    search_text (disassembly/comment search), entity_query (full catalog),
+    list_strings (simple string dump).
+
+    LATENCY: Linear in string count. On very_large binaries (95K+ functions), this
+    tool auto-routes to a background task (see rpc.py tools/call handler).
+    Use task_submit manually on large (not very_large) binaries, or narrow
+    patterns (max 20 chars).
+    """
     if limit <= 0:
-        limit = 30
+        limit = 50
     if limit > 500:
         limit = 500
 
-    matches = []
-    regex = re.compile(pattern, re.IGNORECASE)
-    strings = _get_strings_cache()
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"Invalid regex: {e}"}
 
-    skipped = 0
-    more = False
-    for ea, text in strings:
-        if regex.search(text):
-            if skipped < offset:
-                skipped += 1
+    # Collect all candidates in a single ordered pass, then paginate.
+    # Each entry: {"addr": hex, "text": str, "kind": "string"|"name"|"raw"}
+    candidates: list[dict] = []
+    seen_addrs: set[str] = set()
+
+    if search_strings:
+        for ea, text in _get_strings_cache():
+            if regex.search(text):
+                addr_hex = hex(ea)
+                candidates.append({"addr": addr_hex, "text": text, "kind": "string"})
+                seen_addrs.add(addr_hex)
+
+    if search_names:
+        for name_ea, name in idautils.Names():
+            if name and regex.search(name):
+                addr_hex = hex(name_ea)
+                if addr_hex not in seen_addrs:
+                    candidates.append({"addr": addr_hex, "text": name, "kind": "name"})
+                    seen_addrs.add(addr_hex)
+
+    if scan_raw:
+        # Scan data segments for raw byte matches not in the string table
+        _RAW_SCAN_CAP_PER_SEG = 16 * 1024 * 1024  # 16 MiB per segment
+        for seg_ea in idautils.Segments():
+            seg = idaapi.getseg(seg_ea)
+            if not seg or seg.size() < 4:
                 continue
-            if len(matches) >= limit:
-                more = True
-                break
-            matches.append({"addr": hex(ea), "string": text})
+            try:
+                seg_size = min(int(seg.size()), _RAW_SCAN_CAP_PER_SEG)
+                data = idaapi.get_bytes(seg.start_ea, seg_size)
+                if not data:
+                    continue
+                for m in regex.finditer(data):
+                    match_addr = seg.start_ea + m.start()
+                    addr_hex = hex(match_addr)
+                    if addr_hex in seen_addrs:
+                        continue
+                    match_bytes = data[m.start() : m.end()]
+                    # Best-effort display: try UTF-8, fall back to hex
+                    try:
+                        text = match_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = match_bytes.hex()
+                    candidates.append({"addr": addr_hex, "text": text, "kind": "raw"})
+                    seen_addrs.add(addr_hex)
+            except Exception:
+                continue
+
+    # Stable sort: strings first, then names, then raw, preserving address order
+    candidates.sort(
+        key=lambda c: (
+            {"string": 0, "name": 1, "raw": 2}.get(c["kind"], 3),
+            int(c["addr"], 16),
+        )
+    )
+
+    total = len(candidates)
+    page = candidates[offset: offset + limit]
+    more = (offset + limit) < total
+
+    matches = [{"addr": c["addr"], "string": c["text"], "kind": c["kind"]} for c in page]
 
     return {
         "n": len(matches),
         "matches": matches,
+        "total": total,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
 
 
-_COMMENT_SCOLORS = (
-    ida_lines.SCOLOR_REGCMT,
-    ida_lines.SCOLOR_RPTCMT,
-    ida_lines.SCOLOR_AUTOCMT,
-    ida_lines.SCOLOR_COLLAPSED,
+_COMMENT_SCOLORS = tuple(
+    c
+    for c in (
+        getattr(ida_lines, "SCOLOR_REGCMT", None),
+        getattr(ida_lines, "SCOLOR_RPTCMT", None),
+        getattr(ida_lines, "SCOLOR_AUTOCMT", None),
+        getattr(ida_lines, "SCOLOR_COLLAPSED", None),
+    )
+    if c is not None
 )
 
 
@@ -973,24 +1682,27 @@ def _all_segments() -> list[tuple[int, int]]:
 def search_text(
     pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
     limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
-    start: Annotated[str, "Lower bound (hex or symbol). Empty = first segment."] = "",
-    end: Annotated[str, "Upper bound (hex or symbol, exclusive). Empty = last segment."] = "",
-    regex: Annotated[bool, "Treat pattern as a Python regex"] = False,
+    cursor: Annotated[str, "Resume address: hex or symbol returned by the previous call's cursor field. Empty = start from first segment."] = "",
+    regex: Annotated[bool, "Treat pattern as a regex (uses IDA's SEARCH_REGEX)"] = False,
     case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
     code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
 ) -> SearchTextResult:
-    """Search the rendered listing for `pattern` over [start, end).
+    """Search the rendered listing using IDA's native text search (fast C++ scan).
 
-    Iterates `idautils.Heads()` in pure Python and renders each via
-    `ida_lines.generate_disassembly()`. Per-head iteration is cheap and
-    yields between heads, so the per-tool deadline (sync_wrapper) and the
-    UI Cancel button both interrupt the walk reliably — unlike the C-level
-    `ida_search.find_text()` it replaced, which on huge .text segments
-    could run for minutes without polling `user_cancelled()`.
+    Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
+    once via `ida_lines.generate_disassembly()` to extract matching lines and
+    classify them as disasm or comment. Returns one hit per EA.
 
-    Use `start`/`end` to scope the work for predictable performance on
-    large binaries; without them the scan covers the whole image.
+    The ``cursor`` field contains a hex address string (e.g. ``\"0x401234\"``) to
+    resume from on the next page — pass it back as the ``cursor`` argument.
+
+    See also: find_regex (regex search across strings/symbol names),
+    insn_query (instruction pattern search).
+
+    LATENCY: Linear in binary size. On very_large binaries (95K+ functions), this
+    tool auto-routes to a background task (see rpc.py tools/call handler).
+    Use find_regex with short patterns on large (not very_large) binaries.
     """
     if limit <= 0:
         limit = 30
@@ -1004,7 +1716,7 @@ def search_text(
     want_disasm = include in ("disasm", "all")
     want_comments = include in ("comments", "all")
 
-    # Per-line matcher (Python re or substring; case folding done here).
+    # Build a Python-side matcher for per-line filtering after the C++ find.
     if regex:
         try:
             flags = 0 if case_sensitive else re.IGNORECASE
@@ -1012,99 +1724,154 @@ def search_text(
         except re.error as e:
             return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
         matcher = lambda s: bool(rx.search(s))
-    elif case_sensitive:
-        needle = pattern
-        matcher = lambda s: needle in s
     else:
-        needle = pattern.lower()
-        matcher = lambda s: needle in s.lower()
+        if case_sensitive:
+            needle = pattern
+            matcher = lambda s: needle in s
+        else:
+            needle = pattern.lower()
+            matcher = lambda s: needle in s.lower()
 
+    # Build IDA search flags.
+    sflag = ida_search.SEARCH_DOWN | ida_search.SEARCH_NOSHOW
+    if case_sensitive:
+        sflag |= ida_search.SEARCH_CASE
+    if regex:
+        sflag |= ida_search.SEARCH_REGEX
+
+    # Resolve cursor.
     segments = _exec_segments() if code_only else _all_segments()
     if not segments:
         return {"n": 0, "hits": [], "cursor": {"done": True}}
 
-    if start:
+    if cursor:
         try:
-            start_ea = parse_address(start)
+            cursor_ea = parse_address(cursor)
         except Exception as e:
-            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid start: {e}"}
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid cursor: {e}"}
     else:
-        start_ea = segments[0][0]
-
-    if end:
-        try:
-            end_ea = parse_address(end)
-        except Exception as e:
-            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid end: {e}"}
-    else:
-        end_ea = segments[-1][1]
-
-    if end_ea <= start_ea:
-        return {"n": 0, "hits": [], "cursor": {"done": True}}
+        cursor_ea = segments[0][0]
 
     hits: list[SearchTextHit] = []
     next_cursor: int | None = None
-    cancelled = False
-    # Chunk the address space into fixed-size windows and call Heads() per
-    # chunk. This bounds each Heads()/next_head() C call to one CHUNK_BYTES
-    # scan — without it, a single next_head over a huge undefined gap can
-    # run for tens of seconds without yielding to Python, so neither the
-    # tool deadline nor the cancel flag can interrupt it.
-    #
-    # Between chunks we check (a) our own monotonic deadline directly
-    # (independent of sync.py's Timer, which can be starved by GIL contention
-    # on big binaries), and (b) the global cancel flag for UI-driven cancels.
-    # Either path returns a partial result with cursor.cancelled=True.
-    CHUNK_BYTES = 65536
-    deadline = get_tool_deadline()
+    seg_idx = 0
+    # Skip ahead to the segment that contains/follows cursor_ea.
+    while seg_idx < len(segments) and segments[seg_idx][1] <= cursor_ea:
+        seg_idx += 1
+    if seg_idx < len(segments) and cursor_ea < segments[seg_idx][0]:
+        cursor_ea = segments[seg_idx][0]
 
-    for seg_start, seg_end in segments:
-        if cancelled or len(hits) >= limit:
-            break
-        if seg_end <= start_ea:
+    while seg_idx < len(segments) and len(hits) < limit:
+        seg_start, seg_end = segments[seg_idx]
+        ea = ida_search.find_text(cursor_ea, 0, 0, pattern, sflag)
+        if ea == idaapi.BADADDR or ea >= seg_end:
+            seg_idx += 1
+            if seg_idx < len(segments):
+                cursor_ea = segments[seg_idx][0]
             continue
-        if seg_start >= end_ea:
-            break
-        walk_start = max(seg_start, start_ea)
-        walk_end = min(seg_end, end_ea)
-        chunk_ea = walk_start
-        while chunk_ea < walk_end:
-            if cancelled or len(hits) >= limit:
+        if ea < seg_start:
+            # Match landed in a segment we already passed; skip.
+            cursor_ea = ea + 1
+            continue
+
+        lines = _classify_hit_lines(ea, matcher, want_disasm, want_comments)
+        if lines:
+            entry: SearchTextHit = {"addr": hex(ea), "matches": lines}
+            func = idaapi.get_func(ea)
+            if func is not None:
+                fname = ida_funcs.get_func_name(func.start_ea)
+                if fname:
+                    entry["function"] = fname
+            seg = idaapi.getseg(ea)
+            if seg is not None:
+                sname = ida_segment.get_segm_name(seg)
+                if sname:
+                    entry["segment"] = sname
+            hits.append(entry)
+            if len(hits) >= limit:
+                # Compute resume cursor: just past this hit.
+                size = max(1, idaapi.get_item_size(ea))
+                next_cursor = ea + size
                 break
-            if (deadline is not None and time.monotonic() >= deadline) \
-                    or ida_kernwin.user_cancelled():
-                cancelled = True
-                next_cursor = chunk_ea
-                break
-            chunk_end = min(chunk_ea + CHUNK_BYTES, walk_end)
-            for head_ea in idautils.Heads(chunk_ea, chunk_end):
-                lines = _classify_hit_lines(head_ea, matcher, want_disasm, want_comments)
-                if not lines:
-                    continue
-                entry: SearchTextHit = {"addr": hex(head_ea), "matches": lines}
-                func = idaapi.get_func(head_ea)
-                if func is not None:
-                    fname = ida_funcs.get_func_name(func.start_ea)
-                    if fname:
-                        entry["function"] = fname
-                seg = idaapi.getseg(head_ea)
-                if seg is not None:
-                    sname = ida_segment.get_segm_name(seg)
-                    if sname:
-                        entry["segment"] = sname
-                hits.append(entry)
-                if len(hits) >= limit:
-                    size = max(1, idaapi.get_item_size(head_ea))
-                    next_cursor = head_ea + size
-                    break
-            chunk_ea = chunk_end
+
+        # Advance past this match. Use item size if known to avoid re-hitting
+        # the same head's listing on the next iteration.
+        size = idaapi.get_item_size(ea)
+        cursor_ea = ea + (size if size > 0 else 1)
 
     cursor: dict[str, Any]
-    if cancelled:
-        cursor = {"next": hex(next_cursor), "cancelled": True}
-    elif next_cursor is not None:
+    if next_cursor is not None:
         cursor = {"next": hex(next_cursor)}
     else:
         cursor = {"done": True}
 
     return {"n": len(hits), "hits": hits, "cursor": cursor}
+
+
+class ReadMcpOutputResult(TypedDict):
+    ok: bool
+    output_id: str
+    offset: int
+    total_chars: int
+    has_more: bool
+    chunk: str
+    error: NotRequired[str]
+
+
+@tool
+@idasync
+def read_mcp_output(
+    output_id: Annotated[str, "Output ID from a truncated MCP tool response."],
+    offset: Annotated[int, "Character offset to start reading from."] = 0,
+    max_chars: Annotated[
+        int, "Maximum characters to return per chunk (default 40000, cap 50000)."
+    ] = 40000,
+) -> ReadMcpOutputResult:
+    """Read a previously cached MCP tool output by its output_id.
+
+    When a tool response exceeds the 50KB size limit, the full output is cached
+    in memory and an output_id is provided in the truncation hint. Use this tool
+    to retrieve the full data in chunks. Each chunk includes offset, total size,
+    and a has_more flag so you can page through large outputs.
+
+    Typical workflow:
+      1. Call any tool that may return large output (e.g. decompile, disasm, callgraph).
+      2. If the response mentions truncation and gives an output_id,
+         call read_mcp_output(output_id=..., offset=0).
+      3. If has_more is true, call again with offset = previous_offset + len(chunk).
+
+    See also: decompile, decompile_batch, disasm, callgraph, export_funcs,
+    trace_data_chain, find_similar_functions — all tools that may trigger truncation.
+    """
+    data = get_cached_output(output_id)
+    if data is None:
+        return {
+            "ok": False,
+            "output_id": output_id,
+            "offset": offset,
+            "total_chars": 0,
+            "has_more": False,
+            "chunk": "",
+            "error": f"Output '{output_id}' not found or expired (cache holds max 100 entries).",
+        }
+
+    serialized = json.dumps(data)
+    total = len(serialized)
+    max_chars = min(max_chars, 50000)
+
+    if offset < 0:
+        offset = 0
+    if offset > total:
+        offset = total
+
+    chunk = serialized[offset:offset + max_chars]
+    has_more = offset + max_chars < total
+
+    return {
+        "ok": True,
+        "output_id": output_id,
+        "offset": offset,
+        "total_chars": total,
+        "has_more": has_more,
+        "chunk": chunk,
+    }

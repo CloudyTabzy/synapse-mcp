@@ -1,5 +1,6 @@
 import fnmatch
 import json
+import logging
 import os
 import re
 import struct
@@ -97,11 +98,17 @@ class CommentAppendOp(TypedDict):
     ]
 
 
-class AsmPatchOp(TypedDict):
+class AsmPatchOp(TypedDict, total=False):
     """Assembly patch operation"""
 
     addr: Annotated[str, "Address (hex or decimal)"]
     asm: Annotated[str, "Assembly instruction(s), semicolon-separated"]
+    expected_bytes: Annotated[
+        str,
+        "Optional hex string of bytes currently at addr (e.g. '48 89 C0'). "
+        "If provided, the patch is only applied when the live bytes match. "
+        "Mismatch returns verified=false and skips the write.",
+    ]
 
 
 class FunctionRename(TypedDict):
@@ -328,7 +335,7 @@ class InsnPattern(TypedDict, total=False):
     max_scan_insns: Annotated[int, "Max instructions to scan"]
     include_fn: Annotated[bool, "Include function metadata"]
     include_disasm: Annotated[bool, "Include disassembly text"]
-    allow_broad: Annotated[bool, "Allow scopeless scan"]
+    allow_broad: Annotated[bool, "Scan all executable sections when no func/segment/start/end scope is set (default: true)"]
 
 
 class NumberConversion(TypedDict, total=False):
@@ -405,6 +412,17 @@ class DefineOp(TypedDict, total=False):
         str, "Address to define (hex or decimal). Use 'start:end' for explicit bounds."
     ]
     end: Annotated[str, "Optional end address for explicit bounds"]
+    force: Annotated[
+        bool,
+        "If True, run plan_and_wait on the range before add_func to force IDA to "
+        "analyze unanalyzed/encrypted bytes. If del_items is also True, existing "
+        "data/code definitions are cleared first.",
+    ]
+    del_items: Annotated[
+        bool,
+        "If True (requires force=True), call ida_bytes.del_items on the range before "
+        "analysis. Useful when IDA incorrectly defined bytes as data.",
+    ]
 
 
 class UndefineOp(TypedDict, total=False):
@@ -450,10 +468,11 @@ class Global(TypedDict):
     name: str
 
 
-class Import(TypedDict):
+class Import(TypedDict, total=False):
     addr: str
     imported_name: str
     module: str
+    ordinal: NotRequired[int]
 
 
 class String(TypedDict):
@@ -585,11 +604,90 @@ T = TypeVar("T")
 class Page(TypedDict, Generic[T]):
     data: list[T]
     next_offset: Optional[int]
+    total: int
 
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+_log = logging.getLogger(__name__)
+
+
+def _classify_exc(exc: Exception) -> str:
+    """Map an exception to a broad error-type string for structured reporting."""
+    if isinstance(exc, IDAError):
+        return "ida_error"
+    if isinstance(exc, (ValueError, TypeError)):
+        return "invalid_input"
+    msg = str(exc).lower()
+    if any(w in msg for w in ("not found", "no function", "badaddr", "not mapped")):
+        return "not_found"
+    if any(w in msg for w in ("timed out", "timeout", "deadline", "took too long")):
+        return "timeout"
+    if any(w in msg for w in ("decompilation failed", "hex-rays unavailable", "no decompiler", "decompil")):
+        return "decompile_unavailable"
+    if "not available" in msg and "install" in msg:
+        return "dependency_missing"
+    if any(w in msg for w in ("permission denied", "access denied", "unauthorized")):
+        return "permission_denied"
+    return "internal_error"
+
+
+def _is_expected_error(exc: Exception) -> bool:
+    """True for user-facing conditions that should not spam IDA's console with a
+    traceback — bad input, not-found, missing dependency, timeout, etc.
+
+    Only ``internal_error`` (an unrecognised/unexpected failure) keeps the full
+    traceback, because that is the one case where the stack is actually useful
+    for debugging. Everything else is an expected outcome of agent input and is
+    fully reported in the tool's returned ``error`` field anyway.
+    """
+    return _classify_exc(exc) != "internal_error"
+
+
+def _log_tool_exc(label: str, context: str, exc: Exception, msg: str) -> None:
+    """Log a tool exception, with a traceback only for genuine internal errors."""
+    if _is_expected_error(exc):
+        _log.warning("%s [%s]: %s", label, context or type(exc).__name__, msg)
+    else:
+        _log.exception("%s [%s]: %s", label, context or type(exc).__name__, msg)
+
+
+def tool_error(exc: Exception, context: str = "", hint: str | None = None) -> dict:
+    """Build a top-level structured error dict and log the exception.
+
+    Returns ``{"ok": False, "error": "<context>: <msg>", "error_type": "..."}``.
+    Expected, user-facing errors (bad address, invalid input, not-found, missing
+    dependency, timeout) are logged at WARNING without a traceback so they do not
+    appear as scary "Traceback" blocks in IDA's console — they are already fully
+    reported in the returned ``error`` field. Only ``internal_error`` keeps the
+    traceback. Call this inside a top-level ``except`` block.
+    """
+    msg = str(exc)
+    error_str = f"{context}: {msg}" if (context and msg) else (context or msg)
+    result: dict = {"ok": False, "error": error_str, "error_type": _classify_exc(exc)}
+    if hint:
+        result["hint"] = hint
+    _log_tool_exc("Tool error", context, exc, msg)
+    return result
+
+
+def item_error(exc: Exception, context: str = "", hint: str | None = None) -> dict:
+    """Build a per-item error dict (no ``ok`` key) and log the exception.
+
+    Use inside batch-operation loops where each item in the result list carries
+    its own error field.  Returns ``{"error": "<context>: <msg>", "error_type": "..."}``.
+    Like ``tool_error``, expected user-facing errors are logged without a
+    traceback; only genuine internal errors keep one.
+    """
+    msg = str(exc)
+    error_str = f"{context}: {msg}" if (context and msg) else (context or msg)
+    result: dict = {"error": error_str, "error_type": _classify_exc(exc)}
+    if hint:
+        result["hint"] = hint
+    _log_tool_exc("Item error", context, exc, msg)
+    return result
 
 
 def get_image_size() -> int:
@@ -726,6 +824,70 @@ def normalize_dict_list(
     else:
         # Any other type → empty dict
         return [{}]
+
+
+def summary_stats(
+    items: list[dict],
+    field: str,
+    label_field: str = "name",
+) -> dict | None:
+    """Compute summary statistics over one numeric field of a list of dicts.
+
+    Returns mean/median/stdev/min/max plus the p25/p75/p95 percentiles, and the
+    ``label_field`` value of the min and max items (so an agent sees *which* entry
+    is the outlier without scanning the whole list). Returns None when there are
+    no usable numeric values.
+
+    Pure Python on purpose: the lists here are short (sections, a page of
+    functions), so a numpy dependency would add nothing. Used to pre-aggregate
+    bulk tool results so agents don't manually scan hundreds of rows.
+    """
+    pairs = [
+        (float(it[field]), it.get(label_field))
+        for it in items
+        if isinstance(it.get(field), (int, float))
+    ]
+    if not pairs:
+        return None
+
+    values = [v for v, _ in pairs]
+    n = len(values)
+    ordered = sorted(values)
+    mean = sum(values) / n
+
+    def _pct(p: float) -> float:
+        # Linear-interpolation percentile (matches numpy's default 'linear').
+        if n == 1:
+            return ordered[0]
+        rank = p / 100.0 * (n - 1)
+        lo = int(rank)
+        frac = rank - lo
+        if lo + 1 < n:
+            return ordered[lo] + frac * (ordered[lo + 1] - ordered[lo])
+        return ordered[lo]
+
+    if n > 1:
+        variance = sum((v - mean) ** 2 for v in values) / n
+        stdev = variance ** 0.5
+    else:
+        stdev = 0.0
+
+    min_v, min_label = min(pairs, key=lambda x: x[0])
+    max_v, max_label = max(pairs, key=lambda x: x[0])
+
+    return {
+        "count": n,
+        "mean": round(mean, 4),
+        "median": round(_pct(50), 4),
+        "stdev": round(stdev, 4),
+        "min": round(min_v, 4),
+        "min_at": min_label,
+        "max": round(max_v, 4),
+        "max_at": max_label,
+        "p25": round(_pct(25), 4),
+        "p75": round(_pct(75), 4),
+        "p95": round(_pct(95), 4),
+    }
 
 
 def looks_like_address(s: str) -> bool:
@@ -919,6 +1081,7 @@ def paginate(data: list[T], offset: int, count: int) -> Page[T]:
     return {
         "data": data[offset : offset + count],
         "next_offset": next_offset,
+        "total": len(data),
     }
 
 
@@ -1006,23 +1169,6 @@ class my_modifier_t(ida_hexrays.user_lvar_modifier_t):
         return False
 
 
-def hexrays_local_var_exists(func_ea: int, var_name: str) -> bool:
-    """Return True if a Hex-Rays local variable exists in the decompiled function."""
-    if not ida_hexrays.init_hexrays_plugin():
-        return False
-    try:
-        cfunc = ida_hexrays.decompile(func_ea)
-        if not cfunc:
-            return False
-        lvars = cfunc.get_lvars()
-        for i in range(lvars.size()):
-            if lvars[i].name == var_name:
-                return True
-    except Exception:
-        return False
-    return False
-
-
 def parse_decls_ctypes(decls: str, hti_flags: int) -> tuple[int, list[str]]:
     if sys.platform == "win32":
         import ctypes
@@ -1062,7 +1208,10 @@ def parse_decls_ctypes(decls: str, hti_flags: int) -> tuple[int, list[str]]:
 def get_stack_frame_variables_internal(
     fn_addr: int, raise_error: bool
 ) -> list[StackFrameVariable]:
-    from .sync import ida_major
+    from .sync import _ensure_version
+
+    _ensure_version()
+    from .sync import ida_major  # noqa: F401
 
     if ida_major < 9:
         return []
@@ -1138,18 +1287,32 @@ def decompile_checked(addr: int):
     return cfunc
 
 
-def decompile_function_safe(
-    ea: int, include_addresses: bool = True
-) -> tuple[str | None, str | None]:
-    """Safely decompile a function. Returns (code, error); exactly one is non-None."""
+def decompile_function_safe(ea: int, include_addresses: bool = True, max_lines: int = 0) -> Optional[str]:
+    """Safely decompile a function, returning None on failure (uses cache).
+
+    Args:
+        ea: Function address.
+        include_addresses: Append /*0xNNNN*/ markers per line.
+        max_lines: If > 0, truncate pseudocode at this many lines and append
+                   a "... (N more lines)" note.
+    """
     import ida_lines
     import ida_kernwin
 
     try:
-        cfunc = decompile_checked(ea)
+        if not ida_hexrays.init_hexrays_plugin():
+            return None
+        cfunc = ida_hexrays.decompile(ea)
+        if not cfunc:
+            return None
         sv = cfunc.get_pseudocode()
         lines = []
-        for sl in sv:
+        total_lines = len(sv)
+        for idx, sl in enumerate(sv):
+            if max_lines > 0 and idx >= max_lines:
+                omitted = total_lines - max_lines
+                lines.append(f"\n// ... ({omitted} more line{'s' if omitted != 1 else ''}) ...")
+                break
             sl: ida_kernwin.simpleline_t
             _head = ida_hexrays.ctree_item_t()
             item = ida_hexrays.ctree_item_t()
@@ -1169,11 +1332,9 @@ def decompile_function_safe(
                 lines.append(f"{text} /*{line_ea:#x}*/")
             else:
                 lines.append(text)
-        return "\n".join(lines), None
-    except IDAError as e:
-        return None, str(e)
-    except Exception as e:
-        return None, f"Decompilation failed at {hex(ea)}: {e}"
+        return "\n".join(lines)
+    except Exception:
+        return None
 
 
 def get_assembly_lines(ea: int) -> str:

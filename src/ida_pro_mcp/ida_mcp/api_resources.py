@@ -290,3 +290,202 @@ def xrefs_from_resource(addr: Annotated[str, "Source address"]) -> list[dict]:
             }
         )
     return xrefs
+
+
+# ============================================================================
+# Triton MCP Resources
+# ============================================================================
+
+
+@resource("triton://session/context")
+@idasync
+def triton_session_context_resource() -> dict:
+    """Dump the current Triton session context as JSON.
+
+    Includes architecture, modes, symbolic variable count, path constraint
+    count, taint state, and snapshot count.
+    """
+    try:
+        from .api_triton import TRITON_AVAILABLE, _get_ctx, _arch_to_str
+        if not TRITON_AVAILABLE:
+            return {"error": "Triton not available"}
+        ctx = _get_ctx()
+        sym_vars = ctx.getSymbolicVariables()
+        pcs = ctx.getPathConstraints()
+        tainted_regs = ctx.getTaintedRegisters()
+        tainted_mem = ctx.getTaintedMemory()
+
+        modes_enabled = []
+        try:
+            from triton import MODE
+            for mode in (
+                MODE.ALIGNED_MEMORY,
+                MODE.AST_OPTIMIZATIONS,
+                MODE.CONSTANT_FOLDING,
+                MODE.ONLY_ON_SYMBOLIZED,
+                MODE.ONLY_ON_TAINTED,
+                MODE.PC_TRACKING_SYMBOLIC,
+                MODE.TAINT_THROUGH_POINTERS,
+            ):
+                if ctx.isModeEnabled(mode):
+                    modes_enabled.append(str(mode))
+        except Exception:
+            pass
+
+        return {
+            "architecture": _arch_to_str(ctx.getArchitecture()),
+            "gpr_bitsize": ctx.getGprBitSize(),
+            "modes_enabled": modes_enabled,
+            "symbolic_var_count": len(sym_vars),
+            "path_constraint_count": len(pcs),
+            "tainted_register_count": len(tainted_regs),
+            "tainted_memory_cell_count": len(tainted_mem),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@resource("triton://session/constraints")
+@idasync
+def triton_session_constraints_resource() -> dict:
+    """Return the accumulated path predicate in SMT-LIB 2 format.
+
+    The output can be pasted into Z3 or any SMT-LIB 2 compliant solver
+    for external verification or constraint manipulation.
+    """
+    try:
+        from .api_triton import TRITON_AVAILABLE, _get_ctx
+        if not TRITON_AVAILABLE:
+            return {"error": "Triton not available"}
+        ctx = _get_ctx()
+        predicate = ctx.getPathPredicate()
+        smt = ctx.liftToSMT(predicate, assert_=True, icomment=True)
+        return {"smt_lib2": smt}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@resource("triton://session/symbolic-vars")
+@idasync
+def triton_session_symbolic_vars_resource() -> dict:
+    """List all symbolic variables in the current Triton session."""
+    try:
+        from .api_triton import TRITON_AVAILABLE, _get_ctx
+        if not TRITON_AVAILABLE:
+            return {"error": "Triton not available"}
+        ctx = _get_ctx()
+        from triton import SYMBOLIC
+        variables = []
+        for vid, sv in ctx.getSymbolicVariables().items():
+            stype = sv.getType()
+            if stype == SYMBOLIC.REGISTER_VARIABLE:
+                kind = "register"
+                try:
+                    origin = ctx.getRegister(sv.getOrigin()).getName()
+                except Exception:
+                    origin = str(sv.getOrigin())
+            elif stype == SYMBOLIC.MEMORY_VARIABLE:
+                kind = "memory"
+                origin = hex(sv.getOrigin())
+            else:
+                kind = "undefined"
+                origin = str(sv.getOrigin())
+            variables.append({
+                "id": vid,
+                "name": sv.getName(),
+                "alias": sv.getAlias(),
+                "bitsize": sv.getBitSize(),
+                "kind": kind,
+                "origin": origin,
+            })
+        return {"variables": variables}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ============================================================================
+# Miasm MCP Resources
+# ============================================================================
+
+
+@resource("miasm://function/{address}/ir")
+@idasync
+def miasm_function_ir_resource(address: Annotated[str, "Function address (hex or symbol name)"]) -> dict:
+    """Return the Miasm IR lifting (IRCFG) for a function as JSON."""
+    try:
+        from .api_miasm import MIASM_AVAILABLE, _manager, _iter_ircfg_blocks, _ircfg_edges, _ir_blocks_to_dict
+        if not MIASM_AVAILABLE:
+            return {"error": "Miasm not available"}
+        import idaapi
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"error": f"No function at {hex(ea)}"}
+        data = _manager.get_bytes(func.start_ea, func.end_ea)
+        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+        asmcfg = mdis.dis_multiblock(func.start_ea)
+        lifter = _manager.machine.lifter_model_call(loc_db)
+        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+        edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+        return {
+            "function_ea": hex(func.start_ea),
+            "blocks": _ir_blocks_to_dict(ircfg),
+            "edges": edges,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@resource("miasm://function/{address}/ssa")
+@idasync
+def miasm_function_ssa_resource(address: Annotated[str, "Function address (hex or symbol name)"]) -> dict:
+    """Return the SSA-transformed IRCFG for a function as JSON."""
+    try:
+        from .api_miasm import MIASM_AVAILABLE, _manager, _iter_ircfg_blocks, _ircfg_edges, _ir_blocks_to_dict
+        if not MIASM_AVAILABLE:
+            return {"error": "Miasm not available"}
+        import idaapi
+        from miasm.analysis.ssa import SSADiGraph
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"error": f"No function at {hex(ea)}"}
+        data = _manager.get_bytes(func.start_ea, func.end_ea)
+        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+        asmcfg = mdis.dis_multiblock(func.start_ea)
+        lifter = _manager.machine.lifter_model_call(loc_db)
+        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+        heads = list(ircfg.heads())
+        if heads:
+            ssa = SSADiGraph(ircfg)
+            ssa.transform(heads[0])
+        edges = [{"src": str(s), "dst": str(d)} for s, d in _ircfg_edges(ircfg)]
+        return {
+            "function_ea": hex(func.start_ea),
+            "form": "ssa",
+            "blocks": _ir_blocks_to_dict(ircfg),
+            "edges": edges,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@resource("miasm://function/{address}/cfg-dot")
+@idasync
+def miasm_function_cfg_dot_resource(address: Annotated[str, "Function address (hex or symbol name)"]) -> dict:
+    """Return a Graphviz DOT string for the function's assembly CFG."""
+    try:
+        from .api_miasm import MIASM_AVAILABLE, _manager
+        if not MIASM_AVAILABLE:
+            return {"error": "Miasm not available"}
+        import idaapi
+        ea = parse_address(address)
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"error": f"No function at {hex(ea)}"}
+        data = _manager.get_bytes(func.start_ea, func.end_ea)
+        mdis, _ = _manager.get_mdis(data, func.start_ea)
+        asmcfg = mdis.dis_multiblock(func.start_ea)
+        return {"dot": asmcfg.dot()}
+    except Exception as exc:
+        return {"error": str(exc)}

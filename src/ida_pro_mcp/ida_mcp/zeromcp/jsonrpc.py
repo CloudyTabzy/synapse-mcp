@@ -360,6 +360,14 @@ class JsonRpcRegistry:
                     if expected_type is float and isinstance(value, int):
                         validated_params[param_name] = float(value)
                         continue
+                    # Allow "true"/"false" strings -> bool (some MCP clients stringify booleans)
+                    if expected_type is bool and isinstance(value, str):
+                        if value.lower() == "true":
+                            validated_params[param_name] = True
+                            continue
+                        elif value.lower() == "false":
+                            validated_params[param_name] = False
+                            continue
                     if not isinstance(value, expected_type):
                         raise JsonRpcException(
                             -32602,

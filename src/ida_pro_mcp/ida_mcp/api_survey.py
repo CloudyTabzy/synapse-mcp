@@ -10,8 +10,8 @@ from typing import Annotated, TypedDict
 from .rpc import tool
 from .sync import idasync, tool_timeout
 from . import compat
-from .api_core import _get_strings_cache
-from .utils import get_image_size
+from .api_core import _get_strings_cache, _is_auto_analysis_running
+from .utils import get_image_size, tool_error
 
 
 class SurveyMetadata(TypedDict):
@@ -77,14 +77,15 @@ class SurveyImportsByCategory(TypedDict):
     other: list[SurveyImportEntry]
 
 
-class SurveyCallGraphSummary(TypedDict):
+class SurveyCallGraphSummary(TypedDict, total=False):
     total_edges: int
-    max_depth_estimate: None
+    max_depth_estimate: int | None
     root_functions: list[str]
     leaf_functions_count: int
 
 
 class SurveyBinaryResult(TypedDict, total=False):
+    ok: bool
     metadata: SurveyMetadata
     statistics: SurveyStatistics
     segments: list[SurveySegmentInfo]
@@ -93,7 +94,9 @@ class SurveyBinaryResult(TypedDict, total=False):
     interesting_functions: list[SurveyInterestingFunction]
     imports_by_category: SurveyImportsByCategory
     call_graph_summary: SurveyCallGraphSummary
+    _recommended_tools: dict[str, str]
     _note: str
+    error: str
 
 # Max functions to iterate for xref counting on large binaries.
 _MAX_FUNC_ITER = 10_000
@@ -353,12 +356,17 @@ def _build_imports_by_category() -> dict[str, list[dict]]:
 
 
 def _build_call_graph_summary(func_eas: list[int]) -> dict:
+    import collections
     import idaapi
     import idautils
 
     total_edges = 0
     root_functions: list[str] = []
     leaf_count = 0
+
+    # Build adjacency list: func_ea -> set of called func_eas
+    func_ea_set = set(func_eas)
+    adj: dict[int, set[int]] = {ea: set() for ea in func_eas}
 
     for ea in func_eas:
         has_callers = False
@@ -374,6 +382,10 @@ def _build_call_graph_summary(func_eas: list[int]) -> dict:
         for item_ea in idautils.FuncItems(ea):
             for xref in idautils.XrefsFrom(item_ea, 0):
                 if xref.type in (idaapi.fl_CF, idaapi.fl_CN):
+                    target = idaapi.get_func(xref.to)
+                    if target:
+                        tgt_ea = target.start_ea
+                        adj[ea].add(tgt_ea)
                     total_edges += 1
                     has_callees = True
 
@@ -383,10 +395,53 @@ def _build_call_graph_summary(func_eas: list[int]) -> dict:
         if not has_callees:
             leaf_count += 1
 
+    # BFS from all roots concurrently to find maximum call-chain depth.
+    max_depth_estimate: int | None = None
+    if adj:
+        try:
+            # Only track visited separately; depth dict starts empty.
+            visited: set[int] = set()
+            depth: dict[int, int] = {}
+            queue: collections.deque[tuple[int, int]] = collections.deque()
+            max_depth = 0
+
+            # Seed queue with all root functions at depth 0.
+            for ea in func_eas:
+                has_callers = any(
+                    xref.type in (idaapi.fl_CF, idaapi.fl_CN)
+                    for xref in idautils.XrefsTo(ea, 0)
+                )
+                if not has_callers:
+                    depth[ea] = 0
+                    queue.append((ea, 0))
+
+            while queue:
+                node, d = queue.popleft()
+                if node in visited:
+                    continue
+                visited.add(node)
+                if len(visited) > 50000:
+                    break
+                for neighbor in adj.get(node, ()):
+                    if neighbor in visited:
+                        continue
+                    nd = d + 1
+                    # Re-assign if shorter path found (multiple parents).
+                    existing = depth.get(neighbor, None)
+                    if existing is None or nd < existing:
+                        depth[neighbor] = nd
+                    queue.append((neighbor, nd))
+                    if nd > max_depth:
+                        max_depth = nd
+
+            max_depth_estimate = max_depth
+        except Exception:
+            max_depth_estimate = None
+
     return {
         "total_edges": total_edges,
-        "max_depth_estimate": None,  # would require full DFS; omitted for performance
-        "root_functions": root_functions[:100],  # cap to avoid massive output
+        "max_depth_estimate": max_depth_estimate,
+        "root_functions": root_functions[:100],
         "leaf_functions_count": leaf_count,
     }
 
@@ -407,38 +462,59 @@ def survey_binary(
     for binaries with >10k functions."""
     import idautils
 
-    minimal = detail_level == "minimal"
+    try:
+        if _is_auto_analysis_running():
+            return tool_error(
+                RuntimeError(
+                    "Auto-analysis is still running; survey enumerates functions and "
+                    "can block the worker. Retry shortly, or call analysis_status() "
+                    "to check, then re-run."
+                ),
+                "survey_binary",
+            )
+        minimal = detail_level == "minimal"
 
-    # Collect all function addresses once, cap at _MAX_FUNC_ITER for large binaries.
-    all_func_eas = list(idautils.Functions())
-    truncated = len(all_func_eas) > _MAX_FUNC_ITER
-    if truncated:
-        func_eas = all_func_eas[:_MAX_FUNC_ITER]
-    else:
-        func_eas = all_func_eas
+        # Collect all function addresses once, cap at _MAX_FUNC_ITER for large binaries.
+        all_func_eas = list(idautils.Functions())
+        truncated = len(all_func_eas) > _MAX_FUNC_ITER
+        if truncated:
+            func_eas = all_func_eas[:_MAX_FUNC_ITER]
+        else:
+            func_eas = all_func_eas
 
-    strings = _get_strings_cache()
-    segments = _build_segments()
+        strings = _get_strings_cache()
+        segments = _build_segments()
 
-    result: dict = {
-        "metadata": _build_metadata(),
-        "statistics": _build_statistics(
-            all_func_eas, len(strings), len(segments)
-        ),
-        "segments": segments,
-        "entrypoints": _build_entrypoints(),
-    }
+        result: dict = {
+            "ok": True,
+            "metadata": _build_metadata(),
+            "statistics": _build_statistics(
+                all_func_eas, len(strings), len(segments)
+            ),
+            "segments": segments,
+            "entrypoints": _build_entrypoints(),
+        }
 
-    if not minimal:
-        result["interesting_strings"] = _build_interesting_strings()
-        result["interesting_functions"] = _build_interesting_functions(func_eas, truncated)
-        result["imports_by_category"] = _build_imports_by_category()
-        result["call_graph_summary"] = _build_call_graph_summary(func_eas)
+        if not minimal:
+            result["interesting_strings"] = _build_interesting_strings()
+            result["interesting_functions"] = _build_interesting_functions(func_eas, truncated)
+            result["imports_by_category"] = _build_imports_by_category()
+            result["call_graph_summary"] = _build_call_graph_summary(func_eas)
 
-    if truncated:
-        result["_note"] = (
-            f"Binary has {len(all_func_eas)} functions; "
-            f"xref analysis was limited to the first {_MAX_FUNC_ITER} for performance."
-        )
+        result["_recommended_tools"] = {
+            "interesting_strings": "Use list_strings(min_length=4) or entity_query(kind='strings', filter='...') for the full string table.",
+            "interesting_functions": "Use analyze_function(addr='...') for deep analysis, or func_profile(addr='...') for metrics-only profiling.",
+            "imports_by_category": "Use trace_data_chain(address='...', cross_functions=true) to find callers of suspicious imports.",
+            "call_graph_summary": "Use callgraph(roots=['start'], max_depth=3) for detailed caller topology.",
+            "overall": "Start with analyze_function or decompile_batch for the most interesting functions, then trace data flow from suspicious strings/imports.",
+        }
 
-    return result
+        if truncated:
+            result["_note"] = (
+                f"Binary has {len(all_func_eas)} functions; "
+                f"xref analysis was limited to the first {_MAX_FUNC_ITER} for performance."
+            )
+
+        return result
+    except Exception as e:
+        return tool_error(e, "survey_binary")

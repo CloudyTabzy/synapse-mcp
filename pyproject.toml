@@ -1,7 +1,7 @@
 [project]
-name = "ida-pro-mcp"
+name = "synapse-mcp"
 version = "2.0.0"
-description = "Vibe reversing with IDA Pro"
+description = "Synapse MCP — AI-powered reverse engineering assistant for IDA Pro with Triton symbolic execution, Miasm IR analysis, and comprehensive binary analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -9,9 +9,9 @@ authors = [
     { name = "can1357" },
     { name = "IDA Pro MCP Contributors" },
 ]
-keywords = ["ida", "mcp", "llm", "plugin"]
+keywords = ["ida", "mcp", "llm", "plugin", "triton", "miasm", "symbolic-execution", "binary-analysis", "reverse-engineering"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -21,6 +21,34 @@ classifiers = [
 dependencies = [
     "idapro>=0.0.9",
     "tomli-w>=1.0.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+triton   = ["triton-library>=0.10.0"]
+miasm    = ["miasm>=0.1.5", "future>=0.18.0"]
+construct = ["construct>=2.10.68"]
+cstruct  = ["dissect.cstruct>=4.0", "filetype>=1.2.0"]
+lief     = ["lief>=0.15.0"]
+yara     = ["yara-python>=4.3.0"]
+angr     = ["angr>=9.2"]
+networkx = ["networkx>=3.0"]
+unicorn  = ["unicorn>=2.1.0"]
+numpy    = ["numpy>=2.0.0"]
+elf      = ["pyelftools>=0.31"]
+xor      = ["z3-solver>=4.12.0"]
+toon     = ["toon_format>=0.9.0b1"]
+all      = [
+    "triton-library>=0.10.0", "miasm>=0.1.5", "future>=0.18.0",
+    "construct>=2.10.68",
+    "dissect.cstruct>=4.0", "filetype>=1.2.0",
+    "lief>=0.15.0",
+    "yara-python>=4.3.0",
+    "networkx>=3.0",
+    "unicorn>=2.1.0",
+    "numpy>=2.0.0",
+    "pyelftools>=0.31",
+    "z3-solver>=4.12.0",
 ]
 
 [dependency-groups]
@@ -32,8 +60,9 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/mrexodia/ida-pro-mcp"
-Issues = "https://github.com/mrexodia/ida-pro-mcp/issues"
+Repository = "https://github.com/CloudyTabzy/synapse-mcp"
+Issues = "https://github.com/CloudyTabzy/synapse-mcp/issues"
+Upstream = "https://github.com/mrexodia/ida-pro-mcp"
 
 [build-system]
 requires = ["setuptools"]
@@ -41,6 +70,7 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 ida-pro-mcp = "ida_pro_mcp.server:main"
+synapse-mcp = "ida_pro_mcp.server:main"
 idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
 ida-mcp-test = "ida_pro_mcp.test:main"
 ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"

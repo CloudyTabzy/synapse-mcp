@@ -14,7 +14,7 @@ import ida_funcs
 
 from .rpc import tool
 from .sync import idasync
-from .utils import parse_address, normalize_list_input
+from .utils import parse_address, normalize_list_input, tool_error, item_error
 
 from . import _sigmaker as _sm
 
@@ -85,6 +85,8 @@ class MakeSigResult(TypedDict):
     format: str
     unique: NotRequired[bool]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class MakeSigForFunctionResult(TypedDict):
@@ -94,6 +96,8 @@ class MakeSigForFunctionResult(TypedDict):
     signature: str | None
     format: str
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class XrefSigResult(TypedDict):
@@ -101,7 +105,11 @@ class XrefSigResult(TypedDict):
     addr: str | None
     signatures: list[dict] | None
     total_xrefs: NotRequired[int]
+    xrefs_sampled: NotRequired[int]
+    truncated: NotRequired[bool]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +166,10 @@ def make_signature(
         except Exception as e:
             results.append({
                 "query": addr_str,
-                "addr": hex(ea) if 'ea' in dir() else None,
+                "addr": hex(ea) if 'ea' in locals() else None,
                 "signature": None,
                 "format": format,
-                "error": str(e),
+                **item_error(e),
             })
     return results
 
@@ -231,7 +239,7 @@ def make_signature_for_function(
                 "name": None,
                 "signature": None,
                 "format": format,
-                "error": str(e),
+                **item_error(e),
             })
     return results
 
@@ -277,7 +285,7 @@ def make_signature_for_range(
             "addr": None,
             "signature": None,
             "format": format,
-            "error": str(e),
+            **item_error(e),
         }
 
 
@@ -301,17 +309,27 @@ def find_xref_signatures(
         int,
         "Maximum signature length in bytes (default: 250)",
     ] = 250,
+    max_xrefs: Annotated[
+        int,
+        "Maximum number of callers to sample when generating signatures (default: 50). "
+        "High-traffic functions (e.g. malloc, operator new) can have hundreds of callers; "
+        "this cap keeps the call fast. Callers are sorted by function size before sampling "
+        "so the most likely short-signature sites are tried first. Increase if truncated=true "
+        "and the returned signatures are longer than expected.",
+    ] = 50,
 ) -> list[XrefSigResult]:
     """Find signatures for code locations that reference an address. For each
     input address, finds all code cross-references TO it, generates a unique
     signature at each xref site, and returns the shortest ones. Ideal for
     creating signatures for data addresses, vtable entries, or string
-    references that can't be signatured directly."""
+    references that can't be signatured directly.
+
+    When a target has many callers the search is capped at max_xrefs to stay
+    fast. The result includes total_xrefs (all callers IDA knows), xrefs_sampled
+    (how many were tried), and truncated (true when the cap was hit)."""
     sm = _sm
     fmt = _resolve_format(format)
     cfg = _make_config(fmt, max_length=max_length)
-    import dataclasses
-    cfg = dataclasses.replace(cfg, print_top_x=top)
     finder = sm.XrefFinder()
     addrs_list = normalize_list_input(addrs)
 
@@ -320,10 +338,10 @@ def find_xref_signatures(
         ea = None
         try:
             ea = _resolve_addr(addr_str)
-            xref_result = finder.find_xrefs(ea, cfg)
+            xref_result = finder.find_xrefs(ea, cfg, max_xrefs=max_xrefs, top=top)
 
             sigs = []
-            for gs in xref_result.signatures[:top]:
+            for gs in xref_result.signatures:
                 sig_str = _format_sig(gs.signature, fmt)
                 sigs.append({
                     "xref_addr": hex(int(gs.address)) if gs.address else None,
@@ -331,17 +349,85 @@ def find_xref_signatures(
                     "length": len(gs.signature),
                 })
 
-            results.append({
+            entry: XrefSigResult = {
                 "query": addr_str,
                 "addr": hex(ea),
                 "signatures": sigs,
-                "total_xrefs": len(xref_result.signatures),
-            })
+                "total_xrefs": xref_result.total_xrefs,
+                "xrefs_sampled": xref_result.xrefs_sampled,
+            }
+            if xref_result.truncated:
+                entry["truncated"] = True
+            results.append(entry)
         except Exception as e:
             results.append({
                 "query": addr_str,
                 "addr": hex(ea) if ea is not None else None,
                 "signatures": None,
-                "error": str(e),
+                **item_error(e),
             })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Signature scanning
+# ---------------------------------------------------------------------------
+
+
+class ScanMatch(TypedDict):
+    addr: str
+
+
+class ScanSignatureResult(TypedDict, total=False):
+    ok: bool
+    pattern: str
+    match_count: int
+    truncated: bool
+    matches: list[ScanMatch]
+    error: str
+    error_type: str
+    hint: str
+
+
+@tool
+@idasync
+def scan_signature(
+    pattern: Annotated[
+        str,
+        "Byte pattern to search for. Accepts IDA format ('E8 ? ? ? ? 90'), "
+        "x64dbg format, or hex string. Use ? or ?? as wildcards.",
+    ],
+    max_results: Annotated[int, "Maximum number of match addresses to return (default 200)"] = 200,
+    count: Annotated[int | None, "Alias for max_results"] = None,
+    limit: Annotated[int | None, "Alias for max_results"] = None,
+) -> ScanSignatureResult:
+    """Scan the loaded binary for all occurrences of a byte pattern.
+
+    Returns each matching address. Wildcards (? or ??) skip individual bytes.
+    Use ``count`` or ``limit`` as aliases for ``max_results``.
+
+    Examples:
+      'E8 ? ? ? ? 90'   — call followed by NOP
+      'FF 25 ?? ?? ?? ??' — indirect jump (x64 style)
+    """
+    cap = count if count is not None else (limit if limit is not None else max_results)
+    try:
+        if not pattern.strip():
+            return {"ok": False, "error": "Pattern must not be empty"}
+
+        searcher = _sm.SignatureSearcher.from_signature(pattern.strip())
+        results = searcher.search()
+
+        all_matches = results.matches
+        truncated = len(all_matches) > cap
+        matches = [{"addr": hex(m.address)} for m in all_matches[:cap]]
+
+        return {
+            "ok": True,
+            "pattern": pattern.strip(),
+            "match_count": len(all_matches),
+            "truncated": truncated,
+            "matches": matches,
+        }
+    except Exception as e:
+        return tool_error(e)

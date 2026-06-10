@@ -19,10 +19,15 @@ import ida_idaapi
 import ida_kernwin
 import ida_name
 import idaapi
+import ida_bytes
+import ida_auto
+import idautils
 
 from .rpc import tool, unsafe, ext
 from .sync import idasync, keep_batch, get_pre_call_batch, IDAError
 from .utils import (
+    tool_error,
+    item_error,
     RegisterValue,
     ThreadRegisters,
     Breakpoint,
@@ -45,6 +50,8 @@ class DebugControlResult(TypedDict, total=False):
     exited: bool
     state: str
     error: str
+    error_type: str
+    hint: str
 
 
 class BreakpointResult(TypedDict, total=False):
@@ -53,12 +60,16 @@ class BreakpointResult(TypedDict, total=False):
     condition: str | None
     language: str | None
     error: str
+    error_type: str
+    hint: str
 
 
 class ThreadRegistersResult(TypedDict, total=False):
     tid: int
     regs: ThreadRegisters | None
     error: str
+    error_type: str
+    hint: str
 
 
 class StackFrameInfo(TypedDict):
@@ -72,6 +83,8 @@ class DebugMemoryReadResult(TypedDict):
     size: int
     data: str | None
     error: NotRequired[str | None]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class DebugMemoryWriteResult(TypedDict, total=False):
@@ -79,6 +92,8 @@ class DebugMemoryWriteResult(TypedDict, total=False):
     size: int
     ok: bool
     error: str | None
+    error_type: str
+    hint: str
 
 
 # ============================================================================
@@ -544,23 +559,57 @@ def dbg_bps() -> list[Breakpoint]:
     return list_breakpoints()
 
 
+_BPT_TYPE_MAP: dict[str, tuple[int, int]] = {
+    # (ida_type_constant, size)
+    "software":      (idaapi.BPT_SOFT, 0),
+    "hardware_exec": (idaapi.BPT_EXEC, 1),
+    "hardware_rw":   (idaapi.BPT_RDWR, 1),
+    "hardware_write":(idaapi.BPT_WRITE, 1),
+}
+
+
 @ext("dbg")
 @unsafe
 @tool
 @idasync
 def dbg_add_bp(
     addrs: Annotated[list[str] | str, "Address(es) to add breakpoints at"],
+    bpt_type: Annotated[
+        str,
+        "Breakpoint type: 'software' (default), 'hardware_exec', "
+        "'hardware_rw' (read/write), 'hardware_write'. "
+        "Hardware breakpoints require a running debugger session.",
+    ] = "software",
+    size: Annotated[
+        int,
+        "Size in bytes for hardware breakpoints (1, 2, or 4). "
+        "Ignored for software breakpoints.",
+    ] = 1,
 ) -> list[BreakpointResult]:
-    """Add breakpoints at one or more addresses."""
+    """Add breakpoints at one or more addresses.
+
+    Software breakpoints (default) replace the instruction byte with INT3.
+    Hardware breakpoints use CPU debug registers and do not modify code —
+    useful for read/write monitoring or when code integrity checks are present.
+    """
     addrs = normalize_list_input(addrs)
     results = []
+
+    bpt_key = bpt_type.lower().strip()
+    if bpt_key not in _BPT_TYPE_MAP:
+        valid = list(_BPT_TYPE_MAP)
+        return [{"error": f"Unknown bpt_type '{bpt_type}'. Valid: {valid}"}]
+
+    ida_type, default_size = _BPT_TYPE_MAP[bpt_key]
+    bp_size = size if bpt_key != "software" else 0
 
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            if idaapi.add_bpt(ea, 0, idaapi.BPT_SOFT):
+            if idaapi.add_bpt(ea, bp_size, ida_type):
                 results.append({"addr": addr, "ok": True})
             else:
+                # add_bpt can return False if the bp already exists at that addr
                 breakpoints = list_breakpoints()
                 for bpt in breakpoints:
                     if bpt["addr"] == hex(ea):
@@ -569,7 +618,7 @@ def dbg_add_bp(
                 else:
                     results.append({"addr": addr, "error": "Failed to set breakpoint"})
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -593,7 +642,7 @@ def dbg_delete_bp(
             else:
                 results.append({"addr": addr, "error": "Failed to delete breakpoint"})
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -626,7 +675,7 @@ def dbg_toggle_bp(
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -724,7 +773,7 @@ def dbg_set_bp_condition(
                 }
             )
         except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
+            results.append({"addr": addr, **item_error(e)})
 
     return results
 
@@ -773,7 +822,7 @@ def dbg_regs_remote(
             regs = _get_registers_for_thread(dbg, tid)
             results.append({"tid": tid, "regs": regs})
         except Exception as e:
-            results.append({"tid": tid, "regs": None, "error": str(e)})
+            results.append({"tid": tid, "regs": None, **item_error(e, f"tid {tid}")})
 
     return results
 
@@ -814,7 +863,7 @@ def dbg_gpregs_remote(
             regs = _get_registers_general_for_thread(dbg, tid)
             results.append({"tid": tid, "regs": regs})
         except Exception as e:
-            results.append({"tid": tid, "regs": None, "error": str(e)})
+            results.append({"tid": tid, "regs": None, **item_error(e, f"tid {tid}")})
 
     return results
 
@@ -963,7 +1012,7 @@ def dbg_read(
 
         except Exception as e:
             results.append(
-                {"addr": region.get("addr"), "size": 0, "data": None, "error": str(e)}
+                {"addr": region.get("addr"), "size": 0, "data": None, **item_error(e, "read memory region")}
             )
 
     return results
@@ -998,6 +1047,131 @@ def dbg_write(
             )
 
         except Exception as e:
-            results.append({"addr": region.get("addr"), "size": 0, "error": str(e)})
+            results.append({"addr": region.get("addr"), "size": 0, **item_error(e, f"dbg_write addr={region.get('addr')}")})
 
     return results
+
+
+# ============================================================================
+# Debugger: attach to running process
+# ============================================================================
+
+_ATTACH_RESULTS = {
+    1:  ("ok", "Attached successfully"),
+    0:  ("cancelled", "User cancelled or no process selected"),
+    -1: ("failed", "Cannot attach (process died, insufficient privileges, or unsupported debugger)"),
+    -2: ("no_process", "No compatible process found for the given PID"),
+    -3: ("not_supported", "Current debugger backend does not support attach"),
+    -4: ("not_initialized", "Debugger not initialized — load a debugger plugin first"),
+}
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_attach_pid(
+    pid: Annotated[int, "Process ID of the running process to attach to"],
+) -> DebugControlResult:
+    """Attach IDA's debugger to an already-running process by PID.
+
+    The appropriate debugger plugin for the target platform must be selected
+    in Debugger → Select debugger before calling this tool.
+
+    Return states: 'attached', 'cancelled', 'failed', 'no_process',
+    'not_supported', 'not_initialized'.
+    """
+    try:
+        rc = ida_dbg.attach_process(pid, -1)
+        state_key, message = _ATTACH_RESULTS.get(rc, ("failed", f"Unexpected return code {rc}"))
+
+        if rc == 1:
+            return {"started": True, "state": "attached", "running": True}
+        elif rc == 0:
+            return {"state": "cancelled", "error": message}
+        else:
+            return {"state": state_key, "error": message}
+
+    except Exception as e:
+        return {**tool_error(e, "get debug state"), "state": "error"}
+
+
+# ============================================================================
+# Debugger: sync live memory into the IDA database
+# ============================================================================
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def sync_debugger_to_idb(
+    start: Annotated[str, "Start address of the range to sync from live process memory"],
+    end: Annotated[str, "End address (exclusive) of the range to sync"],
+    analyze: Annotated[
+        bool,
+        "After patching, run plan_and_wait on the range so IDA disassembles "
+        "and builds xrefs for the newly synced bytes (default: True)",
+    ] = True,
+) -> dict:
+    """Read a range of bytes from the live debugger process and patch them into the IDA database.
+
+    This is the key tool for encrypted/packed sections: run the target under
+    IDA's debugger until the section is decrypted in memory, then call this
+    tool to capture the decrypted bytes into the IDB. Once patched, ``analyze``
+    triggers ``plan_and_wait`` so that ``xrefs_to``, ``define_func``, and
+    decompilation work on the real code.
+
+    Workflow for encrypted sections:
+    1. Load the binary in IDA and attach the debugger.
+    2. Run until the section is decrypted (breakpoint on the decryption stub's RET).
+    3. Call ``sync_debugger_to_idb(start, end)``.
+    4. Call ``scan_and_define_funcs(start, end)`` to define functions.
+    5. Use ``xrefs_to`` / ``analyze_batch`` normally.
+
+    Requires: active debugger session (dbg_run or dbg_attach_pid first).
+    """
+    try:
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            return {"ok": False, "error": "end must be greater than start", "error_type": "invalid_input"}
+
+        dbg_ensure_active()
+
+        size = end_ea - start_ea
+        data = idaapi.dbg_read_memory(start_ea, size)
+        if not data:
+            return {
+                "ok": False,
+                "error": f"dbg_read_memory failed for {hex(start_ea)}–{hex(end_ea)}. "
+                         "Ensure the debugger is suspended (not running) and the address "
+                         "is mapped in the target process.",
+                "error_type": "not_found",
+            }
+
+        # Patch the bytes into the IDA database
+        ida_bytes.patch_bytes(start_ea, bytes(data))
+
+        functions_before = sum(1 for _ in idautils.Functions(start_ea, end_ea))
+        if analyze:
+            ida_auto.plan_and_wait(start_ea, end_ea)
+        functions_after = sum(1 for _ in idautils.Functions(start_ea, end_ea))
+
+        return {
+            "ok": True,
+            "start": hex(start_ea),
+            "end": hex(end_ea),
+            "bytes_synced": len(data),
+            "analyzed": analyze,
+            "functions_before": functions_before,
+            "functions_after": functions_after,
+            "new_functions": functions_after - functions_before,
+            "note": (
+                "Bytes patched into IDB from live process. "
+                + ("IDA analysis complete — xrefs_to and define_func should now work. " if analyze else "")
+                + "Call scan_and_define_funcs to batch-define any remaining functions."
+            ),
+        }
+    except Exception as e:
+        return tool_error(e, "sync_debugger_to_idb")

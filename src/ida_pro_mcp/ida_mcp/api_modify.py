@@ -9,17 +9,19 @@ import ida_typeinf
 import ida_frame
 import ida_dirtree
 import ida_funcs
-import ida_name
 import ida_ua
+import ida_auto
+import ida_xref
 
 from .compat import tinfo_get_udm
-from .rpc import tool
+import ida_nalt
+
+from .rpc import tool, unsafe
 from .sync import idasync, IDAError
 from .utils import (
     parse_address,
     decompile_checked,
     refresh_decompiler_ctext,
-    hexrays_local_var_exists,
     CommentOp,
     CommentAppendOp,
     AsmPatchOp,
@@ -30,15 +32,16 @@ from .utils import (
     RenameBatch,
     DefineOp,
     UndefineOp,
+    tool_error,
+    item_error,
 )
-
-MAX_BOOKMARK_SLOTS = 1024
-BOOKMARK_PREFIX = "idaMCP: "
 
 
 class CommentResult(TypedDict):
     addr: str
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
 class AppendCommentResult(TypedDict):
@@ -47,11 +50,16 @@ class AppendCommentResult(TypedDict):
     appended: NotRequired[bool]
     skipped: NotRequired[bool]
     error: NotRequired[str]
+    error_type: NotRequired[str]
+    hint: NotRequired[str]
 
 
-class PatchAsmResult(TypedDict):
+class PatchAsmResult(TypedDict, total=False):
     addr: str
-    error: NotRequired[str]
+    verified: bool
+    error: str
+    error_type: str
+    hint: str
 
 
 class RenameItemResult(TypedDict, total=False):
@@ -64,6 +72,8 @@ class RenameItemResult(TypedDict, total=False):
     dir_error: str
     dry_run: bool
     error: str
+    error_type: str
+    hint: str
 
 
 class RenameSummaryResult(TypedDict, total=False):
@@ -93,17 +103,20 @@ class DefineResult(TypedDict, total=False):
     end: str
     size: int
     length: int
+    existed: bool
     error: str
+    error_type: str
+    hint: str
 
 
-class BookmarkResult(TypedDict, total=False):
-    addr: str
-    ea: str
-    slot: int | None
-    title: str
-    prefix: str
+class XrefItem(TypedDict, total=False):
+    frm: str
+    to: str
+    type: str
     ok: bool
     error: str
+    error_type: str
+    hint: str
 
 
 # ============================================================================
@@ -113,56 +126,11 @@ class BookmarkResult(TypedDict, total=False):
 
 @tool
 @idasync
-def add_bookmark(
-    addr: Annotated[str, "Address to bookmark"],
-    name: Annotated[str, "Bookmark label text after the prefix"],
-    prefix: Annotated[
-        str,
-        "Optional title prefix. Defaults to 'idaMCP: '; pass '' for no prefix.",
-    ] = BOOKMARK_PREFIX,
-) -> BookmarkResult:
-    """Add or replace the IDA bookmark at an address. Set prefix="" for no prefix."""
-    ea = parse_address(addr)
-    title = f"{prefix}{name}"
-    free_slot: int | None = None
-
-    for slot in range(MAX_BOOKMARK_SLOTS):
-        slot_ea = idc.get_bookmark(slot)
-        if slot_ea == idc.BADADDR:
-            if free_slot is None:
-                free_slot = slot
-            continue
-
-        if slot_ea == ea:
-            free_slot = slot
-            break
-
-    if free_slot is None:
-        return {
-            "addr": addr,
-            "ea": hex(ea),
-            "slot": None,
-            "title": title,
-            "prefix": prefix,
-            "ok": False,
-            "error": "No free bookmark slot",
-        }
-
-    idc.put_bookmark(ea, 0, 0, 0, free_slot, title)
-    return {
-        "addr": addr,
-        "ea": hex(ea),
-        "slot": free_slot,
-        "title": title,
-        "prefix": prefix,
-        "ok": True,
-    }
-
-
-@tool
-@idasync
 def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
-    """Set comments at addresses (both disassembly and decompiler views)"""
+    """Set comments at addresses (both disassembly and decompiler views).
+
+    Profile: modify
+    """
     if isinstance(items, dict):
         items = [items]
 
@@ -234,7 +202,7 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"set comment at {addr_str}")})
 
     return results
 
@@ -302,7 +270,7 @@ def append_comments(
                 continue
             results.append({"addr": addr_str, "scope": "line", "appended": True})
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"append comment at {addr_str}")})
 
     return results
 
@@ -324,7 +292,10 @@ def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[
 @tool
 @idasync
 def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
-    """Patch assembly instructions at addresses"""
+    """Patch assembly instructions at addresses.
+
+    Profile: modify
+    """
     if isinstance(items, dict):
         items = [items]
 
@@ -332,70 +303,51 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
     for item in items:
         addr_str = item.get("addr", "")
         instructions = item.get("asm", "")
+        expected_bytes_str: str | None = item.get("expected_bytes")  # type: ignore[assignment]
 
         try:
             ea = parse_address(addr_str)
+
+            # Pre-flight byte verification
+            if expected_bytes_str:
+                expected = bytes(
+                    int(b, 16)
+                    for b in expected_bytes_str.strip().split()
+                )
+                live = ida_bytes.get_bytes(ea, len(expected))
+                if live != expected:
+                    results.append({
+                        "addr": addr_str,
+                        "verified": False,
+                        "error": (
+                            f"Byte mismatch at {hex(ea)}: "
+                            f"expected {expected_bytes_str.upper()}, "
+                            f"found {' '.join(f'{b:02X}' for b in (live or b''))}"
+                        ),
+                    })
+                    continue
+                results_entry: PatchAsmResult = {"addr": addr_str, "verified": True}
+            else:
+                results_entry = {"addr": addr_str}
+
             assembles = instructions.split(";")
             for assemble in assembles:
                 assemble = assemble.strip()
                 try:
                     (check_assemble, bytes_to_patch) = idautils.Assemble(ea, assemble)
                     if not check_assemble:
-                        results.append(
-                            {
-                                "addr": addr_str,
-                                "error": f"Failed to assemble: {assemble}",
-                            }
-                        )
+                        results_entry["error"] = f"Failed to assemble: {assemble}"
                         break
                     ida_bytes.patch_bytes(ea, bytes_to_patch)
                     ea += len(bytes_to_patch)
                 except Exception as e:
-                    results.append(
-                        {"addr": addr_str, "error": f"Failed at {hex(ea)}: {e}"}
-                    )
+                    results_entry["error"] = f"Failed at {hex(ea)}: {e}"
                     break
-            else:
-                results.append({"addr": addr_str})
+            results.append(results_entry)
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"patch asm at {addr_str}")})
 
     return results
-
-
-def rename_at_ea(
-    ea: int,
-    new_name: str,
-    *,
-    allow_overwrite: bool = False,
-    dry_run: bool = False,
-) -> tuple[bool, str | None]:
-    """Rename at address with detailed error reporting."""
-    conflict_ea = idaapi.get_name_ea(idaapi.BADADDR, new_name)
-    if (
-        conflict_ea != idaapi.BADADDR
-        and conflict_ea != ea
-        and not allow_overwrite
-    ):
-        return (
-            False,
-            f"can't rename at {hex(ea)} as {new_name!r}: name already used at {hex(conflict_ea)}",
-        )
-
-    if dry_run:
-        return True, None
-
-    flags = idaapi.SN_CHECK
-    if allow_overwrite:
-        flags = idaapi.SN_CHECK | int(getattr(idaapi, "SN_FORCE", 0))
-    ok = idaapi.set_name(ea, new_name, flags)
-    if not ok:
-        return (
-            False,
-            f"Rename failed at {hex(ea)}: IDA rejected name {new_name!r} "
-            "(invalid identifier or internal conflict)",
-        )
-    return True, None
 
 
 @tool
@@ -406,7 +358,10 @@ def rename(
         "Rename batch with func/data/local/stack fields (at least one required)",
     ],
 ) -> RenameResult:
-    """Batch-rename funcs/globals/locals/stack vars with dry-run options."""
+    """Batch-rename funcs/globals/locals/stack vars with dry-run options.
+
+    Profile: modify
+    """
 
     stop_on_error = bool(batch.get("stop_on_error", False))
     dry_run = bool(batch.get("dry_run", False))
@@ -437,12 +392,24 @@ def rename(
         return False
 
     def _set_name_checked(ea: int, new_name: str) -> tuple[bool, str | None]:
-        return rename_at_ea(
-            ea,
-            new_name,
-            allow_overwrite=allow_overwrite,
-            dry_run=dry_run,
-        )
+        conflict_ea = idaapi.get_name_ea(idaapi.BADADDR, new_name)
+        if (
+            conflict_ea != idaapi.BADADDR
+            and conflict_ea != ea
+            and not allow_overwrite
+        ):
+            return False, f"Name already exists at {hex(conflict_ea)}"
+
+        if dry_run:
+            return True, None
+
+        flags = idaapi.SN_CHECK
+        if allow_overwrite:
+            flags = idaapi.SN_CHECK | int(getattr(idaapi, "SN_FORCE", 0))
+        ok = idaapi.set_name(ea, new_name, flags)
+        if not ok:
+            return False, "Rename failed"
+        return True, None
 
     def _place_func_in_vibe_dir(ea: int) -> tuple[bool, str | None]:
         if dry_run:
@@ -536,7 +503,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"addr": item.get("addr"), "error": str(e)})
+                results.append({"addr": item.get("addr"), **item_error(e, "rename function")})
                 if stop_on_error:
                     halted = True
                     break
@@ -605,7 +572,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"old": item.get("old"), "error": str(e)})
+                results.append({"old": item.get("old"), **item_error(e, "rename global")})
                 if stop_on_error:
                     halted = True
                     break
@@ -649,32 +616,11 @@ def rename(
                 success = True
                 error = None
                 if not dry_run:
-                    if not ida_hexrays.init_hexrays_plugin():
-                        success = False
-                        error = (
-                            "Hex-Rays decompiler is not available "
-                            "(required for local variable rename)"
-                        )
-                    else:
-                        success = ida_hexrays.rename_lvar(
-                            func.start_ea, old_name, new_name
-                        )
-                        if success:
-                            refresh_decompiler_ctext(func.start_ea)
-                        elif not hexrays_local_var_exists(func.start_ea, old_name):
-                            error = (
-                                f"Local variable {old_name!r} not found in function at "
-                                f"{hex(func.start_ea)}"
-                            )
-                        else:
-                            error = (
-                                f"Rename failed: could not rename local {old_name!r} "
-                                f"to {new_name!r}"
-                            )
+                    success = ida_hexrays.rename_lvar(func.start_ea, old_name, new_name)
+                    if success:
+                        refresh_decompiler_ctext(func.start_ea)
                 if not success:
-                    error = error or (
-                        f"Rename failed: could not rename local {old_name!r} to {new_name!r}"
-                    )
+                    error = "Rename failed"
 
                 result = {
                     "func_addr": func_addr,
@@ -690,7 +636,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"func_addr": item.get("func_addr"), "error": str(e)})
+                results.append({"func_addr": item.get("func_addr"), **item_error(e, "rename local var")})
                 if stop_on_error:
                     halted = True
                     break
@@ -792,24 +738,10 @@ def rename(
                 success = True
                 error = None
                 if not dry_run:
-                    _, conflict_udm = tinfo_get_udm(frame_tif, new_name)
-                    if conflict_udm and new_name != old_name:
-                        success = False
-                        error = f"Stack variable name {new_name!r} already exists"
-                    else:
-                        sval = ida_frame.soff_to_fpoff(func, offset)
-                        success = ida_frame.define_stkvar(func, new_name, sval, udm.type)
-                        if not success:
-                            error = (
-                                f"Rename failed: could not rename stack variable "
-                                f"{old_name!r} to {new_name!r} in function at "
-                                f"{hex(func.start_ea)}"
-                            )
+                    sval = ida_frame.soff_to_fpoff(func, offset)
+                    success = ida_frame.define_stkvar(func, new_name, sval, udm.type)
                 if not success:
-                    error = error or (
-                        f"Rename failed: could not rename stack variable {old_name!r} "
-                        f"to {new_name!r} in function at {hex(func.start_ea)}"
-                    )
+                    error = "Rename failed"
 
                 result = {
                     "func_addr": func_addr,
@@ -825,7 +757,7 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"func_addr": item.get("func_addr"), "error": str(e)})
+                results.append({"func_addr": item.get("func_addr"), **item_error(e, "rename stack var")})
                 if stop_on_error:
                     halted = True
                     break
@@ -902,10 +834,55 @@ def rename(
     return result
 
 
+def _diagnose_add_func_failure(start_ea: int, end_ea: int) -> str:
+    """Build a human-readable hint explaining why add_func failed."""
+    parts: list[str] = []
+    seg = idaapi.getseg(start_ea)
+    if seg is None:
+        return "address is not in any known segment"
+    seg_name = idaapi.get_segm_name(seg) or "?"
+    if seg.type == idaapi.SEG_DATA:
+        parts.append(f"segment '{seg_name}' is typed as DATA")
+    elif seg.type == idaapi.SEG_BSS:
+        parts.append(f"segment '{seg_name}' is typed as BSS")
+    flags = idc.get_full_flags(start_ea)
+    if idc.is_unknown(flags):
+        parts.append("bytes are undefined")
+    elif idc.is_data(flags):
+        parts.append("bytes are currently typed as data")
+    overlap = idaapi.get_func(start_ea)
+    if overlap:
+        parts.append(
+            f"overlaps existing function {hex(overlap.start_ea)}–{hex(overlap.end_ea)}"
+        )
+    if not parts:
+        parts.append("IDA declined to create the function (bounds may be ambiguous)")
+    hint = "; ".join(parts)
+    # Append explicit JSON example so LLMs know the exact fix
+    example = (
+        f'Retry with: {{"addr":"{hex(start_ea)}","end":"<exclusive_end>",'
+        f'"force":true}} — or add "del_items":true if bytes are misidentified as data'
+    )
+    return f"{hint}. {example}"
+
+
 @tool
 @idasync
 def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
-    """Define functions; IDA infers bounds unless end is provided."""
+    """Define functions at one or more addresses.
+
+    IDA infers bounds unless ``end`` is supplied. If the function already
+    exists at the start address the call succeeds (``existed: true``).
+
+    **force=true** — runs ``ida_auto.plan_and_wait(start, end)`` before
+    ``add_func``, forcing IDA to analyse and disassemble the range first.
+    This is essential for encrypted or unanalysed regions where ``add_func``
+    would otherwise silently fail.
+
+    **del_items=true** (requires ``force=true``) — clears existing
+    code/data definitions before re-analysis via ``ida_bytes.del_items``.
+    Use this when IDA previously misidentified bytes as data.
+    """
     if isinstance(items, dict):
         items = [items]
 
@@ -913,22 +890,31 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
     for item in items:
         addr_str = item.get("addr", "")
         end_str = item.get("end", "")
+        force = bool(item.get("force", False))
+        do_del = bool(item.get("del_items", False)) and force
 
         try:
             start_ea = parse_address(addr_str)
             end_ea = parse_address(end_str) if end_str else idaapi.BADADDR
 
-            # Check if already a function
+            # Already a function → success, no-op
             existing = idaapi.get_func(start_ea)
             if existing and existing.start_ea == start_ea:
                 results.append(
                     {
                         "addr": addr_str,
-                        "start": hex(start_ea),
-                        "error": "Function already exists at this address",
+                        "start": hex(existing.start_ea),
+                        "end": hex(existing.end_ea),
+                        "existed": True,
                     }
                 )
                 continue
+
+            if force:
+                plan_end = end_ea if end_ea != idaapi.BADADDR else start_ea + 0x200
+                if do_del:
+                    ida_bytes.del_items(start_ea, 0, plan_end - start_ea)
+                ida_auto.plan_and_wait(start_ea, plan_end)
 
             success = ida_funcs.add_func(start_ea, end_ea)
             if success:
@@ -941,15 +927,197 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                     }
                 )
             else:
+                hint = _diagnose_add_func_failure(start_ea, end_ea)
                 results.append(
                     {
                         "addr": addr_str,
                         "start": hex(start_ea),
                         "error": "define_func failed",
+                        "hint": hint,
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"define function at {addr_str}")})
+
+    return results
+
+
+@tool
+@idasync
+def analyze_range(
+    start: Annotated[str, "Start address of range to force-analyse"],
+    end: Annotated[str, "End address (exclusive) of range to force-analyse"],
+) -> dict:
+    """Force IDA to analyse an address range and rebuild the xref database for it.
+
+    Calls ``ida_auto.plan_and_wait(start, end)``, which processes all queued
+    analysis requests for the range: it disassembles bytes, creates xrefs, and
+    defines data items. After this call, ``xrefs_to`` / ``xrefs_from`` will
+    return results for code that lives in the range.
+
+    This is useful for encrypted or packed sections that IDA skipped during
+    the initial auto-analysis pass. Note that the bytes must already be
+    decrypted in the IDA database (via patching or a custom loader) before
+    this tool can produce correct results.
+    """
+    try:
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            return {"ok": False, "error": "end must be greater than start", "error_type": "invalid_input"}
+        ida_auto.plan_and_wait(start_ea, end_ea)
+        func_count = sum(1 for _ in idautils.Functions(start_ea, end_ea))
+        return {
+            "ok": True,
+            "start": hex(start_ea),
+            "end": hex(end_ea),
+            "size": end_ea - start_ea,
+            "functions_in_range": func_count,
+            "note": "Analysis complete. xrefs_to / xrefs_from should now reflect this range.",
+        }
+    except Exception as e:
+        return tool_error(e, "analyze_range")
+
+
+@tool
+@idasync
+def scan_and_define_funcs(
+    start: Annotated[str, "Start address of range to scan"],
+    end: Annotated[str, "End address (exclusive) of range to scan"],
+    force: Annotated[
+        bool,
+        "Run plan_and_wait on the range before scanning (needed for unanalysed regions)",
+    ] = True,
+    del_items: Annotated[
+        bool,
+        "Clear existing definitions before analysis (use with force=True when IDA "
+        "previously misidentified bytes as data)",
+    ] = False,
+) -> dict:
+    """Scan an address range, force IDA analysis, and define all functions found.
+
+    Heavy: for large ranges use invoke_tool(..., async_mode=True) or task_submit + task_poll.
+
+    Workflow:
+    1. Optionally clear existing definitions (``del_items=true``).
+    2. Run ``plan_and_wait`` to disassemble the range (``force=true``).
+    3. Walk every code head not already inside a function and call ``add_func``.
+    4. Return a summary of created and failed function definitions.
+
+    Ideal for encrypted/obfuscated sections that have been decrypted in-place
+    and need batch function recovery without manual IDA interaction.
+    """
+    try:
+        start_ea = parse_address(start)
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            return {"ok": False, "error": "end must be greater than start", "error_type": "invalid_input"}
+
+        if force:
+            if del_items:
+                ida_bytes.del_items(start_ea, 0, end_ea - start_ea)
+            ida_auto.plan_and_wait(start_ea, end_ea)
+
+        created: list[dict] = []
+        failed: list[str] = []
+
+        ea = start_ea
+        while ea < end_ea and ea != idaapi.BADADDR:
+            fn = idaapi.get_func(ea)
+            if fn:
+                # Skip to end of existing function
+                ea = fn.end_ea
+                continue
+            flags = idc.get_full_flags(ea)
+            if idc.is_code(flags):
+                ok = ida_funcs.add_func(ea)
+                if ok:
+                    fn2 = idaapi.get_func(ea)
+                    if fn2:
+                        created.append({"start": hex(fn2.start_ea), "end": hex(fn2.end_ea)})
+                        ea = fn2.end_ea
+                        continue
+                    else:
+                        created.append({"start": hex(ea), "end": None})
+                else:
+                    failed.append(hex(ea))
+            next_ea = idc.next_head(ea, end_ea)
+            if next_ea == idaapi.BADADDR or next_ea <= ea:
+                break
+            ea = next_ea
+
+        return {
+            "ok": True,
+            "start": hex(start_ea),
+            "end": hex(end_ea),
+            "created_count": len(created),
+            "failed_count": len(failed),
+            "created": created,
+            "failed": failed,
+        }
+    except Exception as e:
+        return tool_error(e, "scan_and_define_funcs")
+
+
+_XREF_CREFS = {
+    "call":       ida_xref.fl_CN,
+    "call_near":  ida_xref.fl_CN,
+    "call_far":   ida_xref.fl_CF,
+    "jump":       ida_xref.fl_JN,
+    "jump_near":  ida_xref.fl_JN,
+    "jump_far":   ida_xref.fl_JF,
+    "flow":       ida_xref.fl_F,
+}
+_XREF_DREFS = {
+    "data_read":   ida_xref.dr_R,
+    "data_write":  ida_xref.dr_W,
+    "data_offset": ida_xref.dr_O,
+}
+_XREF_VALID = sorted(_XREF_CREFS) + sorted(_XREF_DREFS)
+
+
+@unsafe
+@tool
+@idasync
+def add_xref(
+    items: Annotated[
+        list[dict] | dict,
+        "List of {from, to, type} dicts. "
+        "type (default 'call'): call/call_near, call_far, jump/jump_near, jump_far, "
+        "flow, data_read, data_write, data_offset",
+    ],
+) -> list[XrefItem]:
+    """Manually add cross-references between addresses.
+
+    Use when IDA has not detected a call/jump relationship, e.g. when the
+    caller lives in encrypted or undefined code that IDA has not analysed.
+    All xrefs are tagged ``XREF_USER`` so they survive IDA reanalysis.
+
+    After adding xrefs, ``xrefs_to(target)`` will return these entries.
+    """
+    if isinstance(items, dict):
+        items = [items]
+
+    results: list[XrefItem] = []
+    for item in items:
+        frm_str = str(item.get("from", "") or item.get("frm", ""))
+        to_str = str(item.get("to", ""))
+        xref_type = str(item.get("type", "call")).lower().replace("-", "_")
+
+        try:
+            frm_ea = parse_address(frm_str)
+            to_ea = parse_address(to_str)
+
+            if xref_type in _XREF_CREFS:
+                ok = ida_xref.add_cref(frm_ea, to_ea, _XREF_CREFS[xref_type] | ida_xref.XREF_USER)
+            elif xref_type in _XREF_DREFS:
+                ok = ida_xref.add_dref(frm_ea, to_ea, _XREF_DREFS[xref_type] | ida_xref.XREF_USER)
+            else:
+                raise ValueError(f"Unknown xref type '{xref_type}'. Valid: {_XREF_VALID}")
+
+            results.append({"frm": hex(frm_ea), "to": hex(to_ea), "type": xref_type, "ok": ok})
+        except Exception as e:
+            results.append({"frm": frm_str, "to": to_str, **item_error(e, f"add_xref {frm_str}->{to_str}")})  # type: ignore[arg-type]
 
     return results
 
@@ -981,7 +1149,7 @@ def define_code(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"create instruction at {addr_str}")})
 
     return results
 
@@ -1030,290 +1198,169 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[DefineResult]:
                     }
                 )
         except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
+            results.append({"addr": addr_str, **item_error(e, f"undefine at {addr_str}")})
 
     return results
 
 
 # ============================================================================
-# Hex-Rays + operand-typing operations (the "last 20% polish" tools)
+# Type removal
 # ============================================================================
 
 
-class ForceRecompileOp(TypedDict, total=False):
-    addr: str  # function entry, or "*" / omitted to recompile every function
-
-
-class ForceRecompileResult(TypedDict, total=False):
-    addr: str
-    name: str
+class RemoveTypeResult(TypedDict, total=False):
     ok: bool
+    addr: str
     error: str
 
 
 @tool
 @idasync
-def force_recompile(
-    items: Annotated[
-        list[ForceRecompileOp] | ForceRecompileOp,
-        "List of {addr: function-entry-EA} ops, or a single op. Omit / pass empty list to recompile every function.",
-    ] = None,
-) -> dict:
-    """Invalidate the Hex-Rays decompile cache for one or more functions.
+def remove_type(
+    addr: Annotated[str, "Address to remove type information from"],
+) -> RemoveTypeResult:
+    """Remove the type annotation applied to an address or function.
 
-    Use after `set_type`, `rename` (especially of locals), `set_op_type`, or
-    `make_data` so the next `decompile` call regenerates fresh pseudocode
-    instead of returning a cached, stale view.
+    Clears the stored tinfo_t so IDA reverts to auto-inferred type.
+    Useful after applying an incorrect type via set_type or the decompiler.
+    Also invalidates the Hex-Rays decompiler cache for the owning function.
     """
-    targets: list[int] = []
-    invalidate_all = False
-
-    if items is None:
-        invalidate_all = True
-    elif isinstance(items, dict):
-        items = [items]
-    elif isinstance(items, list) and len(items) == 0:
-        invalidate_all = True
-
-    if invalidate_all:
-        targets = list(idautils.Functions())
-    else:
-        for item in items or []:
-            addr_str = item.get("addr") if isinstance(item, dict) else None
-            if not addr_str:
-                continue
-            try:
-                ea = parse_address(addr_str)
-                func = ida_funcs.get_func(ea)
-                if func is not None:
-                    targets.append(func.start_ea)
-            except Exception:
-                pass
-
-    results: list[ForceRecompileResult] = []
-    for ea in targets:
+    try:
+        ea = parse_address(addr)
+        ida_nalt.del_tinfo(ea)
         try:
-            ida_hexrays.mark_cfunc_dirty(ea)
-            results.append({
-                "addr": hex(ea),
-                "name": ida_funcs.get_func_name(ea) or "",
+            if ida_hexrays.init_hexrays_plugin():
+                ida_hexrays.clear_cached_cfuncs()
+        except Exception:
+            pass
+        return {"ok": True, "addr": hex(ea)}
+    except Exception as e:
+        return {**tool_error(e, f"remove_type at {addr}"), "addr": addr}
+
+
+# ============================================================================
+# Stub / placeholder tagging
+# ============================================================================
+
+import re as _re
+
+_AUTO_NAME_RE = _re.compile(
+    r'^(sub|nullsub|loc|def|byte|word|dword|qword|oword|xmmword|ymmword|zmmword|unk|j_)_[0-9A-Fa-f]+$'
+)
+
+
+def _is_auto_generated_name(name: str) -> bool:
+    """Return True if name looks like an IDA-generated placeholder (sub_XXXX, loc_XXXX, …)."""
+    return bool(_AUTO_NAME_RE.match(name))
+
+
+@unsafe
+@tool
+@idasync
+def mark_functions_as_stubs(
+    addrs: Annotated[
+        list[str] | str,
+        "Function address(es) to tag — list or comma-separated. "
+        "e.g. ['0x2e0', '0x390'] or '0x2e0,0x390'.",
+    ],
+    reason: Annotated[
+        str,
+        "Tag reason to store in the function comment "
+        "(e.g. 'encrypted', 'thunk', 'placeholder'; default: 'stub').",
+    ] = "stub",
+    rename: Annotated[
+        bool,
+        "Prefix auto-named functions (sub_XXXX, nullsub_XXXX) with 'stub_' so they "
+        "stand out in function lists. Only renames if the current name is auto-generated. "
+        "Default: true.",
+    ] = True,
+) -> dict:
+    """Tag one or more functions as stubs / placeholders / encrypted blobs.
+
+    For each address:
+    - Sets a repeatable function comment ``[STUB:<reason>]`` so the tag
+      appears in disassembly listings and is visible to all analysis tools.
+    - Optionally renames auto-generated functions (``sub_*``, ``nullsub_*``, …)
+      with a ``stub_`` prefix so they are easy to filter from function lists.
+
+    Returns per-address status including the old name, new name (if renamed),
+    and whether the tag was applied.
+
+    Typical use: after ``lief_sections`` reveals a packed ``.text`` with entropy
+    > 7.2, tag all functions in the encrypted range so later analysis can skip them:
+
+        mark_functions_as_stubs(addrs=['0x2e0', '0x390', ...], reason='encrypted')
+
+    Then filter with: ``func_query([{\"name_regex\": \"^(?!stub_)\"}])``
+
+    See also: func_query (filter by name pattern), add_comment (free-form comments).
+    """
+    from .utils import normalize_list_input
+    import ida_name
+
+    raw_addrs = normalize_list_input(addrs)
+    if not raw_addrs:
+        return {"ok": False, "error": "No addresses provided"}
+
+    tag = f"[STUB:{reason}]"
+    results: list[dict] = []
+    tagged = 0
+    skipped = 0
+
+    for raw in raw_addrs:
+        raw = raw.strip()
+        if not raw:
+            continue
+        entry: dict = {"addr": raw}
+        try:
+            ea = parse_address(raw)
+            entry["addr"] = hex(ea)
+
+            func = ida_funcs.get_func(ea)
+            if func is None:
+                entry["ok"] = False
+                entry["error"] = "No function at this address"
+                skipped += 1
+                results.append(entry)
+                continue
+
+            # Function comment — repeatable so it shows in both listing and decompiler
+            old_cmt = idc.get_func_cmt(func.start_ea, 1) or ""
+            if tag not in old_cmt:
+                new_cmt = (old_cmt + "\n" + tag).strip() if old_cmt else tag
+                idc.set_func_cmt(func.start_ea, new_cmt, 1)
+
+            old_name = ida_funcs.get_func_name(func.start_ea) or hex(func.start_ea)
+            new_name = old_name
+            renamed = False
+
+            if rename and _is_auto_generated_name(old_name):
+                candidate = f"stub_{hex(func.start_ea)[2:]}"
+                flags = ida_name.SN_NOCHECK | ida_name.SN_FORCE
+                if ida_name.set_name(func.start_ea, candidate, flags):
+                    new_name = candidate
+                    renamed = True
+
+            entry.update({
                 "ok": True,
+                "old_name": old_name,
+                "new_name": new_name,
+                "renamed": renamed,
+                "comment_set": tag,
             })
-        except Exception as e:
-            results.append({"addr": hex(ea), "ok": False, "error": str(e)})
+            tagged += 1
+
+        except Exception as exc:
+            entry.update({**item_error(exc, f"mark_functions_as_stubs at {raw}"),
+                          "ok": False})
+            skipped += 1
+
+        results.append(entry)
 
     return {
-        "summary": {
-            "total": len(results),
-            "ok": sum(1 for r in results if r.get("ok")),
-            "failed": sum(1 for r in results if not r.get("ok")),
-            "all": invalidate_all,
-        },
+        "ok": True,
+        "tagged": tagged,
+        "skipped": skipped,
+        "total": len(results),
         "results": results,
     }
-
-
-class SetOpTypeOp(TypedDict, total=False):
-    addr: str          # instruction EA
-    op_n: int          # operand index (0 = first operand)
-    kind: str          # "stroff" | "offset" | "hex" | "dec" | "char" | "binary" | "stkvar"
-    struct: NotRequired[str]   # struct name (required for kind="stroff")
-    delta: NotRequired[int]    # offset within struct (default 0)
-    target_addr: NotRequired[str]  # for kind="offset", the symbol the operand references
-
-
-class SetOpTypeResult(TypedDict, total=False):
-    addr: str
-    op_n: int
-    kind: str
-    ok: bool
-    error: str
-
-
-_OP_FORMAT_FLAGS = {
-    "hex":    ida_bytes.FF_0NUMH,
-    "dec":    ida_bytes.FF_0NUMD,
-    "char":   ida_bytes.FF_0CHAR,
-    "binary": ida_bytes.FF_0NUMB,
-    "octal":  ida_bytes.FF_0NUMO,
-}
-
-
-@tool
-@idasync
-def set_op_type(
-    items: Annotated[
-        list[SetOpTypeOp] | SetOpTypeOp,
-        "Operand-typing ops. Equivalent to GUI 'Y' (struct offset) or 'O' (offset) operations.",
-    ],
-) -> list[SetOpTypeResult]:
-    """Set the type of an instruction operand. GUI 'Y' / 'O' / '#' equivalent.
-
-    Tags an operand at a specific instruction with a desired interpretation.
-    Useful when the decompiler picks an awkward expression form (e.g., the
-    "earlier-named-symbol + offset" form for contiguous globals).
-
-    `kind` values:
-    - `"stroff"`: struct-offset reference. Requires `struct`, optional `delta`.
-    - `"offset"`: absolute offset / pointer. Optional `target_addr`.
-    - `"hex" | "dec" | "char" | "binary" | "octal"`: numeric format.
-    - `"stkvar"`: stack-variable reference (function-local).
-    """
-    if isinstance(items, dict):
-        items = [items]
-
-    results: list[SetOpTypeResult] = []
-    for item in items:
-        addr_str = item.get("addr", "")
-        op_n = int(item.get("op_n", 0))
-        kind = str(item.get("kind", "")).strip().lower()
-
-        try:
-            ea = parse_address(addr_str)
-        except Exception as e:
-            results.append({"addr": addr_str, "op_n": op_n, "kind": kind, "ok": False, "error": str(e)})
-            continue
-
-        ok = False
-        err = None
-        try:
-            if kind == "stroff":
-                struct_name = str(item.get("struct", "")).strip()
-                if not struct_name:
-                    err = "struct name required for kind='stroff'"
-                else:
-                    delta = int(item.get("delta", 0))
-                    # IDA 9.x: structs live in the local type library; resolve
-                    # via tinfo_t.get_named_type and then get_tid.
-                    til = ida_typeinf.get_idati()
-                    sti = ida_typeinf.tinfo_t()
-                    if not sti.get_named_type(til, struct_name):
-                        err = f"struct not found: {struct_name}"
-                    else:
-                        tid = sti.get_tid()
-                        if tid == idaapi.BADADDR:
-                            err = f"struct {struct_name} has no tid"
-                        else:
-                            path = idaapi.tid_array(1)
-                            path[0] = tid
-                            ok = bool(ida_bytes.op_stroff(ea, op_n, path.cast(), 1, delta))
-            elif kind == "offset":
-                target_str = str(item.get("target_addr", "")).strip()
-                if target_str:
-                    target_ea = parse_address(target_str)
-                    ok = bool(idc.op_plain_offset(ea, op_n, target_ea))
-                else:
-                    ok = bool(idc.op_plain_offset(ea, op_n, 0))
-            elif kind == "stkvar":
-                ok = bool(idc.op_stkvar(ea, op_n))
-            elif kind in _OP_FORMAT_FLAGS:
-                flag = _OP_FORMAT_FLAGS[kind]
-                ok = bool(ida_bytes.set_op_type(ea, flag, op_n))
-            else:
-                err = f"unknown kind: {kind!r} (expected stroff/offset/stkvar/hex/dec/char/binary/octal)"
-        except Exception as e:
-            err = str(e)
-
-        result: SetOpTypeResult = {"addr": addr_str, "op_n": op_n, "kind": kind, "ok": ok}
-        if err is not None and not ok:
-            result["error"] = err
-        results.append(result)
-
-    return results
-
-
-class MakeDataOp(TypedDict, total=False):
-    addr: str
-    type: str  # full C declaration, e.g. "ISP_SNS_STATE_S * g_pastImx290[4]"
-    name: NotRequired[str]   # optional rename
-    delete_existing: NotRequired[bool]  # default True
-
-
-class MakeDataResult(TypedDict, total=False):
-    addr: str
-    name: str
-    type: str
-    size: int
-    ok: bool
-    error: str
-
-
-@tool
-@idasync
-def make_data(
-    items: Annotated[
-        list[MakeDataOp] | MakeDataOp,
-        "Data-creation ops. Each {addr, type, name?} replaces existing data items at addr with a fresh symbol of the given type.",
-    ],
-) -> list[MakeDataResult]:
-    """Create a typed data symbol at an address, replacing any prior items.
-
-    Use this to harden a symbol boundary that the decompiler is currently
-    expressing through a neighboring global plus offset. `set_type` alone
-    leaves the underlying byte items unchanged; this tool deletes them
-    first, then re-creates them at the right size with the right type, then
-    optionally renames.
-
-    The `type` field is a full C declaration with a placeholder name, e.g.
-    `"ISP_SNS_STATE_S * g_pastImx290[4]"` — IDA parses it via SetType.
-    """
-    if isinstance(items, dict):
-        items = [items]
-
-    results: list[MakeDataResult] = []
-    for item in items:
-        addr_str = item.get("addr", "")
-        type_decl = str(item.get("type", "")).strip()
-        name = str(item.get("name", "")).strip()
-        delete_existing = bool(item.get("delete_existing", True))
-
-        try:
-            ea = parse_address(addr_str)
-        except Exception as e:
-            results.append({"addr": addr_str, "ok": False, "error": str(e)})
-            continue
-
-        if not type_decl:
-            results.append({"addr": addr_str, "ok": False, "error": "type declaration is required"})
-            continue
-
-        # Ensure the declaration has a trailing semicolon for SetType.
-        decl = type_decl if type_decl.endswith(";") else type_decl + ";"
-
-        try:
-            # Apply the type (this also tells us the size).
-            apply_ok = idc.SetType(ea, decl)
-            if not apply_ok:
-                results.append({"addr": addr_str, "ok": False, "error": f"SetType rejected declaration: {decl!r}"})
-                continue
-
-            # Compute size from the now-applied type.
-            tif = ida_typeinf.tinfo_t()
-            try:
-                ok_t = ida_typeinf.guess_tinfo(tif, ea)
-            except Exception:
-                ok_t = False
-            size = tif.get_size() if ok_t else 0
-
-            if delete_existing and size > 0:
-                ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size)
-                # Re-apply after del_items (it can clobber the type binding).
-                idc.SetType(ea, decl)
-
-            if name:
-                ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_FORCE)
-
-            # Mark all dependent decompiles dirty so subsequent decompile() gets fresh output.
-            ida_hexrays.clear_cached_cfuncs()
-
-            results.append({
-                "addr": addr_str,
-                "name": name or (ida_name.get_name(ea) or ""),
-                "type": idc.get_type(ea) or "",
-                "size": size,
-                "ok": True,
-            })
-        except Exception as e:
-            results.append({"addr": addr_str, "ok": False, "error": str(e)})
-
-    return results

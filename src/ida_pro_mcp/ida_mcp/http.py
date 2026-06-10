@@ -65,6 +65,15 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     if new_tools:
         enabled_tools.update({name: True for name in new_tools})
 
+    try:
+        from .api_discovery import _LOCAL_TOOL_NAMES as PROTECTED_TOOLS
+    except Exception:
+        PROTECTED_TOOLS = set()
+
+    for name in PROTECTED_TOOLS:
+        if name in original_tools:
+            enabled_tools[name] = True
+
     if enabled_tools != original_enabled_tools:
         config_json_set(config_key, enabled_tools)
 
@@ -114,34 +123,61 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
                 return
             self._handle_config_post()
         else:
-            super().do_POST()
+            # Mark proxied requests so _redirecting_dispatch won't re-proxy (loop prevention)
+            from .api_discovery import PROXY_HEADER, set_request_proxied
+            set_request_proxied(self.headers.get(PROXY_HEADER) == "1")
+            try:
+                super().do_POST()
+            finally:
+                set_request_proxied(False)
 
     def do_GET(self):
         """Handles GET requests."""
-        parsed = urlparse(self.path)
-        path = parsed.path
+        from .api_discovery import PROXY_HEADER, set_request_proxied
 
-        if path == "/config.html":
-            if not self._check_host():
+        set_request_proxied(self.headers.get(PROXY_HEADER) == "1")
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+
+            if path == "/config.html":
+                if not self._check_host():
+                    return
+                self._handle_config_get()
                 return
-            self._handle_config_get()
-            return
 
-        if path == "/profile.txt":
-            if not self._check_host():
+            if path == "/profile.txt":
+                if not self._check_host():
+                    return
+                self._handle_profile_export()
                 return
-            self._handle_profile_export()
-            return
 
-        # Handle output download requests
-        output_match = re.match(r"^/output/([a-f0-9-]+)\.(\w+)$", path)
-        if output_match:
-            if not self._check_api_request():
+            # Handle output download requests
+            output_match = re.match(r"^/output/([a-f0-9-]+)\.(\w+)$", path)
+            if output_match:
+                if not self._check_api_request():
+                    return
+                self._handle_output_download(output_match.group(1), output_match.group(2))
                 return
-            self._handle_output_download(output_match.group(1), output_match.group(2))
-            return
 
-        super().do_GET()
+            # MCP Streamable HTTP: GET /mcp is an optional SSE pre-connect probe.
+            # The zeromcp base handler returns 405, which causes some MCP clients
+            # (Kilo, Cursor) to fail instead of falling through to POST /mcp.
+            # Per the MCP spec, an empty SSE stream signals "no events, use POST".
+            if path == "/mcp" or path.rstrip("/") == "/mcp":
+                if not self._check_api_request():
+                    return
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.flush()
+                return
+
+            super().do_GET()
+        finally:
+            set_request_proxied(False)
 
     def _handle_profile_export(self):
         """Return the currently enabled tools as a profile file."""
@@ -163,7 +199,31 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         """Handle download of cached output data."""
         data = get_cached_output(output_id)
         if data is None:
-            self.send_error(404, "Output not found or expired")
+            from .api_discovery import (
+                get_output_proxy_target,
+                is_request_proxied,
+                proxy_output_to_instance,
+            )
+
+            target = get_output_proxy_target(output_id)
+            if target is None or is_request_proxied():
+                self.send_error(404, "Output not found or expired")
+                return
+            try:
+                status, _, response_headers, body = proxy_output_to_instance(
+                    target[0], target[1], f"/output/{output_id}.{extension}"
+                )
+            except Exception as e:
+                self.send_error(502, f"Failed to proxy output download: {e}")
+                return
+
+            self.send_response(status)
+            for header, value in response_headers:
+                if header.lower() == "transfer-encoding":
+                    continue
+                self.send_header(header, value)
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if extension == "json":
@@ -194,25 +254,28 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         return cast(HTTPServer, self.server).server_port
 
     def _check_origin(self) -> bool:
-        """Validate Origin for config POST requests.
-
-        Delegates to the zeromcp ``_check_api_request`` which already
-        handles non-loopback bindings (LAN) and respects the configured
-        CORS policy.  When the server is bound to 0.0.0.0 the Host
-        check passes for any client; the Origin check still enforces
-        the CORS policy so ``unrestricted`` is needed for browser-based
-        LAN config access.
         """
-        return self._check_api_request()
+        Prevents CSRF and DNS rebinding attacks by ensuring POST requests
+        originate from pages served by this server, not external websites.
+        """
+        origin = self.headers.get("Origin")
+        port = self.server_port
+        if origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+            self.send_error(403, "Invalid Origin")
+            return False
+        return True
 
     def _check_host(self) -> bool:
-        """Validate Host header for config page access.
-
-        Delegates to ``_check_api_request`` so the same rules apply as
-        for MCP API calls: loopback-bound servers only accept loopback
-        Host headers; non-loopback servers (0.0.0.0) accept any Host.
         """
-        return self._check_api_request()
+        Prevents DNS rebinding attacks where an attacker's domain (e.g., evil.com)
+        resolves to 127.0.0.1, allowing their page to read localhost resources.
+        """
+        host = self.headers.get("Host")
+        port = self.server_port
+        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self.send_error(403, "Invalid Host")
+            return False
+        return True
 
     def _send_html(self, status: int, text: str):
         """
@@ -428,12 +491,16 @@ input[type="submit"]:hover {
         config_json_set("cors_policy", cors_policy)
         self.update_cors_policy()
 
-        # Update the server's tools
+        # Update the server's tools (discovery tools cannot be disabled)
+        from .api_discovery import _LOCAL_TOOL_NAMES as PROTECTED_TOOLS
+
         if "apply_profile" in postvars:
             whitelist = parse_profile(postvars.get("profile_text", [""])[0])
             enabled_tools = {name: name in whitelist for name in ORIGINAL_TOOLS.keys()}
         else:
             enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
+        for name in PROTECTED_TOOLS:
+            enabled_tools[name] = True
         self.mcp_server.tools.methods = {
             name: func
             for name, func in ORIGINAL_TOOLS.items()

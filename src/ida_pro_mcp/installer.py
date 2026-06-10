@@ -1,7 +1,9 @@
 import glob
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -29,13 +31,21 @@ except ImportError:
     )
     from installer_tui import interactive_choose, interactive_select
 
-MCP_SERVER_NAME = "ida-pro-mcp"
+try:
+    from .ida_mcp.rpc import MCP_SERVER_NAME
+except ImportError:
+    try:
+        from ida_mcp.rpc import MCP_SERVER_NAME
+    except ImportError:
+        MCP_SERVER_NAME = "synapse-mcp"
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server.py")
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+EXPORT_CONFIG_DIR = "mcp-client-configs"
 
 # NOTE: This is in the global scope on purpose
 if not os.path.exists(IDA_PLUGIN_PKG):
@@ -103,6 +113,17 @@ def copy_python_env(env: dict[str, str]):
     return result
 
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Strip C-style comments from JSONC while preserving string literals."""
+
+    def _replacer(match: re.Match) -> str:
+        s = match.group(0)
+        return s if s[0] == '"' else ''
+
+    pattern = r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\r\n]*'
+    return re.sub(pattern, _replacer, text, flags=re.DOTALL)
+
+
 def normalize_transport_url(transport: str) -> str:
     url = urlparse(transport)
     if url.hostname is None or url.port is None:
@@ -122,7 +143,8 @@ def infer_http_transport_type(transport_url: str) -> str:
     return "sse" if urlparse(transport_url).path.rstrip("/") == "/sse" else "http"
 
 
-def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
+def generate_mcp_config(*, client_name: str, transport: str = "stdio", lazy: bool = False):
+    lazy_flags = ["--lazy"] if lazy else []
     if transport == "stdio":
         # No --ida-rpc: server auto-discovers running IDA instances
         if client_name == "Opencode":
@@ -131,13 +153,25 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
                 "command": [
                     get_python_executable(),
                     SERVER_SCRIPT,
+                    *lazy_flags,
                 ],
+            }
+        elif client_name == "Kilo Code":
+            mcp_config = {
+                "type": "local",
+                "command": [
+                    get_python_executable(),
+                    SERVER_SCRIPT,
+                    *lazy_flags,
+                ],
+                "enabled": True,
             }
         else:
             mcp_config = {
                 "command": get_python_executable(),
                 "args": [
                     SERVER_SCRIPT,
+                    *lazy_flags,
                 ],
             }
         env = {}
@@ -154,6 +188,8 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
     transport_url = normalize_transport_url(transport)
     if client_name == "Opencode":
         return {"type": "remote", "url": transport_url}
+    if client_name == "Kilo Code":
+        return {"type": "remote", "url": transport_url, "enabled": True}
     if client_name == "Codex":
         return {"url": force_mcp_path(transport_url)}
     if client_name in ("Claude", "Claude Code"):
@@ -163,21 +199,22 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
     return {"type": "http", "url": force_mcp_path(transport_url)}
 
 
-def print_mcp_config():
-    print("[STDIO MCP CONFIGURATION]")
+def print_mcp_config(*, lazy: bool = False):
+    mode_tag = " [LAZY MODE — 4 meta-tools]" if lazy else ""
+    print(f"[STDIO MCP CONFIGURATION{mode_tag}]")
     print(
         json.dumps(
             {
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
-                        client_name="Generic", transport="stdio"
+                        client_name="Generic", transport="stdio", lazy=lazy
                     )
                 }
             },
             indent=2,
         )
     )
-    print("\n[STREAMABLE HTTP MCP CONFIGURATION]")
+    print(f"\n[STREAMABLE HTTP MCP CONFIGURATION{mode_tag}]")
     print(
         json.dumps(
             {
@@ -185,13 +222,14 @@ def print_mcp_config():
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
                         transport=f"http://{IDA_HOST}:{IDA_PORT}/mcp",
+                        lazy=lazy,
                     )
                 }
             },
             indent=2,
         )
     )
-    print("\n[SSE MCP CONFIGURATION]")
+    print(f"\n[SSE MCP CONFIGURATION{mode_tag}]")
     print(
         json.dumps(
             {
@@ -199,6 +237,7 @@ def print_mcp_config():
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
                         transport=f"http://{IDA_HOST}:{IDA_PORT}/sse",
+                        lazy=lazy,
                     )
                 }
             },
@@ -226,6 +265,8 @@ def _read_config_file(config_path: str, *, is_toml: bool) -> dict | None:
                 return tomllib.loads(data.decode("utf-8")) if data else {}
         with open(config_path, "r", encoding="utf-8") as f:
             data = f.read().strip()
+            if config_path.endswith(".jsonc"):
+                data = _strip_jsonc_comments(data)
             return json.loads(data) if data else {}
     except (json.JSONDecodeError, tomllib.TOMLDecodeError, OSError):
         return None
@@ -269,36 +310,19 @@ def _get_mcp_servers_view(
 
 
 def _resolve_client_targets(
-    configs: dict[str, tuple[str, str]],
-    only: list[str] | None,
-    *,
-    project: bool,
+    configs: dict[str, tuple[str, str]], only: list[str] | None
 ) -> dict[str, tuple[str, str]]:
     if only is None:
         return configs
 
     available = list(configs.keys())
-    other_scope_configs = (
-        get_global_configs() if project else get_project_configs(os.getcwd())
-    )
-    other_scope_name = "global" if project else "project"
     filtered: dict[str, tuple[str, str]] = {}
     for target_name in only:
         resolved = resolve_client_name(target_name, available)
         if resolved is None:
-            other_scope_match = resolve_client_name(
-                target_name, list(other_scope_configs.keys())
+            print(
+                f"Unknown client: '{target_name}'. Use --list-clients to see available targets."
             )
-            if other_scope_match is not None:
-                print(
-                    f"Client '{other_scope_match}' is not supported for "
-                    f"--scope {'project' if project else 'global'}. "
-                    f"Use --scope {other_scope_name} for this target."
-                )
-            else:
-                print(
-                    f"Unknown client: '{target_name}'. Use --list-clients to see available targets."
-                )
         elif resolved not in filtered:
             filtered[resolved] = configs[resolved]
     return filtered
@@ -346,6 +370,7 @@ def list_available_clients():
     print("  ida-pro-mcp --install claude,cursor                       # Specific client targets")
     print("  ida-pro-mcp --install vscode --scope project              # Project-level config")
     print("  ida-pro-mcp --install cursor --transport streamable-http  # Streamable HTTP config")
+    print("  ida-pro-mcp --install roo --scope export                  # Export JSONs for manual copy")
     print("  ida-pro-mcp --uninstall cursor                            # Uninstall specific target")
 
 
@@ -356,13 +381,14 @@ def install_mcp_servers(
     quiet: bool = False,
     only: list[str] | None = None,
     project: bool = False,
+    lazy: bool = False,
 ):
     configs, special_json_structures = _get_scope_config_spec(project=project)
     if not configs:
         print(f"Unsupported platform: {sys.platform}")
         return
 
-    configs = _resolve_client_targets(configs, only, project=project)
+    configs = _resolve_client_targets(configs, only)
     if not configs:
         return
 
@@ -418,6 +444,7 @@ def install_mcp_servers(
             mcp_servers[MCP_SERVER_NAME] = generate_mcp_config(
                 client_name=name,
                 transport=transport,
+                lazy=lazy,
             )
 
         _write_config_file(config_path, config, is_toml=is_toml)
@@ -432,13 +459,313 @@ def install_mcp_servers(
         print(
             "No MCP servers installed. For unsupported MCP clients, use the following config:\n"
         )
-        print_mcp_config()
+        print_mcp_config(lazy=lazy)
+
+
+def _build_client_export_config(client_name: str, transport: str, *, lazy: bool = False) -> dict:
+    """Build a complete config dict for a specific client in the format it expects."""
+    special = {}
+    if client_name in GLOBAL_SPECIAL_JSON_STRUCTURES:
+        special = {client_name: GLOBAL_SPECIAL_JSON_STRUCTURES[client_name]}
+    elif client_name in PROJECT_SPECIAL_JSON_STRUCTURES:
+        special = {client_name: PROJECT_SPECIAL_JSON_STRUCTURES[client_name]}
+
+    config = {}
+    mcp_servers = _get_mcp_servers_view(
+        config,
+        client_name=client_name,
+        is_toml=False,
+        special_json_structures=special,
+    )
+    mcp_servers[MCP_SERVER_NAME] = generate_mcp_config(
+        client_name=client_name, transport=transport, lazy=lazy
+    )
+    return config
+
+
+def _get_all_export_clients() -> dict[str, str]:
+    """Return a mapping of all known client names -> friendly filename slug."""
+    global_clients = get_global_configs()
+    project_clients = get_project_configs(os.getcwd())
+    all_names = sorted(set(global_clients.keys()) | set(project_clients.keys()))
+    result: dict[str, str] = {}
+    for name in all_names:
+        slug = name.lower().replace(" ", "-").replace(".", "").replace("(", "").replace(")", "")
+        result[name] = f"{slug}.json"
+    return result
+
+
+def export_mcp_configs(
+    *,
+    transport: str = "stdio",
+    only: list[str] | None = None,
+    project_dir: str | None = None,
+    lazy: bool = False,
+) -> None:
+    """Export MCP config JSON files to the project folder for manual IDE setup."""
+    clients = _get_all_export_clients()
+    if not clients:
+        print("No supported MCP clients found for export.")
+        return
+
+    if only:
+        filtered = {}
+        for target in only:
+            resolved = resolve_client_name(target, list(clients.keys()))
+            if resolved and resolved in clients:
+                filtered[resolved] = clients[resolved]
+            else:
+                print(f"  Warning: Unknown client '{target}' — skipping")
+        clients = filtered
+
+    out_dir = os.path.join(project_dir or os.getcwd(), EXPORT_CONFIG_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+
+    written = 0
+    for name, filename in clients.items():
+        config = _build_client_export_config(name, transport, lazy=lazy)
+        out_path = os.path.join(out_dir, filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+        written += 1
+
+    print(f"\nExported {written} MCP client config(s) to: {out_dir}")
+    print("Copy the contents of the relevant JSON file into your IDE's MCP settings.")
+    if "stdio" in transport or transport == "stdio":
+        print("  Tip: For stdio transport, the 'command' path uses the current Python.")
+    print()
 
 
 def _get_ida_user_dir() -> str:
     if sys.platform == "win32":
         return os.path.join(os.environ["APPDATA"], "Hex-Rays", "IDA Pro")
     return os.path.join(os.path.expanduser("~"), ".idapro")
+
+
+# ============================================================================
+# Optional dependency installation (Triton / Miasm)
+# ============================================================================
+
+OPTIONAL_PACKAGES = {
+    "triton": {
+        "pip_name": "triton-library",
+        "import_name": "triton",
+        "display": "Triton  — symbolic execution & SMT constraint solving",
+        "min_version": "0.10.0",
+    },
+    "miasm": {
+        "pip_name": "miasm",
+        "import_name": "miasm",
+        "display": "Miasm   — IR lifting, SSA, deobfuscation, cross-arch assembly",
+        "min_version": "0.1.5",
+        "extras": ["future>=0.18.0"],
+    },
+    "construct": {
+        "pip_name": "construct",
+        "import_name": "construct",
+        "display": "Construct — declarative binary format parsing",
+        "min_version": "2.10.68",
+    },
+    "cstruct": {
+        "pip_name": "dissect.cstruct",
+        "import_name": "dissect.cstruct",
+        "display": "cstruct  — C-syntax struct parsing + filetype detection",
+        "min_version": "4.0",
+        "extras": ["filetype>=1.2.0"],
+    },
+    "lief": {
+        "pip_name": "lief",
+        "import_name": "lief",
+        "display": "LIEF    — PE/ELF/Mach-O parse, rebuild, signature verify",
+        "min_version": "0.15.0",
+    },
+    "yara": {
+        "pip_name": "yara-python",
+        "import_name": "yara",
+        "display": "YARA    — signature scanning, crypto/threat detection",
+        "min_version": "4.3.0",
+    },
+    "networkx": {
+        "pip_name": "networkx",
+        "import_name": "networkx",
+        "display": "NetworkX — call/CFG graph analysis, centrality, communities",
+        "min_version": "3.0",
+    },
+    "unicorn": {
+        "pip_name": "unicorn",
+        "import_name": "unicorn",
+        "display": "Unicorn — concrete CPU emulation (decrypt stubs, shellcode, hashes)",
+        "min_version": "2.1.0",
+    },
+    "numpy": {
+        "pip_name": "numpy",
+        "import_name": "numpy",
+        "display": "NumPy   — entropy maps, byte histograms, XOR recovery, similarity",
+        "min_version": "2.0.0",
+    },
+    "elf": {
+        "pip_name": "pyelftools",
+        "import_name": "elftools",
+        "display": "pyelftools — ELF/DWARF: symbols, functions, line info, types, IDB sync",
+        "min_version": "0.31",
+    },
+    "xor": {
+        "pip_name": "z3-solver",
+        "import_name": "z3",
+        "display": "Z3      — xor_solve_universal constraint path (multi-byte keys + regex/charset)",
+        "min_version": "4.12.0",
+    },
+}
+
+
+def _find_ida_python() -> str | None:
+    """Try to locate IDA Pro's embedded Python executable."""
+    # 1. IDADIR environment variable (set by IDA at launch; useful when running
+    #    this installer from IDA's own Python console).
+    ida_dir = os.environ.get("IDADIR") or os.environ.get("IDAHOME")
+    if ida_dir and os.path.isdir(ida_dir):
+        for subdir in ("", "python311", "python312", "python310", "python39"):
+            candidate = os.path.join(ida_dir, subdir, "python.exe" if sys.platform == "win32" else "python3")
+            if os.path.isfile(candidate):
+                return candidate
+
+    # 2. Windows registry
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    key = winreg.OpenKey(hive, r"SOFTWARE\Hex-Rays\IDA Pro")
+                    ida_dir, _ = winreg.QueryValueEx(key, "InstallPath")
+                    winreg.CloseKey(key)
+                    if ida_dir and os.path.isdir(str(ida_dir)):
+                        for subdir in ("", "python311", "python312", "python310", "python39"):
+                            candidate = os.path.join(str(ida_dir), subdir, "python.exe")
+                            if os.path.isfile(candidate):
+                                return candidate
+                except OSError:
+                    continue
+        except ImportError:
+            pass
+
+    # 3. Common Windows installation paths
+    if sys.platform == "win32":
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        for ida_subdir in ("IDA Pro 9.3", "IDA Pro 9.2", "IDA Pro 9.1", "IDA Pro 9.0",
+                           "IDA Pro 8.4", "IDA Pro 8.3"):
+            for py_subdir in ("python311", "python312", "python310", "python39", ""):
+                candidate = os.path.join(program_files, ida_subdir, py_subdir, "python.exe")
+                if os.path.isfile(candidate):
+                    return candidate
+
+    return None
+
+
+def _check_package_installed(python_exe: str, import_name: str) -> bool:
+    """Return True if import_name can be imported in the given Python."""
+    result = subprocess.run(
+        [python_exe, "-c", f"import {import_name}"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def install_optional_deps(
+    packages: list[str],
+    *,
+    python_exe: str | None = None,
+    quiet: bool = False,
+) -> dict[str, bool]:
+    """Install optional analysis engine packages into IDA's Python.
+
+    Args:
+        packages: list of short names: 'triton', 'miasm', or 'all'
+        python_exe: explicit Python executable path; auto-detected if None
+        quiet: suppress output
+
+    Returns:
+        dict mapping package short name -> install success
+    """
+    # Expand 'all'
+    if "all" in packages:
+        packages = list(OPTIONAL_PACKAGES.keys())
+    packages = [p for p in packages if p in OPTIONAL_PACKAGES]
+
+    if not packages:
+        valid = ", ".join(list(OPTIONAL_PACKAGES.keys()) + ["all"])
+        print(f"No recognised packages requested. Valid names: {valid}")
+        return {}
+
+    # Resolve Python executable
+    if python_exe is None:
+        python_exe = _find_ida_python()
+        if python_exe:
+            if not quiet:
+                print(f"Detected IDA Python: {python_exe}")
+        else:
+            python_exe = get_python_executable()
+            if not quiet:
+                print(
+                    f"[WARNING] Could not detect IDA's Python. "
+                    f"Installing into current Python: {python_exe}\n"
+                    "If IDA uses a different interpreter, re-run with --python /path/to/ida/python"
+                )
+
+    results: dict[str, bool] = {}
+    for short_name in packages:
+        info = OPTIONAL_PACKAGES[short_name]
+        pip_pkgs = [f"{info['pip_name']}>={info['min_version']}"] + info.get("extras", [])
+
+        already = _check_package_installed(python_exe, info["import_name"])
+        if already and not quiet:
+            print(f"  {short_name}: already installed (skipping)")
+            results[short_name] = True
+            continue
+
+        if not quiet:
+            print(f"  Installing {short_name} ({' '.join(pip_pkgs)}) ...")
+
+        proc = subprocess.run(
+            [python_exe, "-m", "pip", "install", *pip_pkgs],
+            capture_output=quiet,
+        )
+        ok = proc.returncode == 0
+        results[short_name] = ok
+        if not quiet:
+            status = "OK" if ok else "FAILED"
+            print(f"  {short_name}: {status}")
+            if not ok and proc.stderr:
+                print(f"    stderr: {proc.stderr.decode(errors='replace').strip()}")
+
+    return results
+
+
+def run_install_deps_command(packages: list[str], args) -> None:
+    """Entry point for --install-deps CLI flag."""
+    python_exe: str | None = getattr(args, "python", None)
+    install_optional_deps(packages, python_exe=python_exe)
+
+
+def _interactive_install_deps() -> None:
+    """Interactive step: offer to install optional engines after main install."""
+    try:
+        from .installer_tui import interactive_select
+    except ImportError:
+        from installer_tui import interactive_select
+
+    items = [(info["display"], False) for info in OPTIONAL_PACKAGES.values()]
+    selected = interactive_select(items, "Install optional analysis engines? (space=toggle, enter=confirm):")
+    if not selected:
+        return
+
+    short_names = [
+        short for short, info in OPTIONAL_PACKAGES.items()
+        if info["display"] in selected
+    ]
+    if short_names:
+        print()
+        install_optional_deps(short_names)
 
 
 def _remove_path(path: str) -> None:
@@ -571,17 +898,28 @@ def _get_install_scope(args, *, interactive: bool) -> str | None:
         return "project"
 
     choice = interactive_choose(
-        ["Project (current directory)", "Global (user-level)"],
+        [
+            "Export JSON configs to project folder (manual copy)",
+            "Project (current directory)",
+            "Global (user-level)",
+        ],
         "Select installation scope:",
     )
     if choice is None:
         return None
+    if choice.startswith("Export"):
+        return "export"
     if choice.startswith("Project"):
         return "project"
     return "global"
 
 
-def _get_scope_selection_items(*, project: bool) -> list[tuple[str, bool]]:
+def _get_scope_selection_items(*, scope: str) -> list[tuple[str, bool]]:
+    if scope == "export":
+        clients = _get_all_export_clients()
+        return [(name, False) for name in clients.keys()]
+
+    project = scope == "project"
     configs, _ = _get_scope_config_spec(project=project)
     return [
         (
@@ -598,14 +936,26 @@ def _apply_client_install(
     transport: str,
     uninstall: bool,
     client_targets: list[str],
+    lazy: bool = False,
 ) -> None:
-    if client_targets:
-        install_mcp_servers(
-            transport=transport,
-            uninstall=uninstall,
-            only=client_targets,
-            project=(scope == "project"),
-        )
+    if not client_targets:
+        return
+    if scope == "export":
+        if uninstall:
+            out_dir = os.path.join(os.getcwd(), EXPORT_CONFIG_DIR)
+            if os.path.isdir(out_dir):
+                shutil.rmtree(out_dir)
+                print(f"Removed exported configs: {out_dir}")
+            return
+        export_mcp_configs(transport=transport, only=client_targets, lazy=lazy)
+        return
+    install_mcp_servers(
+        transport=transport,
+        uninstall=uninstall,
+        only=client_targets,
+        project=(scope == "project"),
+        lazy=lazy,
+    )
 
 
 def _parse_client_targets(targets_str: str) -> list[str]:
@@ -628,7 +978,7 @@ def _interactive_install(*, uninstall: bool, args):
         print("Cancelled.")
         return
 
-    items = _get_scope_selection_items(project=(scope == "project"))
+    items = _get_scope_selection_items(scope=scope)
     if not items:
         print(f"Unsupported platform: {sys.platform}")
         return
@@ -638,17 +988,24 @@ def _interactive_install(*, uninstall: bool, args):
         print("Cancelled.")
         return
 
+    lazy = getattr(args, "lazy", False)
     _apply_client_install(
         scope=scope,
         transport=transport,
         uninstall=uninstall,
         client_targets=selected,
+        lazy=lazy,
     )
+
+    if not uninstall:
+        print()
+        _interactive_install_deps()
 
 
 def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
     install_ida_plugin(uninstall=uninstall, allow_ida_free=args.allow_ida_free)
 
+    lazy = getattr(args, "lazy", False)
     if targets_str:
         _apply_client_install(
             scope=_get_install_scope(args, interactive=False),
@@ -657,6 +1014,7 @@ def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
             ),
             uninstall=uninstall,
             client_targets=_parse_client_targets(targets_str),
+            lazy=lazy,
         )
         return
 

@@ -54,6 +54,7 @@ GLOBAL_SPECIAL_JSON_STRUCTURES: dict[str, tuple[str | None, str]] = {
     "VS Code Insiders": ("mcp", "servers"),
     "Visual Studio 2022": (None, "servers"),
     "Opencode": (None, "mcp"),
+    "Kilo Code": (None, "mcp"),
 }
 
 
@@ -83,15 +84,8 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
                 "mcp_settings.json",
             ),
             "Kilo Code": (
-                os.path.join(
-                    os.getenv("APPDATA", ""),
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "kilocode.kilo-code",
-                    "settings",
-                ),
-                "mcp_settings.json",
+                os.path.join(os.path.expanduser("~"), ".config", "kilo"),
+                "kilo.jsonc",
             ),
             "Claude": (
                 os.path.join(os.getenv("APPDATA", ""), "Claude"),
@@ -145,7 +139,7 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
                 "settings.json",
             ),
             "Antigravity IDE": (
-                os.path.join(os.path.expanduser("~"), ".gemini", "config"),
+                os.path.join(os.path.expanduser("~"), ".gemini", "antigravity"),
                 "mcp_config.json",
             ),
             "Warp": (
@@ -214,17 +208,8 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
                 "mcp_settings.json",
             ),
             "Kilo Code": (
-                os.path.join(
-                    os.path.expanduser("~"),
-                    "Library",
-                    "Application Support",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "kilocode.kilo-code",
-                    "settings",
-                ),
-                "mcp_settings.json",
+                os.path.join(os.path.expanduser("~"), ".config", "kilo"),
+                "kilo.jsonc",
             ),
             "Claude": (
                 os.path.join(
@@ -244,7 +229,7 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
             ),
             "Codex": (os.path.join(os.path.expanduser("~"), ".codex"), "config.toml"),
             "Antigravity IDE": (
-                os.path.join(os.path.expanduser("~"), ".gemini", "config"),
+                os.path.join(os.path.expanduser("~"), ".gemini", "antigravity"),
                 "mcp_config.json",
             ),
             "Zed": (
@@ -375,16 +360,8 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
                 "mcp_settings.json",
             ),
             "Kilo Code": (
-                os.path.join(
-                    os.path.expanduser("~"),
-                    ".config",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "kilocode.kilo-code",
-                    "settings",
-                ),
-                "mcp_settings.json",
+                os.path.join(os.path.expanduser("~"), ".config", "kilo"),
+                "kilo.jsonc",
             ),
             "Cursor": (os.path.join(os.path.expanduser("~"), ".cursor"), "mcp.json"),
             "Windsurf": (
@@ -398,7 +375,7 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
             ),
             "Codex": (os.path.join(os.path.expanduser("~"), ".codex"), "config.toml"),
             "Antigravity IDE": (
-                os.path.join(os.path.expanduser("~"), ".gemini", "config"),
+                os.path.join(os.path.expanduser("~"), ".gemini", "antigravity"),
                 "mcp_config.json",
             ),
             "Zed": (
