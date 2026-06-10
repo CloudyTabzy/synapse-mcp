@@ -920,7 +920,7 @@ class IdalibSupervisor:
         return copy.deepcopy(items)
 
 
-mcp = McpServer("ida-pro-mcp")
+mcp = McpServer("synapse-mcp")
 supervisor: IdalibSupervisor | None = None
 _original_dispatch = mcp.registry.dispatch
 

@@ -15,6 +15,7 @@ import ida_xref
 
 from .compat import tinfo_get_udm
 import ida_nalt
+import ida_name
 
 from .rpc import tool, unsafe
 from .sync import idasync, IDAError
@@ -1364,3 +1365,254 @@ def mark_functions_as_stubs(
         "total": len(results),
         "results": results,
     }
+
+
+# ============================================================================
+# Force recompile, operand typing, and data creation
+# ============================================================================
+
+
+class ForceRecompileOp(TypedDict, total=False):
+    addr: str
+
+
+class ForceRecompileResult(TypedDict, total=False):
+    addr: str
+    name: str
+    ok: bool
+    error: str
+
+
+@tool
+@idasync
+def force_recompile(
+    items: Annotated[
+        list[ForceRecompileOp] | ForceRecompileOp,
+        "List of {addr: function-entry-EA} ops, or a single op. Omit / pass empty list to recompile every function.",
+    ] = None,
+) -> dict:
+    """Invalidate the Hex-Rays decompile cache for one or more functions."""
+    targets: list[int] = []
+    invalidate_all = False
+
+    if items is None:
+        invalidate_all = True
+    elif isinstance(items, dict):
+        items = [items]
+    elif isinstance(items, list) and len(items) == 0:
+        invalidate_all = True
+
+    if invalidate_all:
+        targets = list(idautils.Functions())
+    else:
+        for item in items or []:
+            addr_str = item.get("addr") if isinstance(item, dict) else None
+            if not addr_str:
+                continue
+            try:
+                ea = parse_address(addr_str)
+                func = ida_funcs.get_func(ea)
+                if func is not None:
+                    targets.append(func.start_ea)
+            except Exception:
+                pass
+
+    results: list[ForceRecompileResult] = []
+    for ea in targets:
+        try:
+            ida_hexrays.mark_cfunc_dirty(ea)
+            results.append({
+                "addr": hex(ea),
+                "name": ida_funcs.get_func_name(ea) or "",
+                "ok": True,
+            })
+        except Exception as e:
+            results.append({"addr": hex(ea), "ok": False, "error": str(e)})
+
+    return {
+        "summary": {
+            "total": len(results),
+            "ok": sum(1 for r in results if r.get("ok")),
+            "failed": sum(1 for r in results if not r.get("ok")),
+            "all": invalidate_all,
+        },
+        "results": results,
+    }
+
+
+class SetOpTypeOp(TypedDict, total=False):
+    addr: str
+    op_n: int
+    kind: str
+    struct: NotRequired[str]
+    delta: NotRequired[int]
+    target_addr: NotRequired[str]
+
+
+class SetOpTypeResult(TypedDict, total=False):
+    addr: str
+    op_n: int
+    kind: str
+    ok: bool
+    error: str
+
+
+_OP_FORMAT_FLAGS = {
+    "hex":    ida_bytes.FF_0NUMH,
+    "dec":    ida_bytes.FF_0NUMD,
+    "char":   ida_bytes.FF_0CHAR,
+    "binary": ida_bytes.FF_0NUMB,
+    "octal":  ida_bytes.FF_0NUMO,
+}
+
+
+@tool
+@idasync
+def set_op_type(
+    items: Annotated[
+        list[SetOpTypeOp] | SetOpTypeOp,
+        "Operand-typing ops. Equivalent to GUI 'Y' (struct offset) or 'O' (offset) operations.",
+    ],
+) -> list[SetOpTypeResult]:
+    """Set the type of an instruction operand. GUI 'Y' / 'O' / '#' equivalent."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results: list[SetOpTypeResult] = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        op_n = int(item.get("op_n", 0))
+        kind = str(item.get("kind", "")).strip().lower()
+
+        try:
+            ea = parse_address(addr_str)
+        except Exception as e:
+            results.append({"addr": addr_str, "op_n": op_n, "kind": kind, "ok": False, "error": str(e)})
+            continue
+
+        ok = False
+        err = None
+        try:
+            if kind == "stroff":
+                struct_name = str(item.get("struct", "")).strip()
+                if not struct_name:
+                    err = "struct name required for kind='stroff'"
+                else:
+                    delta = int(item.get("delta", 0))
+                    til = ida_typeinf.get_idati()
+                    sti = ida_typeinf.tinfo_t()
+                    if not sti.get_named_type(til, struct_name):
+                        err = f"struct not found: {struct_name}"
+                    else:
+                        tid = sti.get_tid()
+                        if tid == idaapi.BADADDR:
+                            err = f"struct {struct_name} has no tid"
+                        else:
+                            path = idaapi.tid_array(1)
+                            path[0] = tid
+                            ok = bool(ida_bytes.op_stroff(ea, op_n, path.cast(), 1, delta))
+            elif kind == "offset":
+                target_str = str(item.get("target_addr", "")).strip()
+                if target_str:
+                    target_ea = parse_address(target_str)
+                    ok = bool(idc.op_plain_offset(ea, op_n, target_ea))
+                else:
+                    ok = bool(idc.op_plain_offset(ea, op_n, 0))
+            elif kind == "stkvar":
+                ok = bool(idc.op_stkvar(ea, op_n))
+            elif kind in _OP_FORMAT_FLAGS:
+                flag = _OP_FORMAT_FLAGS[kind]
+                ok = bool(ida_bytes.set_op_type(ea, flag, op_n))
+            else:
+                err = f"unknown kind: {kind!r} (expected stroff/offset/stkvar/hex/dec/char/binary/octal)"
+        except Exception as e:
+            err = str(e)
+
+        result: SetOpTypeResult = {"addr": addr_str, "op_n": op_n, "kind": kind, "ok": ok}
+        if err is not None and not ok:
+            result["error"] = err
+        results.append(result)
+
+    return results
+
+
+class MakeDataOp(TypedDict, total=False):
+    addr: str
+    type: str
+    name: NotRequired[str]
+    delete_existing: NotRequired[bool]
+
+
+class MakeDataResult(TypedDict, total=False):
+    addr: str
+    name: str
+    type: str
+    size: int
+    ok: bool
+    error: str
+
+
+@tool
+@idasync
+def make_data(
+    items: Annotated[
+        list[MakeDataOp] | MakeDataOp,
+        "Data-creation ops. Each {addr, type, name?} replaces existing data items at addr with a fresh symbol of the given type.",
+    ],
+) -> list[MakeDataResult]:
+    """Create a typed data symbol at an address, replacing any prior items."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results: list[MakeDataResult] = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        type_decl = str(item.get("type", "")).strip()
+        name = str(item.get("name", "")).strip()
+        delete_existing = bool(item.get("delete_existing", True))
+
+        try:
+            ea = parse_address(addr_str)
+        except Exception as e:
+            results.append({"addr": addr_str, "ok": False, "error": str(e)})
+            continue
+
+        if not type_decl:
+            results.append({"addr": addr_str, "ok": False, "error": "type declaration is required"})
+            continue
+
+        decl = type_decl if type_decl.endswith(";") else type_decl + ";"
+
+        try:
+            apply_ok = idc.SetType(ea, decl)
+            if not apply_ok:
+                results.append({"addr": addr_str, "ok": False, "error": f"SetType rejected declaration: {decl!r}"})
+                continue
+
+            tif = ida_typeinf.tinfo_t()
+            try:
+                ok_t = ida_typeinf.guess_tinfo(tif, ea)
+            except Exception:
+                ok_t = False
+            size = tif.get_size() if ok_t else 0
+
+            if delete_existing and size > 0:
+                ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size)
+                idc.SetType(ea, decl)
+
+            if name:
+                ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_FORCE)
+
+            ida_hexrays.clear_cached_cfuncs()
+
+            results.append({
+                "addr": addr_str,
+                "name": name or (ida_name.get_name(ea) or ""),
+                "type": idc.get_type(ea) or "",
+                "size": size,
+                "ok": True,
+            })
+        except Exception as e:
+            results.append({"addr": addr_str, "ok": False, "error": str(e)})
+
+    return results

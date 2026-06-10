@@ -184,7 +184,7 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         enabled = sorted(self.mcp_server.tools.methods.keys())
         body = dump_profile(
             enabled,
-            header="ida-pro-mcp profile exported from /config.html",
+            header="synapse-mcp profile exported from /config.html",
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
