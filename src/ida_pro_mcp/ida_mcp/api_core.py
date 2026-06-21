@@ -1494,6 +1494,14 @@ def find_regex(
     symbols (functions, globals, labels). Use ``search_strings``/``search_names`` to
     narrow the scope.
 
+    **Output filtering:** there is no ``output_mode`` parameter — the tool
+    always returns the same tuple of ``addr``/``text``/``kind`` fields. To
+    restrict output to strings-only or names-only, pass
+    ``search_strings=true, search_names=false`` (or vice-versa). To filter
+    results by output mode client-side, post-filter the ``matches`` list
+    on the ``kind`` field (which will be ``"string"``, ``"name"``, or
+    ``"raw"``).
+
     **Search semantics:** operates on IDA's internal string database — the strings
     IDA identified and created items for during analysis. It does NOT scan raw file
     bytes. Strings in packed/encrypted sections, or in DLLs that are not loaded into

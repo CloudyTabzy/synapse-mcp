@@ -31,6 +31,13 @@ from ..api_analysis import (
     find,
     export_funcs,
     callgraph,
+    get_function_callers,
+)
+from ..api_recon import (
+    find_indirect_calls,
+    find_vtable_loaders,
+    find_vtable_callers,
+    identify_vtable_call,
 )
 
 
@@ -837,3 +844,287 @@ def test_analyze_batch():
             "constant_count",
             "basic_block_count",
         )
+
+
+# ============================================================================
+# Regression tests — feedback Issues #3 and #4
+# ============================================================================
+
+
+@test()
+def test_find_indirect_calls_reports_addr_type_and_diagnostics():
+    """find_indirect_calls now returns ``addr_type`` per site and the new
+    ``by_addr_type`` + ``indirect_calls_seen`` fields, so 32-bit PEs that
+    dominant on ``o_mem`` (IAT thunks) and ``o_reg`` (register dispatch)
+    no longer produce misleading zero-count results.
+
+    Regression for Issue #4 in Feedbacks/idalib_mcp_feedback.md: the
+    previous implementation only matched ``o_displ``/``o_phrase`` and
+    silently dropped the two dominant 32-bit PE operand forms, returning
+    "scanned N instructions, found 0" on binaries that were full of
+    indirect calls.
+    """
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    # Scan the single function containing fn_addr (passing empty end= to
+    # let the tool auto-detect function bounds).
+    result = find_indirect_calls(start=fn_addr, end="")
+    assert isinstance(result, dict), f"expected dict, got {type(result).__name__}"
+    assert_ok(result)
+    # New schema fields must be present even when no sites match.
+    assert "by_addr_type" in result, (
+        f"missing by_addr_type field — was the schema regenerated after "
+        f"the find_indirect_calls update?"
+    )
+    assert "indirect_calls_seen" in result, (
+        f"missing indirect_calls_seen diagnostic field"
+    )
+    assert "instructions_scanned" in result
+    assert isinstance(result["by_addr_type"], dict), (
+        f"by_addr_type must be a dict, got {type(result['by_addr_type'])}"
+    )
+    assert isinstance(result["indirect_calls_seen"], int)
+    assert isinstance(result["instructions_scanned"], int)
+    assert result["instructions_scanned"] >= 0
+    assert result["indirect_calls_seen"] >= 0
+    # If indirect calls were found, verify each site carries addr_type.
+    for site in result.get("sites", []):
+        assert "addr_type" in site, (
+            f"site {site.get('addr')} missing addr_type field"
+        )
+        assert site["addr_type"] in (
+            "displ", "phrase", "mem", "reg"
+        ), f"unknown addr_type {site['addr_type']!r}"
+        # by_addr_type counts must aggregate to the per-site count.
+        expected_total = sum(result["by_addr_type"].values())
+        assert expected_total <= result["indirect_calls_seen"], (
+            f"by_addr_type total {expected_total} exceeds indirect_calls_seen "
+            f"{result['indirect_calls_seen']}"
+        )
+
+
+@test()
+def test_find_indirect_calls_zero_results_diagnostic_is_honest():
+    """When find_indirect_calls returns zero sites, the ``note`` field
+    distinguishes between 'no indirect-call itypes detected at all' and
+    'indirect calls were detected but none matched the offset_filter'.
+
+    The previous ``note`` conflated these cases, producing the misleading
+    'found 0 indirect calls' wording even when ``indirect_calls_seen``
+    was nonzero (e.g. for an offset_filter that doesn't match any
+    displacement).
+    """
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    # Pass an offset_filter that is extremely unlikely to match any
+    # real vtable slot, so we're guaranteed to exercise the "sites=0,
+    # seen>0" branch (or, if the function happens to have no indirect
+    # calls, the "sites=0, seen=0" branch).
+    result = find_indirect_calls(start=fn_addr, end="", offset_filter=0xDEADBE)
+    assert_ok(result)
+
+    if result.get("sites"):
+        # The fixture happened to have an indirect call at this filter —
+        # not useful for this regression test, just verify shape.
+        return
+
+    note = result.get("note")
+    if result["indirect_calls_seen"] == 0:
+        # The diagnostic should say it scanned zero indirect-call itypes.
+        if note:
+            assert "0" in note and "indirect-call itype" in note, (
+                f"diagnostic note should report 0 itypes, got: {note!r}"
+            )
+    else:
+        # seen > 0 but sites = [] — note must indicate the filter rejected
+        # them, not say "found 0".
+        assert isinstance(note, str) and note, (
+            "missing note despite indirect_calls_seen > 0 and sites=0"
+        )
+        assert "matched the filter" in note or "saw" in note, (
+            f"note should explain the filter rejection, got: {note!r}"
+        )
+
+
+@test()
+def test_get_function_callers_vtable_fallback_on_empty():
+    """get_function_callers emits ``potential_vtable_references`` when a
+    function has no direct code-xref callers — the signature of a virtual
+    function invoked only through vtable dispatch.
+
+    Regression for Issue #3 in Feedbacks/idalib_mcp_feedback.md: the
+    previous implementation returned an empty ``callers`` list with no
+    guidance, leaving the agent stranded. The fix surfaces data xrefs
+    (``dr_R``/``dr_W``/``dr_O``) to the function entry address as
+    candidate vtable references.
+    """
+    # Find a function whose CodeRefsTo set is empty. On a typical
+    # fixture (crackme03.elf), entry-point / leaf functions / functions
+    # referenced only through dispatch tables are candidates.
+    import idautils
+
+    target_addr: str | None = None
+    target_has_data_refs = False
+    for ea in idautils.Functions():
+        direct_callers = list(idautils.CodeRefsTo(ea, True))
+        if direct_callers:
+            continue
+        # Functions with direct callers only are not candidate vtable-
+        # only functions. Check the data xref set is also non-empty so
+        # we exercise the fallback's emission (the `potential_vtable_
+        # references`) field.
+        data_refs = [x for x in idautils.XrefsTo(ea, 0) if not x.iscode]
+        if data_refs:
+            target_addr = hex(ea)
+            target_has_data_refs = True
+            break
+
+    if target_addr is None or not target_has_data_refs:
+        skip_test(
+            "binary has no function with zero direct callers AND data "
+            "refs to its entry address (cannot exercise vtable fallback)"
+        )
+
+    result = get_function_callers(target_addr)
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    assert_ok(entry)
+    # The vtable fallback field must be present.
+    assert "potential_vtable_references" in entry, (
+        f"missing potential_vtable_references on a function with no "
+        f"direct callers — fallback path was not triggered"
+    )
+    refs = entry["potential_vtable_references"]
+    assert isinstance(refs, list) and refs, (
+        f"potential_vtable_references must be a non-empty list when "
+        f"direct callers are empty and data refs exist"
+    )
+    # Each ref must carry the documented fields.
+    for ref in refs:
+        assert "ref_ea" in ref
+        assert "ref_type" in ref
+        assert ref["ref_type"] in ("data_read", "data_write", "offset", "data")
+    # The note must mention the vtable interpretation.
+    assert isinstance(entry.get("note"), str) and "vtable" in entry["note"].lower(), (
+        f"note should mention virtual/vtable interpretation, got: "
+        f"{entry.get('note')!r}"
+    )
+
+
+@test()
+def test_find_vtable_loaders_returns_loader_shape():
+    """find_vtable_loaders returns the documented shape when pointed at
+    a data address referenced from elsewhere in the binary. The tool is
+    orthogonal to vtable discovery — give it any address with data refs
+    and verify the schema.
+    """
+    target = get_data_address()
+    if not target:
+        skip_test("binary has no data address")
+
+    result = find_vtable_loaders(target)
+    assert isinstance(result, dict)
+    assert_ok(result)
+    assert "target" in result
+    assert "refs" in result and isinstance(result["refs"], list)
+    # The count breakdown fields must be present even when zero.
+    for k in ("read_count", "write_count", "offset_count", "count"):
+        assert k in result, f"missing {k} in find_vtable_loaders result"
+        assert isinstance(result[k], int)
+    # Verify per-site shape when sites are present.
+    for ref in result["refs"]:
+        assert "ref_ea" in ref
+        assert "ref_type" in ref
+        assert "disasm" in ref
+        assert ref["ref_type"] in ("data_read", "data_write", "offset")
+
+
+@test()
+def test_find_vtable_callers_returns_shape_on_real_function():
+    """find_vtable_callers returns the documented shape and gracefully
+    handles a function that has no vtable references (the common case
+    for crackmes whose functions are called directly).
+    """
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = find_vtable_callers(fn_addr)
+    assert isinstance(result, dict)
+    assert_ok(result)
+    assert "func" in result
+    assert "vtables" in result and isinstance(result["vtables"], list)
+    assert "callers" in result and isinstance(result["callers"], list)
+    assert "caller_count" in result and isinstance(result["caller_count"], int)
+    # When callers is empty, a hint explaining how to confirm or escalate
+    # must be present.
+    if not result["callers"]:
+        hint = result.get("hint")
+        assert isinstance(hint, str) and hint, (
+            "missing hint field when callers list is empty — should "
+            "direct the agent to get_function_callers or explain why no "
+            "vtable refs exist"
+        )
+
+
+@test()
+def test_identify_vtable_call_handles_o_mem_form():
+    """identify_vtable_call now accepts the ``o_mem`` operand form
+    (``call dword ptr [absolute_addr]`` — the dominant 32-bit PE
+    indirect-call form for IAT thunks).
+
+    Regression for Issue #4 sibling fix: previously, o_mem indirect
+    calls were rejected upfront as "indirect call but operand is not
+    reg-indirect". The fix returns the absolute address as a terminal
+    ``final_source``.
+    """
+    # Scan any executable segment for an indirect call site of any kind
+    # (o_displ, o_phrase, o_mem, or o_reg) and verify identify_vtable_call
+    # runs without crashing on it — the original code crashed on o_mem
+    # because its upfront filter rejected it as "not reg-indirect".
+    import ida_funcs
+    import idaapi
+    import idautils
+    import idc
+    from ..api_recon import _is_indirect_call, _decoded_or_none
+    import ida_ua
+
+    call_addr_candidate = None
+    for ea in idautils.Functions():
+        func = ida_funcs.get_func(ea)
+        if not func:
+            continue
+        cur = func.start_ea
+        while cur < func.end_ea and cur != idaapi.BADADDR:
+            insn = _decoded_or_none(cur)
+            if insn is not None and _is_indirect_call(insn):
+                op = insn.ops[0]
+                # We're specifically looking for o_mem to exercise the
+                # new branch; any other type is acceptable too.
+                if op.type in (ida_ua.o_mem, ida_ua.o_reg, ida_ua.o_displ, ida_ua.o_phrase):
+                    call_addr_candidate = hex(cur)
+                    break
+            cur = idc.next_head(cur, func.end_ea)
+            if cur == idaapi.BADADDR or cur <= 0:
+                break
+        if call_addr_candidate:
+            break
+
+    if call_addr_candidate is None:
+        skip_test("binary has no indirect call site to test identify_vtable_call on")
+
+    result = identify_vtable_call(call_addr_candidate)
+    assert isinstance(result, dict)
+    assert "call_addr" in result
+    # Either succeeds with a chain/final_source OR returns an error
+    # (e.g. when called on an address that isn't actually an indirect call
+    # at the current IDA decoder's view).
+    if result.get("ok"):
+        assert "chain" in result and isinstance(result["chain"], list)
+    else:
+        # Must include an informative error when not.
+        assert isinstance(result.get("error"), str) and result["error"]

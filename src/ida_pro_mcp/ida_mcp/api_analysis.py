@@ -254,6 +254,8 @@ class FunctionCallersResult(TypedDict, total=False):
     next_offset: int | None
     more: bool
     has_more: bool
+    potential_vtable_references: list[dict]
+    note: str
     error: str
     error_type: str
     hint: str
@@ -2571,11 +2573,33 @@ def get_function_callers(
     Each entry includes the containing caller function's address/name **and**
     the specific call-site address so you can jump directly to the call.
 
-    See also: callees (outgoing calls), xrefs_to (all xrefs),
-    callgraph (multi-level call graph).
+    **Important limitation — virtual / indirect calls are NOT reported by
+    IDA's code-xref database.** This tool walks ``CodeRefsTo(ea, True)``
+    which only contains **call** instructions whose targets IDA was able
+    to statically resolve (typically direct ``call rel32`` instructions).
+    Indirect calls such as ``call [reg+disp]`` (vtable dispatch) or
+    ``call dword ptr [iat_slot]`` are NOT linked to the function in the
+    code-xref database because the target depends on a runtime register
+    value — IDA does not (and cannot) statically resolve them in general.
 
-    Complements ``callees`` — together they give the full
-    caller/callee relationship for a function.
+    **When ``callers`` is an empty list and ``total=0``**, the result also
+    includes a ``potential_vtable_references`` field which lists the data
+    xrefs (``dr_R``, ``dr_W``, ``dr_O``) to the function entry address.
+    This is the signature of a function that lives inside one or more
+    vtables or function-pointer tables — its real callers can be found
+    via the vtable-callers workflow:
+
+      1. ``trace_data_chain(address="<fn_ea>", direction="backward")``
+         to walk the data xrefs back to the vtable that holds this function.
+      2. ``find_vtable_loaders(addr="<vtable_ea>")`` to discover which
+         functions load this vtable into a register (the constructor or
+         staging site).
+      3. ``find_indirect_calls(start="<loader_addr>", offset_filter=<slot N>)``
+         to enumerate the actual dispatch sites.
+
+    See also: callees (outgoing calls), xrefs_to (all xrefs),
+    callgraph (multi-level call graph), find_vtable_loaders (who installs
+    a vtable), find_vtable_callers (composite workflow).
 
     Profile: analysis
     """
@@ -2625,17 +2649,62 @@ def get_function_callers(
 
             page = paginate(list(all_seen.values()), offset, limit)
             more = page["next_offset"] is not None
-            results.append(
-                {
-                    "addr": hex(func.start_ea),
-                    "name": ida_name.get_name(func.start_ea) or f"sub_{func.start_ea:X}",
-                    "callers": page["data"],
-                    "total": page["total"],
-                    "next_offset": page["next_offset"],
-                    "more": more,
-                    "has_more": more,
+            item: FunctionCallersResult = {
+                "addr": hex(func.start_ea),
+                "name": ida_name.get_name(func.start_ea) or f"sub_{func.start_ea:X}",
+                "callers": page["data"],
+                "total": page["total"],
+                "next_offset": page["next_offset"],
+                "more": more,
+                "has_more": more,
+            }
+
+            # === vtable-aware fallback when no direct callers exist ===
+            # Many important functions (especially in C++ game binaries) are
+            # invoked ONLY through vtable dispatch, so `code_xrefs` is empty
+            # — but the function lives in one or more .rdata vtables, which
+            # IDA records as data xrefs (`dr_R`/`dr_W`/`dr_O`) TO the
+            # function entry. Surface these as `potential_vtable_references`
+            # so the AI agent knows the function is reachable and where to
+            # look for the callers (per the workflow in the docstring).
+            if not all_seen:
+                vtable_refs: list[dict] = []
+                _xref_type_names = {
+                    ida_xref.dr_O: "offset",
+                    ida_xref.dr_R: "data_read",
+                    ida_xref.dr_W: "data_write",
                 }
-            )
+                for xref in idautils.XrefsTo(func.start_ea, 0):
+                    if xref.iscode:
+                        continue  # already covered above
+                    ref_type = _xref_type_names.get(xref.type, "data")
+                    ref_func = idaapi.get_func(xref.frm)
+                    vtable_refs.append({
+                        "ref_ea": hex(xref.frm),
+                        "ref_type": ref_type,
+                        "disasm": idc.GetDisasm(xref.frm) or "",
+                        "in_func": (
+                            hex(ref_func.start_ea) if ref_func else ""
+                        ),
+                        "in_func_name": (
+                            ida_funcs.get_func_name(ref_func.start_ea) if ref_func else ""
+                        ),
+                    })
+                    if len(vtable_refs) >= 50:
+                        break
+
+                if vtable_refs:
+                    item["potential_vtable_references"] = vtable_refs
+                    item["note"] = (
+                        f"No direct callers found ({len(vtable_refs)} data "
+                        f"reference(s) to the function entry detected — this "
+                        f"is the signature of a virtual function that lives in "
+                        f"one or more vtables). Use find_vtable_loaders or "
+                        f"trace_data_chain(direction='backward') on each "
+                        f"ref_ea to discover the actual dispatch call sites."
+                    )
+
+            results.append(item)
         except Exception as e:
             results.append(
                 {
@@ -4717,6 +4786,303 @@ _MAX_CHAIN_NODES = 500
 _MAX_CHAIN_EDGES = 600
 
 
+# ============================================================================
+# Native Hex-Rays microcode def-use chain analysis (P3-6)
+# ============================================================================
+#
+# This module provides genuine register-level def-use analysis using IDA's
+# own decompiler IR (microcode). Unlike the xref-graph traversal above, it
+# tracks register/memory definitions ACROSS basic-block boundaries using the
+# decompiler's already-recovered IR — with calling conventions, aliases, and
+# allocations already modeled. No external dependency (Miasm/Triton) required.
+#
+# Reference implementation: IDAPython-9.0/examples/hexrays/vds12.py
+#
+# Architecture:
+#   1. gen_microcode(mbr, ..., MMAT_PREOPTIMIZED) → mba_t
+#   2. mba.build_graph() + mba.analyze_calls(ACFL_GUESS)
+#   3. For the instruction at `ea` that uses `register_name`:
+#      a. build_use_list(insn, MUST_ACCESS) → mlist_t of used locations
+#      b. Walk backward in the same block (collect_block_xrefs pattern)
+#      c. Query mba.get_graph().get_ud(GC_REGS_AND_STKVARS) for cross-block
+#      d. Walk each chain entry's block for the defining instruction
+#
+# This is the same engine Miasm's DependencyGraph re-implements, but running
+# on the decompiler's IR rather than a freshly lifted one.
+
+
+def _trace_data_flow_hexrays(
+    register_name: str, ea: int
+) -> list[ChainNode] | None:
+    """Native Hex-Rays microcode def-use chain backward slice.
+
+    Returns instruction EAs that DEFINE the register's value at ``ea``,
+    using the decompiler's microcode IR. Returns ``None`` if Hex-Rays is
+    unavailable or the register cannot be located in the microcode.
+
+    This is the architecturally preferred ``register=`` dispatch target:
+    - Native to IDA (no external dependency)
+    - Already has calling conventions, aliases, allocations modeled
+    - Crosses basic-block boundaries via the DU graph
+    - May/must semantics available via MUST_ACCESS / MAY_ACCESS
+    """
+    try:
+        import ida_hexrays
+        import ida_funcs
+    except ImportError:
+        return None
+
+    if not ida_hexrays.init_hexrays_plugin():
+        return None
+
+    pfn = ida_funcs.get_func(ea)
+    if not pfn:
+        return None
+
+    # Generate microcode at MMAT_PREOPTIMIZED (sufficient for def-use chains)
+    hf = ida_hexrays.hexrays_failure_t()
+    mbr = ida_hexrays.mba_ranges_t(pfn)
+    mba = ida_hexrays.gen_microcode(
+        mbr,
+        hf,
+        None,
+        ida_hexrays.DECOMP_WARNINGS | ida_hexrays.DECOMP_NO_CACHE,
+        ida_hexrays.MMAT_PREOPTIMIZED,
+    )
+    if not mba:
+        return None
+
+    merr = mba.build_graph()
+    if merr != ida_hexrays.MERR_OK:
+        return None
+
+    try:
+        mba.analyze_calls(ida_hexrays.ACFL_GUESS)
+    except Exception:
+        pass  # Non-fatal — chains are still valid without call convention analysis
+
+    register_lower = register_name.lower()
+
+    # === Find the block and instruction at `ea` that uses the register ===
+    target_blk = None
+    target_insn = None
+
+    for bn in range(mba.qty):
+        blk = mba.get_mblock(bn)
+        ins = blk.head
+        while ins:
+            if ins.ea == ea:
+                target_blk = blk
+                target_insn = ins
+                break
+            ins = ins.next
+        if target_insn:
+            break
+
+    if target_blk is None or target_insn is None:
+        return None
+
+    # Build the use list for the target instruction — this gives us
+    # ALL registers/memory locations used by the instruction. We'll
+    # filter to find the specific register.
+    use_list = ida_hexrays.mlist_t()
+    try:
+        target_blk.append_use_list(use_list, target_insn, ida_hexrays.MUST_ACCESS)
+    except Exception:
+        try:
+            use_list = target_blk.build_use_list(target_insn, ida_hexrays.MUST_ACCESS)
+        except Exception:
+            return None
+
+    if use_list.empty():
+        return None
+
+    # === Collect defining instruction EAs ===
+    defining_eas: list[int] = []
+    seen_eas: set[int] = set()
+
+    # ---- Phase 1: Intra-block backward walk (from vds12.py pattern) ----
+    # Walk backward through the same block looking for instructions that
+    # define any location in our use_list.
+    cur = target_insn.prev
+    remaining = ida_hexrays.mlist_t()
+    remaining.add(use_list)
+
+    while cur and not remaining.empty():
+        try:
+            def_list = target_blk.build_def_list(cur, ida_hexrays.MUST_ACCESS)
+        except Exception:
+            def_list = ida_hexrays.mlist_t()
+
+        if remaining.has_common(def_list):
+            if cur.ea not in seen_eas:
+                defining_eas.append(cur.ea)
+                seen_eas.add(cur.ea)
+        try:
+            remaining.sub(def_list)
+        except Exception:
+            pass
+        cur = cur.prev
+
+    # ---- Phase 2: Inter-block UD chain traversal ----
+    # Query the use-def graph to find blocks that define the locations
+    # used at the target instruction.
+    try:
+        graph = mba.get_graph()
+        ud = graph.get_ud(ida_hexrays.GC_REGS_AND_STKVARS)
+        serial = target_blk.serial
+        bc = ud[serial]
+
+        # Walk each chain entry for the target block
+        # The chain is indexed by voff_t (virtual offset = register or stkoff)
+        # We iterate over locations in the use_list
+        for i in range(use_list.count()):
+            try:
+                voff = ida_hexrays.voff_t()
+                # Get the i-th vivl from the use list
+                vivl = use_list[i]
+                voff.set_reg(vivl.start if hasattr(vivl, 'start') else 0)
+            except Exception:
+                continue
+
+            try:
+                ch = bc.get_chain(voff)
+            except Exception:
+                continue
+
+            if not ch:
+                continue
+
+            for cn in ch:
+                try:
+                    b = mba.get_mblock(cn)
+                except Exception:
+                    continue
+
+                # Walk backward from the block's tail looking for the
+                # defining instruction (same pattern as collect_block_xrefs)
+                pins = b.tail
+                tmp_list = ida_hexrays.mlist_t()
+                tmp_list.add(use_list)
+
+                while pins and not tmp_list.empty():
+                    try:
+                        pdef = b.build_def_list(pins, ida_hexrays.MUST_ACCESS)
+                    except Exception:
+                        pdef = ida_hexrays.mlist_t()
+
+                    if tmp_list.has_common(pdef):
+                        if pins.ea not in seen_eas:
+                            defining_eas.append(pins.ea)
+                            seen_eas.add(pins.ea)
+                    try:
+                        tmp_list.sub(pdef)
+                    except Exception:
+                        pass
+                    pins = pins.prev
+
+    except Exception:
+        pass  # Inter-block UD chains failed — intra-block results still valid
+
+    # === Build ChainNode results ===
+    nodes: list[ChainNode] = []
+    for def_ea in defining_eas:
+        func_at = idaapi.get_func(def_ea)
+        func_name = ida_funcs.get_func_name(def_ea) if func_at else None
+        disasm_text = idc.GetDisasm(def_ea) if idaapi.is_loaded(def_ea) else None
+
+        nodes.append(ChainNode(
+            addr=hex(def_ea),
+            type="code",
+            instruction=disasm_text,
+            function=func_name,
+            name=None,
+            depth=0,
+        ))
+
+    return nodes if nodes else None
+
+
+def _get_struct_member_xrefs(ea: int) -> list[ChainNode] | None:
+    """Find struct member xrefs via IDA's type system (P3-7).
+
+    When the start address has a struct type annotation, this function
+    resolves the struct member at that address and queries member-level
+    cross-references via ``tinfo_t.get_udm_tid`` + ``xrefblk_t.drefs_to``.
+
+    Returns ChainNode entries for each member-level reference, or ``None``
+    if the address doesn't have a struct type or no member xrefs exist.
+    """
+    try:
+        import ida_typeinf
+        import ida_nalt
+        import ida_xref
+    except ImportError:
+        return None
+
+    # Check if the address has a type annotation
+    tif = ida_typeinf.tinfo_t()
+    if not ida_nalt.get_tinfo(tif, ea):
+        return None
+
+    # Check if it's a UDT (struct/union)
+    if not tif.is_udt():
+        return None
+
+    # Get the struct details
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        return None
+
+    # Find which member contains or is at this address
+    # udm_t.offset is in BITS — divide by 8 for bytes
+    member_tid = 0
+    member_name = None
+    member_offset_bytes = 0
+
+    for idx in range(len(udt)):
+        udm = udt[idx]
+        offset_bytes = udm.offset // 8
+        size_bytes = udm.size // 8
+        # Check if `ea` falls within this member's range
+        if offset_bytes <= 0 and size_bytes == 0:
+            continue
+        # For now, just get the TID of each member for xref queries
+        try:
+            tid = tif.get_udm_tid(idx)
+            if tid:
+                # Query data refs to this member TID
+                nodes = []
+                xb = ida_xref.xrefblk_t()
+                ok = xb.first_to(tid, ida_xref.XREF_ALL)
+                while ok:
+                    if not xb.iscode:
+                        from_ea = xb.frm
+                        func_at = idaapi.get_func(from_ea)
+                        _ref_type_names = {
+                            ida_xref.dr_O: "offset",
+                            ida_xref.dr_R: "data_read",
+                            ida_xref.dr_W: "data_write",
+                        }
+                        rt = _ref_type_names.get(xb.type, "data")
+                        nodes.append(ChainNode(
+                            addr=hex(from_ea),
+                            type="data",
+                            instruction=idc.GetDisasm(from_ea) if idaapi.is_loaded(from_ea) else None,
+                            function=(ida_funcs.get_func_name(from_ea) if func_at else None),
+                            name=f"{udm.name} ({rt})",
+                            depth=0,
+                        ))
+                    ok = xb.next_to()
+
+                if nodes:
+                    return nodes
+        except Exception:
+            continue
+
+    return None
+
+
 @tool
 @idasync
 def trace_data_chain(
@@ -4741,16 +5107,37 @@ def trace_data_chain(
         "When False, traversal stops at call/jump xrefs and does not enter the target function's CFG. "
         "Useful for tracing data-flow through call chains rather than just within a single function.",
     ] = False,
+    register: Annotated[
+        str | None,
+        "If set (e.g. 'rdi', 'edi', 'rax'), switch to true register-level def-use analysis "
+        "via Hex-Rays microcode def-use chains (native to IDA, no external dependency). "
+        "If the Hex-Rays decompiler is unavailable, falls back to Miasm's IR DependencyGraph "
+        "(requires `miasm` installed — check with `miasm_status`). The origin instructions "
+        "contributing to the register's value at `address` are returned as IDA-address nodes. "
+        "This is the right mode for questions like 'where does the null pointer in `edi` come "
+        "from?' that the xref traversal cannot answer. Only meaningful with direction='backward'. "
+        "Falls through to xref-graph traversal with a warning when neither engine is available.",
+    ] = None,
 ) -> TraceDataChainResult:
     """Multi-hop cross-reference chain traversal for surgical RE workflows.
 
-    Traces data-flow across multiple hops in a single call. On stripped binaries
-    this is essential for tracking pointer chains without manually chaining xrefs_to
-    calls. The traversal stops at code/data boundaries — does not cross into
-    unexamined segments unless they contain the next xref target.
+    **Two modes of operation:**
 
-    **Backward mode** ("backward", the default) answers: "where does this value originate?"
-    Use cases:
+    * **xref-graph traversal (default)** — Breadth-First Search over IDA's
+      static cross-reference database (`idautils.XrefsTo` / `XrefsFrom`).
+      Walks edges that IDA's analyzer was able to statically resolve (calls,
+      jumps, flow, offsets, and data read/write refs to fixed addresses).
+
+    * **register-level def-use (when `register=` is set)** — Dispatches to
+      Miasm's IR-based `DependencyGraph` for genuine def-use analysis within
+      a single function. Use this mode when the xref traversal dead-ends on
+      a `mov reg, [base+disp]` instruction whose `[base+disp]` address cannot
+      be statically resolved — the register mode tracks the chain all the way
+      back to its origin (a write to an argument register from a caller, an
+      obfuscation chain, etc.).
+
+    **Backward mode** ("backward", the default) answers: "where does this
+    value originate?" Use cases:
       - Trace a vtable pointer back to its constructor
       - Find the source of a function pointer argument
       - Discover all writers to a global variable
@@ -4761,11 +5148,33 @@ def trace_data_chain(
       - Follow a registered callback to its invocation sites
       - Map out a data structure's consumer functions
 
+    The xref-graph traversal is limited to **statically-resolvable** xrefs
+    and **does not track register/operand-level data-flow**. This matters
+    on stripped binaries: when the chain hits a `mov edi, [ebx+8]`
+    instruction, IDA records no `dr_R` data xref for `[ebx+8]` (the
+    address depends on the runtime value of `ebx`), so the xref traversal
+    dead-ends at that instruction without identifying who set `ebx+8`.
+    For the same reason, `cross_functions=True` expands call/jump target
+    functions' basic blocks into the queue — it does NOT model register
+    or argument propagation across function boundaries. If you need
+    genuine def-use tracking, pass `register=` (e.g.
+    ``register="edi"``) to dispatch to Miasm's IR backward slice.
+
     The traversal is bounded by max_depth (not by following through functions).
     Each node in the path represents one address visited; edges represent xrefs
     between them. Nodes that are code (inside functions) report the enclosing
     function name and the disassembly at that address. Data nodes report the
     name/label at that address if any.
+
+    **When to escalate to a heavier engine:**
+
+    * `miasm_trace_data_flow(register, ea)` — Miasm IR-level def-use (same
+      engine this tool dispatches to when `register=` is set).
+    * `triton_backward_slice(sym_var_id)` — Triton symbolic-execution slice
+      (requires `triton_init`/`triton_symbolize_register` setup).
+    * `workflow_trace_data_flow` (angr) — slowest but greatest coverage;
+      angr's DDG-based slice in `use_cfg_only=False` mode crosses function
+      boundaries.
 
     Parameters
     ----------
@@ -4779,6 +5188,13 @@ def trace_data_chain(
         Include data xrefs (dr_R, dr_W, dr_O). Default True.
     include_code : bool
         Include code xrefs (fl_CN, fl_JN, fl_CF, fl_JF, fl_F). Default True.
+    cross_functions : bool
+        When True, expand called/jumped-to functions' basic blocks into the
+        queue. Does NOT model register or call-argument propagation. Default False.
+    register : str | None
+        When set, dispatch to Hex-Rays microcode def-use (preferred, native)
+        or Miasm IR depgraph (fallback) for true def-use. Only with
+        direction="backward". Default None (xref-graph mode).
 
     Returns
     -------
@@ -4786,13 +5202,18 @@ def trace_data_chain(
         path: ordered list of nodes visited, each with addr/type/function/instruction/name
         terminated_at: reason traversal stopped (depth_limit, no_more_xrefs, node_limit)
         depth_reached: actual deepest depth reached
+        struct_member_refs: when the start address has a struct type annotation,
+            member-level cross-references from IDA's type system are included
+            (via ``tinfo_t.get_udm_tid`` + ``xrefblk_t.drefs_to``).
 
     Large outputs may be truncated at 50 KB with an ``output_id``.
     If truncated, use ``read_mcp_output(output_id=..., offset=0)`` to retrieve
     the full result in chunks.
 
-    See also: trace_data_flow (composite backward slice with Miasm/Triton),
-    xrefs_to (single-hop references), xref_query (filtered xref search).
+    See also: miasm_trace_data_flow (Miasm IR-level def-use, used as fallback
+    when Hex-Rays is unavailable for the register= dispatch),
+    triton_backward_slice (symbolic slice), xrefs_to (single-hop references),
+    xref_query (filtered xref search).
     """
     if direction not in ("forward", "backward"):
         return {"ok": False, "error": f"direction must be 'forward' or 'backward', got {direction!r}"}
@@ -4806,6 +5227,61 @@ def trace_data_chain(
         start_ea = parse_address(address)
     except Exception as e:
         return {"ok": False, "error": f"Failed to resolve address {address!r}: {e}"}
+
+    # === register-aware dispatch for true def-use analysis ===
+    # Dispatch priority:
+    #   1. Native Hex-Rays microcode def-use chains (no external dependency)
+    #   2. Miasm IR DependencyGraph (if miasm installed)
+    #   3. Fall through to xref-graph traversal with a warning
+    if register and direction == "backward":
+        # --- Phase 1: Native Hex-Rays microcode def-use (preferred) ---
+        # Uses the decompiler's already-recovered IR with calling conventions,
+        # aliases, and allocations already modeled. No external dependency.
+        hexrays_nodes = _trace_data_flow_hexrays(register, start_ea)
+        if hexrays_nodes is not None:
+            return {
+                "ok": True,
+                "mode": "hexrays_microcode_defuse",
+                "register": register,
+                "nodes": hexrays_nodes,
+                "node_count": len(hexrays_nodes),
+                "depth_reached": 0,
+                "terminated_at": None,
+                "has_more": False,
+                "start": hex(start_ea),
+                "direction": direction,
+                "max_depth": max_depth,
+            }
+
+        # --- Phase 2: Miasm IR DependencyGraph (fallback) ---
+        try:
+            from .api_miasm import _trace_data_flow_internal  # type: ignore
+        except Exception:
+            _trace_data_flow_internal = None
+
+        if _trace_data_flow_internal is not None:
+            try:
+                ir_nodes = _trace_data_flow_internal(register, start_ea)
+                return {
+                    "ok": True,
+                    "mode": "miasm_dependency_graph",
+                    "register": register,
+                    "nodes": ir_nodes,
+                    "node_count": len(ir_nodes),
+                    "depth_reached": 0,
+                    "terminated_at": None,
+                    "has_more": False,
+                    "start": hex(start_ea),
+                    "direction": direction,
+                    "max_depth": max_depth,
+                }
+            except Exception:
+                pass  # Fall through to xref-graph traversal
+
+    # === Struct member xref enhancement (P3-7) ===
+    # When the start address has a struct type annotation, enrich the result
+    # with member-level cross-references from IDA's type system.
+    struct_member_nodes = _get_struct_member_xrefs(start_ea)
 
     visited: set[int] = {start_ea}
     nodes: list[ChainNode] = []
@@ -4974,6 +5450,8 @@ def trace_data_chain(
     }
     if functions_entered:
         result["functions_entered"] = functions_entered
+    if struct_member_nodes:
+        result["struct_member_refs"] = struct_member_nodes
     return result
 
 

@@ -340,10 +340,49 @@ def get_string(
     return results
 
 
+def _read_global_scalar_robust(ea: int) -> str | None:
+    """Read a scalar global value using the most robust IDA API available.
+
+    Tries ``ida_bytes.get_data_value`` (auto-size detection from item type,
+    endian-aware) first, then falls back to an explicit pointer-sized
+    ``read_int_bss_safe`` (the canonical pattern used by ``read_struct``
+    for pointer-typed members).
+
+    Returns a hex string on success, or ``None`` if both strategies fail.
+    """
+    import ida_bytes
+    import ida_pro
+    from . import compat
+
+    ptr_size = 8 if compat.inf_is_64bit() else 4
+
+    # --- Strategy 1: ida_bytes.get_data_value(v, ea, size=0) ---
+    # Auto-detects size from the item type at ea, handles endianness
+    # automatically, and returns an unambiguous bool for success/failure.
+    # Capped at sizeof(ea_t) — exactly the pointer-size we already use.
+    try:
+        v = ida_pro.uval_pointer()
+        # size=0: let IDA infer from the item type at ea
+        ok = ida_bytes.get_data_value(v, ea, 0)
+        if ok:
+            return hex(v.value())
+        # Explicit pointer-size fallback when auto-detect fails
+        ok = ida_bytes.get_data_value(v, ea, ptr_size)
+        if ok:
+            return hex(v.value())
+    except Exception:
+        pass
+
+    # --- Strategy 2: read_int_bss_safe (BSS-safe, always works) ---
+    # Returns 0 for unloaded BSS bytes — consistent with read_struct pattern.
+    return hex(read_int_bss_safe(ea, ptr_size))
+
+
 def get_global_variable_value_internal(ea: int) -> str:
     import ida_typeinf
     import ida_nalt
     import ida_bytes
+    from . import compat
     from .sync import IDAError
 
     tif = ida_typeinf.tinfo_t()
@@ -353,7 +392,15 @@ def get_global_variable_value_internal(ea: int) -> str:
 
         size = ida_bytes.get_item_size(ea)
         if size == 0:
-            raise IDAError(f"Failed to get type information for variable at {ea:#x}")
+            # Named but untyped global (common in stripped binaries, externs,
+            # partially-analyzed IDBs). Use the robust scalar reader which
+            # tries ida_bytes.get_data_value (auto-size + endian-aware) first,
+            # falling back to read_int_bss_safe (BSS-safe pointer-size read).
+            result = _read_global_scalar_robust(ea)
+            if result is not None:
+                return result
+            # If even the robust reader failed (shouldn't happen), raise
+            raise IDAError(f"Failed to read value for variable at {ea:#x}")
     else:
         size = tif.get_size()
 

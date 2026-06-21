@@ -93,6 +93,12 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     "analyze_cleanup_function":   {"address": "addr"},
     "analyze_constructor":        {"address": "addr"},
     "type_propagate":             {"address": "addr"},
+    # vtable-caller discovery tools (Issue #3 feedback) — `addr` singular
+    # except find_vtable_callers which uses `func_addr` (a function target);
+    # accept the common `address`/`addr`/`func`/`function` variants.
+    "find_vtable_loaders":        {"address": "addr"},
+    "find_vtable_callers":        {"address": "func_addr", "addr": "func_addr",
+                                   "func": "func_addr", "function": "func_addr"},
     # -----------------------------------------------------------------------
     # search_text — cursor is a resume hex-address, not a numeric offset.
     # "start" maps naturally (a start address IS a cursor value).

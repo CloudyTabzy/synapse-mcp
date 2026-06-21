@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import traceback
+from difflib import get_close_matches
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
 
@@ -254,9 +255,31 @@ class JsonRpcRegistry:
             # Check no extra params
             extra = set(params.keys()) - set(sig.parameters.keys())
             if extra:
+                # Build a "did you mean..." hint for each hallucinated param.
+                # This catches common AI-agent mistakes like passing `output_mode`
+                # (a common MCP-ish name the agent invented from prior pattern
+                # matching rather than reading the inputSchema returned by
+                # tools/list). The hint is appended to the error message so
+                # the agent can self-correct without the user having to debug.
+                hints_parts: list[str] = []
+                real_params = list(sig.parameters.keys())
+                for ex in sorted(extra):
+                    suggestions = get_close_matches(
+                        ex, real_params, n=3, cutoff=0.5
+                    )
+                    if suggestions:
+                        hints_parts.append(
+                            f"did you mean {suggestions[0]!r}"
+                            + (f" (or {', '.join(repr(s) for s in suggestions[1:])})" if len(suggestions) > 1 else "")
+                            + f" for {ex!r}?"
+                        )
+                hint_text = ""
+                if hints_parts:
+                    hint_text = " — " + "; ".join(hints_parts)
                 raise JsonRpcException(
                     -32602,
                     f"Invalid params: unexpected parameters: {list(extra)}"
+                    f"{hint_text}"
                 )
 
             validated_params = {}

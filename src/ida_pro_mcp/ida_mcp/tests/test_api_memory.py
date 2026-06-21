@@ -368,3 +368,84 @@ def test_get_global_value_bss_symbol_is_zero():
     assert all(int(p, 16) == 0 for p in parts), (
         f"expected all zeros for BSS global {name}, got {value_str!r}"
     )
+
+
+# ============================================================================
+# Regression: untyped-named-global pointer-size fallback (Issue #5 feedback)
+# ============================================================================
+
+
+def _find_untyped_named_global() -> str | None:
+    """Find a named global that has *no* type annotation AND *no* laid-out
+    data item (``get_item_size == 0``). This is the class of global that
+    previously caused ``get_global_value`` to fail with
+    "Failed to get type information for variable at ...".
+
+    Such globals are common in stripped binaries, partially-analyzed IDBs,
+    and extern declarations — exactly the situation described in
+    Feedbacks/idalib_mcp_feedback.md Issue 5.
+    """
+    import ida_bytes
+    import ida_typeinf
+    import ida_nalt
+    import idaapi
+    import idautils
+
+    tif = ida_typeinf.tinfo_t()
+    for addr, name in idautils.Names():
+        if not name or idaapi.get_func(addr):
+            continue
+        if ida_nalt.get_tinfo(tif, addr):
+            continue  # has type — not the case we're looking for
+        if not ida_bytes.has_any_name(addr):
+            continue  # safety: skip anonymous labels
+        if ida_bytes.get_item_size(addr) != 0:
+            continue  # has a laid-out item — would already work
+        return name
+    return None
+
+
+@test()
+def test_get_global_value_untyped_named_global_fallback():
+    """get_global_value falls back to pointer-sized integer read for
+    named-but-untyped globals (no tinfo, no laid-out item).
+
+    Regression test for Issue #5 in Feedbacks/idalib_mcp_feedback.md:
+    on a named global with no type annotation and no IDB-laid-out data
+    item (``get_item_size(ea) == 0``), the legacy code raised
+    ``IDAError("Failed to get type information for variable at ...")``.
+    The fix returns a pointer-sized value via ``read_int_bss_safe`` —
+    the canonical pattern used by ``read_struct`` for pointer-typed
+    members.
+    """
+    name = _find_untyped_named_global()
+    if name is None:
+        skip_test(
+            "binary has no named global with no type and no item-size "
+            "(cannot exercise the fallback path)"
+        )
+
+    result = get_global_value(name)
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+
+    # The regression: the tool MUST succeed and return a value, NOT raise.
+    assert_ok(entry, "value")
+    value_str = entry["value"]
+    assert isinstance(value_str, str) and value_str, (
+        f"expected a non-empty value string, got {value_str!r}"
+    )
+    # Pointer-sized reads return a single hex string ("0xNNNN...") — not a
+    # space-separated per-byte dump (which would also be acceptable but
+    # indicates a tinfo-typed path was taken).
+    assert value_str.startswith("0x"), (
+        f"expected pointer-sized hex string, got {value_str!r}"
+    )
+    # Round-trip: the hex value must parse back to an int.
+    try:
+        int(value_str, 16)
+    except ValueError as e:
+        raise AssertionError(
+            f"get_global_value({name!r}) returned {value_str!r} which is "
+            f"not a valid hex value: {e}"
+        )

@@ -169,6 +169,8 @@ _TOOL_MODULE_EXACT: dict[str, str] = {
     "find_indirect_calls": "recon",
     "identify_vtable_call": "recon",
     "analyze_cleanup_function": "recon",
+    "find_vtable_loaders": "recon",
+    "find_vtable_callers": "recon",
     "find_function_prologues": "recon",
     "apply_flirt_signature": "recon",
     "load_type_library": "recon",

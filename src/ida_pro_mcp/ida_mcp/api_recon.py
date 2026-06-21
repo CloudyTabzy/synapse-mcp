@@ -225,6 +225,7 @@ class IndirectCallSite(TypedDict, total=False):
     base_reg: str
     offset: int
     offset_hex: str
+    addr_type: NotRequired[str]
     disasm: str
 
 
@@ -234,7 +235,11 @@ class IndirectCallsResult(TypedDict, total=False):
     end: str
     sites: list[IndirectCallSite]
     by_offset: dict[str, int]
+    by_addr_type: NotRequired[dict[str, int]]
     count: int
+    indirect_calls_seen: NotRequired[int]
+    instructions_scanned: int
+    note: NotRequired[str]
     error: str
     warnings: list[str]
 
@@ -383,12 +388,85 @@ def _decoded_or_none(ea: int) -> ida_ua.insn_t | None:
 
 
 def _is_indirect_call(insn: ida_ua.insn_t) -> bool:
+    """Check whether an instruction is an indirect call.
+
+    Uses ``ida_idp.is_call_insn`` (portable across x86/ARM/MIPS) as the
+    primary gate, then confirms the call target is NOT a direct immediate
+    (``o_imm``) or direct code address (``o_near``/``o_far``). This is the
+    architecturally correct way to detect indirect calls — the previous
+    ``NN_callni``/``NN_callfi`` check was x86-only and silently returned
+    False for every instruction on ARM/MIPS binaries.
+
+    A call is "indirect" when its operand is one of:
+    ``o_displ`` (call [reg+disp]), ``o_phrase`` (call [reg]),
+    ``o_mem`` (call [absolute_addr]), or ``o_reg`` (call reg).
+    """
     if insn is None:
         return False
-    return insn.itype in (
-        getattr(ida_idp, "NN_callni", -1),
-        getattr(ida_idp, "NN_callfi", -1),
-    )
+    # Portable call detection — works on x86, ARM, MIPS, etc.
+    # is_call_insn has been in ida_idp since IDA 7.x.
+    try:
+        if not ida_idp.is_call_insn(insn):
+            return False
+    except Exception:
+        # Fallback to x86-specific itype constants for very old IDA builds
+        # that might not expose is_call_insn via the insn_t overload.
+        if insn.itype not in (
+            getattr(ida_idp, "NN_callni", -1),
+            getattr(ida_idp, "NN_callfi", -1),
+        ):
+            return False
+
+    # The call instruction IS a call — now check whether its operand is
+    # indirect (memory/register) vs direct (immediate/near/far).
+    op = insn.ops[0]
+    if op.type in (ida_ua.o_imm, ida_ua.o_near, ida_ua.o_far, ida_ua.o_void):
+        return False  # Direct call — not indirect
+    # All other operand types (o_displ, o_phrase, o_mem, o_reg, o_idpspec*)
+    # represent indirect calls whose target depends on runtime state.
+    return True
+
+
+def _is_indirect_jump(insn: ida_ua.insn_t) -> bool:
+    """Check whether an instruction is an indirect jump (tail-call on ARM/MIPS).
+
+    On ARM/MIPS, indirect function dispatch often appears as an indirect
+    jump (BX Rn / JR $rs) rather than an indirect call — ``is_call_insn``
+    would miss these. ``is_indirect_jump_insn`` catches the tail-call form.
+
+    Uses a ``getattr`` guard since ``is_indirect_jump_insn`` was added in
+    IDA 9.0 and may not be present on older 8.x builds.
+    """
+    if insn is None:
+        return False
+    _fn = getattr(ida_idp, "is_indirect_jump_insn", None)
+    if _fn is None:
+        return False
+    try:
+        return _fn(insn)
+    except Exception:
+        return False
+
+
+def _get_processor_name() -> str:
+    """Return the current IDA processor module name (e.g. 'PC' for x86/x64).
+
+    Returns an empty string if no processor module is loaded or the API
+    is unavailable (very old IDA builds).
+    """
+    try:
+        name = ida_idp.get_idp_name()
+        if name:
+            return name
+    except Exception:
+        pass
+    return ""
+
+
+def _is_x86_processor() -> bool:
+    """Check whether the current processor module is x86/x64 (PC/MetaPC)."""
+    proc = _get_processor_name().upper()
+    return proc in ("PC", "METAPC")
 
 
 def _section_by_name(name: str) -> ida_segment.segment_t | None:
@@ -975,21 +1053,75 @@ def find_indirect_calls(
 
     The COM vtable-call discovery primitive. Use `offset_filter=0x40` to
     locate every potential `Present` call in a binary, or `0x10` to find
-    every `Release`. The return includes the base register and exact offset
-    of each call plus a histogram (`by_offset`) of how many calls hit each
-    offset — useful for fingerprinting which COM interface dominates a
-    function.
+    every `Release`. The return includes the base register, displacement
+    (when applicable), and an ``addr_type`` classification of each
+    call site so 32-bit PE/GCC/Clang register-dispatch forms are visible:
+
+      - ``"displ"``  — ``call [reg + dispN]``  (``FF /2 rm=01/10``)
+      - ``"phrase"`` — ``call [reg]``          (``FF /2 rm=00``)
+      - ``"mem"``    — ``call dword ptr [absolute_addr]``  (``FF 15 disp32``)
+                       (32-bit IAT thunks + absolute-address vtable dispatch)
+      - ``"reg"``    — ``call reg``             (``FF D0..FF D7``)
+                       (GCC/Clang/MSVC register-dispatched vtable calls)
+      - ``"jump"``   — indirect jump (``jmp [reg]`` / ``BX Rn`` on ARM/MIPS)
+                       caught by ``is_indirect_jump_insn`` for tail-call dispatch
+
+    ``by_offset`` aggregates only displacement-bearing forms (``displ``/
+    ``phrase``); ``by_addr_type`` shows the full breakdown so the caller
+    can verify the scanner saw the expected operand mix.
+
+    When ``end=""`` (auto-detect function bounds), the scan now covers
+    **all function tail chunks** (via ``ida_funcs.get_func_ranges``),
+    not just the primary ``[start_ea, end_ea)`` range. This is critical
+    for optimized C++ game binaries where indirect call sites in outlined
+    tail chunks were previously missed entirely.
+
+    Uses portable ``ida_idp.is_call_insn`` for call detection (works on
+    ARM/MIPS, not just x86), plus ``is_indirect_jump_insn`` to catch
+    tail-call-style indirect dispatch (``BX Rn`` on ARM, ``JR $rs`` on
+    MIPS).
     """
+    # === Architecture guard ===
+    # The operand-type classification below is designed for x86/x64 indirect
+    # call encodings (o_displ/o_phrase/o_mem/o_reg). On ARM/MIPS the operand
+    # encoding is different (o_idpspec* variants) so the classification
+    # would be misleading. Surface the limitation honestly.
+    if not _is_x86_processor():
+        proc = _get_processor_name()
+        return _annotate({
+            "ok": False,
+            "start": start,
+            "end": end,
+            "error": (
+                f"find_indirect_calls currently supports x86/x64 only "
+                f"(current processor: {proc!r}). For ARM/MIPS indirect "
+                f"dispatch, use a combination of trace_data_chain(register=...) "
+                f"and identify_vtable_call."
+            ),
+            "sites": [],
+            "by_offset": {},
+            "by_addr_type": {},
+            "count": 0,
+            "indirect_calls_seen": 0,
+            "instructions_scanned": 0,
+        })
+
     try:
         start_ea = parse_address(start)
     except (IDAError, Exception) as e:
         return _annotate({**tool_error(e, f"resolve start address {start!r}"), "start": start, "end": end})
 
+    # Determine the scan ranges. When end="" is given, auto-detect function
+    # bounds AND enumerate ALL tail chunks (not just the primary range).
+    # This catches indirect call sites in outlined/chunked code that the
+    # previous single-range scan would miss entirely.
+    scan_ranges: list[tuple[int, int]] = []
     if end:
         try:
             end_ea = parse_address(end)
         except (IDAError, Exception) as e:
             return _annotate({**tool_error(e, f"resolve end address {end!r}"), "start": hex(start_ea), "end": end})
+        scan_ranges.append((start_ea, end_ea))
     else:
         func = ida_funcs.get_func(start_ea)
         if func is None:
@@ -1000,82 +1132,173 @@ def find_indirect_calls(
                 "error": "no end given and no function at start",
             })
         start_ea = func.start_ea
-        end_ea = func.end_ea
+        # Use get_func_ranges to enumerate ALL chunks (primary + tails).
+        # This is the architecturally correct way to scan a complete function
+        # — tail chunks can contain vtable dispatch sites in optimized code.
+        try:
+            ranges = ida_funcs.rangeset_t()
+            ida_funcs.get_func_ranges(ranges, func)
+            for i in range(ranges.nranges()):
+                r = ranges[i]
+                scan_ranges.append((r.start_ea, r.end_ea))
+        except Exception:
+            # Fallback: just use the primary range if get_func_ranges fails
+            scan_ranges.append((func.start_ea, func.end_ea))
 
-    if end_ea <= start_ea:
+    if not scan_ranges or all(s >= e for s, e in scan_ranges):
         return _annotate({
             "ok": False,
             "start": hex(start_ea),
-            "end": hex(end_ea),
-            "error": "end must be > start",
+            "end": end or hex(start_ea),
+            "error": "scan range is empty or invalid",
         })
 
     try:
         sites: list[IndirectCallSite] = []
         by_offset: dict[str, int] = {}
+        by_addr_type: dict[str, int] = {}
         instructions_scanned = 0
-        ea = start_ea
-        while ea < end_ea and len(sites) < limit:
-            insn = _decoded_or_none(ea)
-            if insn is None:
-                ea = idc.next_head(ea, end_ea)
-                if ea == idaapi.BADADDR or ea <= 0:
-                    break
-                continue
+        indirect_calls_seen = 0
 
-            instructions_scanned += 1
-            if _is_indirect_call(insn):
-                # ops[0] for an indirect call is the target memory operand.
-                op = insn.ops[0]
-                base_reg = ""
-                disp = 0
-                matched = False
-                if op.type == ida_ua.o_displ:
-                    # [reg + offset]
-                    base_reg = _reg_name(op.reg, 8)
-                    disp = int(op.addr) if op.addr else 0
-                    matched = True
-                elif op.type == ida_ua.o_phrase:
-                    # [reg] — no displacement
-                    base_reg = _reg_name(op.reg, 8)
+        for range_start, range_end in scan_ranges:
+            ea = range_start
+            while ea < range_end and len(sites) < limit:
+                # Use can_decode as a cheap precheck before full decode
+                # (available since IDA 8.x; guarded for safety).
+                _can_decode_fn = getattr(ida_ua, "can_decode", None)
+                if _can_decode_fn is not None:
+                    try:
+                        if not _can_decode_fn(ea):
+                            ea = idc.next_head(ea, range_end)
+                            if ea == idaapi.BADADDR or ea <= 0:
+                                break
+                            continue
+                    except Exception:
+                        pass  # Fall through to decode_insn
+
+                insn = _decoded_or_none(ea)
+                if insn is None:
+                    ea = idc.next_head(ea, range_end)
+                    if ea == idaapi.BADADDR or ea <= 0:
+                        break
+                    continue
+
+                instructions_scanned += 1
+                is_indirect = _is_indirect_call(insn)
+                is_tail_jump = False
+                if not is_indirect:
+                    # Also check for indirect jumps (tail-call dispatch
+                    # on ARM/MIPS — BX Rn, JR $rs).
+                    is_tail_jump = _is_indirect_jump(insn)
+
+                if is_indirect or is_tail_jump:
+                    indirect_calls_seen += 1
+                    # ops[0] for an indirect call is the target memory/register
+                    # operand. Four operand-type classes must be accepted to cover
+                    # both x64 and 32-bit PE binaries:
+                    #   o_displ — call [reg + disp]   (x64 vtable dispatch)
+                    #   o_phrase — call [reg]          (x64 register-indirect)
+                    #   o_mem   — call dword ptr [absolute_addr]
+                    #             (32-bit IAT thunks + absolute vtable dispatch)
+                    #   o_reg   — call reg             (GCC/Clang/MSVC register
+                    #             dispatch after `mov reg, [vtable+disp]`)
+                    op = insn.ops[0]
+                    base_reg = ""
                     disp = 0
-                    matched = True
+                    addr_type = ""
+                    matched = False
+                    if op.type == ida_ua.o_displ:
+                        base_reg = _reg_name(op.reg, 8)
+                        disp = int(op.addr) if op.addr else 0
+                        addr_type = "displ"
+                        matched = True
+                    elif op.type == ida_ua.o_phrase:
+                        base_reg = _reg_name(op.reg, 8)
+                        disp = 0
+                        addr_type = "phrase"
+                        matched = True
+                    elif op.type == ida_ua.o_mem:
+                        base_reg = ""
+                        disp = int(op.addr) if op.addr else 0
+                        addr_type = "mem"
+                        matched = True
+                    elif op.type == ida_ua.o_reg:
+                        base_reg = _reg_name(op.reg, 8)
+                        disp = 0
+                        addr_type = "reg"
+                        matched = True
+                    elif is_tail_jump:
+                        # Indirect jump caught by is_indirect_jump_insn
+                        # — record as a tail-call dispatch site.
+                        if op.type == ida_ua.o_displ:
+                            base_reg = _reg_name(op.reg, 8)
+                            disp = int(op.addr) if op.addr else 0
+                        elif op.type == ida_ua.o_reg:
+                            base_reg = _reg_name(op.reg, 8)
+                        addr_type = "jump"
+                        matched = True
 
-                if matched and (offset_filter < 0 or disp == offset_filter):
-                    func = ida_funcs.get_func(ea)
-                    sites.append(
-                        {
-                            "addr": hex(ea),
-                            "func": hex(func.start_ea) if func else "",
-                            "base_reg": base_reg,
-                            "offset": disp,
-                            "offset_hex": hex(disp),
-                            "disasm": _safe_disasm(ea),
-                        }
-                    )
-                    key = hex(disp)
-                    by_offset[key] = by_offset.get(key, 0) + 1
+                    if matched:
+                        by_addr_type[addr_type] = by_addr_type.get(addr_type, 0) + 1
+                        if addr_type in ("displ", "phrase", "mem"):
+                            key = hex(disp)
+                            by_offset[key] = by_offset.get(key, 0) + 1
 
-            ea += insn.size if insn.size else 1
+                        if (offset_filter < 0
+                                or (addr_type in ("displ", "phrase", "mem")
+                                    and disp == offset_filter)):
+                            func = ida_funcs.get_func(ea)
+                            sites.append(
+                                {
+                                    "addr": hex(ea),
+                                    "func": hex(func.start_ea) if func else "",
+                                    "base_reg": base_reg,
+                                    "offset": disp,
+                                    "offset_hex": hex(disp),
+                                    "addr_type": addr_type,
+                                    "disasm": _safe_disasm(ea),
+                                }
+                            )
+
+                ea += insn.size if insn.size else 1
 
         note = None
         if len(sites) == 0:
-            note = f"Scanned {instructions_scanned} instructions, found 0 indirect calls. Verify the address range contains decoded code and that the binary is x86/x64."
+            if indirect_calls_seen == 0:
+                note = (
+                    f"Scanned {instructions_scanned} instructions across "
+                    f"{len(scan_ranges)} range(s), found 0 indirect-call "
+                    f"itypes (NN_callni/NN_callfi) in the range. "
+                    f"Verify the range contains decoded code (not undefined "
+                    f"bytes) and the binary is x86/x64."
+                )
+            else:
+                filt_str = (f"{offset_filter:#x}" if offset_filter >= 0 else "-1")
+                note = (
+                    f"Scanned {instructions_scanned} instructions across "
+                    f"{len(scan_ranges)} range(s), saw "
+                    f"{indirect_calls_seen} indirect-call itype(s) but none "
+                    f"matched the filter (offset_filter={filt_str}). "
+                    f"by_addr_type={by_addr_type}. Try offset_filter=-1 to see all."
+                )
         return _annotate({
             "ok": True,
             "start": hex(start_ea),
-            "end": hex(end_ea),
+            "end": hex(scan_ranges[-1][1]) if scan_ranges else hex(start_ea),
             "sites": sites,
             "by_offset": by_offset,
+            "by_addr_type": by_addr_type,
             "count": len(sites),
+            "indirect_calls_seen": indirect_calls_seen,
             "instructions_scanned": instructions_scanned,
+            "scan_ranges": [f"{hex(s)}-{hex(e)}" for s, e in scan_ranges],
             **({"note": note} if note else {}),
         })
     except Exception as e:
         return _annotate({
-            **tool_error(e, f"indirect call scan {hex(start_ea)}-{hex(end_ea)}"),
+            **tool_error(e, f"indirect call scan {hex(start_ea)}"),
             "start": hex(start_ea),
-            "end": hex(end_ea),
+            "end": end or hex(start_ea),
         })
 
 
@@ -1114,15 +1337,34 @@ def identify_vtable_call(
                 "error": "not an indirect call instruction",
             })
 
-        # Extract the base register of the indirect call
+        # Extract the base register of the indirect call.
+        # Four operand forms are accepted (mirrors find_indirect_calls):
+        #   o_displ  — call [reg+disp]  → walk back for mov reg, [...]
+        #   o_phrase — call [reg]       → walk back for mov reg, [...]
+        #   o_reg    — call reg          → walk back for mov reg, [...]  (this
+        #              is the predominant GCC/Clang/MSVC register-dispatch
+        #              form on 32-bit PEs and a common form on x64 too)
+        #   o_mem    — call dword ptr [absolute_addr] → no base register to
+        #              trace; the absolute address is the terminal source.
+        #              Return immediately with final_source="global @ ...".
         op = insn.ops[0]
-        if op.type not in (ida_ua.o_displ, ida_ua.o_phrase):
+        if op.type == ida_ua.o_mem:
+            target_addr = int(op.addr) if op.addr else 0
+            return _annotate({
+                "ok": True,
+                "call_addr": hex(ea),
+                "base_reg": "",
+                "addr_type": "mem",
+                "chain": [],
+                "final_source": f"global @ {hex(target_addr)}",
+            })
+        if op.type not in (ida_ua.o_displ, ida_ua.o_phrase, ida_ua.o_reg):
             return _annotate({
                 "ok": False,
                 "call_addr": hex(ea),
                 "base_reg": "",
                 "chain": [],
-                "error": "indirect call but operand is not reg-indirect",
+                "error": "indirect call but operand is not reg-indirect (o_displ/o_phrase/o_reg/o_mem)",
             })
         target_reg = op.reg
         target_reg_name = _reg_name(target_reg, 8)
@@ -1133,14 +1375,36 @@ def identify_vtable_call(
         current_target = target_reg
 
         while steps_remaining > 0:
-            prev = idc.prev_head(cur, 0)
-            if prev == idaapi.BADADDR or prev <= 0 or prev >= cur:
-                break
-            prev_insn = _decoded_or_none(prev)
-            if prev_insn is None:
-                cur = prev
-                steps_remaining -= 1
-                continue
+            # Use decode_preceding_insn when available (IDA 8.x+) for a
+            # cleaner one-call backward decode. Falls back to the
+            # idc.prev_head + decode_insn pattern on older builds.
+            prev_insn = None
+            prev = idaapi.BADADDR
+            _decode_preceding = getattr(ida_ua, "decode_preceding_insn", None)
+            if _decode_preceding is not None:
+                try:
+                    prev_insn = ida_ua.insn_t()
+                    result_tuple = _decode_preceding(prev_insn, cur)
+                    if isinstance(result_tuple, (tuple, list)):
+                        prev = result_tuple[0]
+                    else:
+                        prev = result_tuple
+                    if prev == idaapi.BADADDR or prev <= 0:
+                        break
+                except Exception:
+                    prev_insn = None
+                    prev = idaapi.BADADDR
+
+            if prev_insn is None or prev == idaapi.BADADDR:
+                # Fallback: manual prev_head + decode_insn
+                prev = idc.prev_head(cur, 0)
+                if prev == idaapi.BADADDR or prev <= 0 or prev >= cur:
+                    break
+                prev_insn = _decoded_or_none(prev)
+                if prev_insn is None:
+                    cur = prev
+                    steps_remaining -= 1
+                    continue
 
             # We care about MOV that writes to current_target
             if prev_insn.itype == getattr(ida_idp, "NN_mov", -1):
@@ -1205,6 +1469,485 @@ def identify_vtable_call(
             "call_addr": call_addr,
             "base_reg": "",
             "chain": [],
+        })
+
+
+# ============================================================================
+# VTable Caller Discovery (Issue #3 feedback — composite workflow)
+# ============================================================================
+
+
+class VTableLoaderSite(TypedDict, total=False):
+    ref_ea: str
+    ref_type: str
+    insn_mnem: str
+    disasm: str
+    dst_reg: str
+    in_func: str
+    in_func_name: str
+
+
+class VTableLoadersResult(TypedDict, total=False):
+    ok: bool
+    target: str
+    refs: list[VTableLoaderSite]
+    read_count: int
+    write_count: int
+    offset_count: int
+    count: int
+    hint: str
+    error: str
+    warnings: list[str]
+
+
+class VTableCallerHit(TypedDict, total=False):
+    caller_func: str
+    caller_func_name: str
+    loader_ea: str
+    loader_dst_reg: str
+    call_ea: str
+    call_addr_type: str
+    vtable_disp: int
+    vtable_disp_hex: str
+    slot_index: int
+    disasm: str
+
+
+class VTableCallersResult(TypedDict, total=False):
+    ok: bool
+    func: str
+    func_name: str
+    vtables: list[dict]
+    callers: list[VTableCallerHit]
+    caller_count: int
+    hint: str
+    error: str
+    warnings: list[str]
+
+
+# Operand-type to readable-name mapping for vtable loader classification.
+# Same set as find_indirect_calls / identify_vtable_call now accept.
+_OP_TYPE_NAMES: dict[int, str] = {
+    ida_ua.o_displ: "displ",
+    ida_ua.o_phrase: "phrase",
+    ida_ua.o_mem: "mem",
+    ida_ua.o_reg: "reg",
+}
+
+
+def _classify_loader_insn(insn: "ida_ua.insn_t") -> tuple[str, str]:
+    """Return (mnemonic, dst_register_name) for a loader instruction.
+
+    Recognises ``lea reg, [vtable]``, ``mov reg, imm_vtable``, and
+    ``mov reg, [mem_vtable_ptr]`` patterns. Returns ("", "") if the
+    instruction isn't a recognisable vtable-loader form.
+    """
+    if insn is None:
+        return "", ""
+    mnem = insn.get_canon_mnem().lower() if hasattr(insn, "get_canon_mnem") else ""
+    if mnem not in ("lea", "mov", "movzx"):
+        return mnem, ""
+    # Operand 0 should be a register destination.
+    dst = insn.ops[0]
+    if dst.type != ida_ua.o_reg:
+        return mnem, ""
+    return mnem, _reg_name(dst.reg, 8)
+
+
+@tool
+@idasync
+def find_vtable_loaders(
+    addr: Annotated[str, "Address or symbol name of a vtable"],
+    include_reads: Annotated[
+        bool,
+        "Include `dr_R` (data-read) xrefs — the loader reads the vtable "
+        "address from the data section. Default True.",
+    ] = True,
+    include_writes: Annotated[
+        bool,
+        "Include `dr_W` (data-write) xrefs — the constructor writes the "
+        "vtable address into a heap object's first field. Default True.",
+    ] = False,
+    include_offsets: Annotated[
+        bool,
+        "Include `dr_O` (offset) xrefs — `lea`/`mov` referencing the vtable "
+        "via an immediate displacement. Default True.",
+    ] = True,
+    limit: Annotated[int, "Cap on returned loader sites (default 200)."] = 200,
+) -> VTableLoadersResult:
+    """Find every instruction that REFERENCES a given vtable address.
+
+    The missing primitive for vtable caller discovery. Walks IDA's data
+    cross-reference table filtered to read/write/offset types per request,
+    decodes the loader instruction at each ref, classifies it (``lea`` /
+    ``mov reg, imm`` / ``mov reg, [mem]`` / constructor write), and
+    extracts the **destination register** so callers can chain into
+    `find_indirect_calls` to locate the actual dispatch sites.
+
+    Use cases:
+      - Discover the constructor that installs a vtable into a new object
+        (set ``include_writes=True`` — this catches ``mov [rcx], offset vtable``).
+      - Find loader functions that read a vtable base into a register
+        prior to vtable dispatch (the default — read/offset refs).
+      - Identify which functions own a vtable (the constructor's class).
+
+    Returns per-loader: reference address, xref type (``data_read`` /
+    ``data_write`` / ``offset``), instruction mnemonic, destination
+    register, containing function, and disassembly.
+
+    See also: find_vtable_callers (composite — runs this then chains to
+    find_indirect_calls), find_indirect_calls (enumerate dispatch sites
+    in a known loader function), get_function_callers (vtable-aware
+    fallback when no direct callers exist).
+    """
+    try:
+        target_ea = parse_address(addr)
+    except (IDAError, Exception) as e:
+        return _annotate({**tool_error(e, f"resolve address {addr!r}"), "target": addr})
+
+    try:
+        loaders: list[VTableLoaderSite] = []
+        read_count = 0
+        write_count = 0
+        offset_count = 0
+
+        _xref_type_names = {
+            ida_xref.dr_O: "offset",
+            ida_xref.dr_R: "data_read",
+            ida_xref.dr_W: "data_write",
+        }
+
+        # Type-system validation: check if IDA's type system recognises this
+        # address as a registered vftable. get_vftable_ordinal returns 0 if
+        # the address is NOT a registered vftable — a strong signal for agents
+        # that the address is a genuine vtable (vs. just a pointer table).
+        vtable_validated = False
+        try:
+            ordinal = ida_typeinf.get_vftable_ordinal(target_ea)
+            vtable_validated = ordinal != 0
+        except Exception:
+            pass
+
+        xb = ida_xref.xrefblk_t()
+        ok = xb.first_to(target_ea, ida_xref.XREF_ALL)
+        while ok and len(loaders) < limit:
+            if not xb.iscode:
+                t = xb.type
+                if t == ida_xref.dr_R and include_reads:
+                    ref_type = "data_read"
+                    read_count += 1
+                elif t == ida_xref.dr_W and include_writes:
+                    ref_type = "data_write"
+                    write_count += 1
+                elif t == ida_xref.dr_O and include_offsets:
+                    ref_type = "offset"
+                    offset_count += 1
+                else:
+                    ok = xb.next_to()
+                    continue
+
+                from_ea = xb.frm
+                insn = _decoded_or_none(from_ea)
+                mnem, dst_reg = _classify_loader_insn(insn) if insn else ("", "")
+
+                func = ida_funcs.get_func(from_ea)
+                loaders.append(VTableLoaderSite(
+                    ref_ea=hex(from_ea),
+                    ref_type=ref_type,
+                    insn_mnem=mnem,
+                    disasm=_safe_disasm(from_ea),
+                    dst_reg=dst_reg,
+                    in_func=(hex(func.start_ea) if func else ""),
+                    in_func_name=(ida_funcs.get_func_name(func.start_ea) if func else ""),
+                ))
+            ok = xb.next_to()
+
+        hint = None
+        if loaders:
+            hint = (
+                "Use find_indirect_calls(start=<in_func>, offset_filter=<disp>) "
+                "in each in_func to enumerate the actual call sites. Pass "
+                "find_vtable_callers(func_ea=...) to run the full workflow "
+                "in one call."
+            )
+        return _annotate({
+            "ok": True,
+            "target": hex(target_ea),
+            "vtable_validated": vtable_validated,
+            "refs": loaders,
+            "read_count": read_count,
+            "write_count": write_count,
+            "offset_count": offset_count,
+            "count": len(loaders),
+            **({"hint": hint} if hint else {}),
+        })
+    except Exception as e:
+        return _annotate({**tool_error(e, f"find vtable loaders for {hex(target_ea)}"), "target": hex(target_ea)})
+
+
+def _find_vtable_run_start(slot_ea: int, ptr_size: int) -> int | None:
+    """Walk backward from slot_ea looking for a consecutive pointer run start.
+
+    Returns the address of the first pointer in the run, or ``None`` if the
+    pointer at slot_ea is not part of a multi-pointer run (i.e. it's the
+    only function pointer in the table and cannot be vtable-disambiguated).
+    """
+    get_ptr = ida_bytes.get_qword if ptr_size == 8 else ida_bytes.get_dword
+    # Walk backwards while the previous pointer is also a code address.
+    start = slot_ea
+    while start >= ptr_size:
+        prev_ptr = get_ptr(start - ptr_size)
+        if not _is_code_address(prev_ptr):
+            break
+        start -= ptr_size
+    # Confirm we found at least a 2-pointer run.
+    nbytes_walked = slot_ea - start
+    if nbytes_walked < ptr_size:
+        return None
+    # Confirm the next pointer IS also code (else slot_ea is in a 2+ run).
+    next_ptr = get_ptr(slot_ea + ptr_size) if idaapi.is_loaded(slot_ea + ptr_size) else 0
+    if not _is_code_address(next_ptr):
+        # Maybe slot_ea is the LAST pointer in the run — verify by checking
+        # we walked back at least 1 code pointer.
+        return start if nbytes_walked >= ptr_size else None
+    return start
+
+
+def _check_vftable_ordinal(vtable_ea: int) -> bool:
+    """Check whether IDA's type system recognises this address as a registered vftable.
+
+    Uses ``ida_typeinf.get_vftable_ordinal`` (available since IDA 7.7+).
+    Returns ``True`` if the address is a registered vftable, ``False``
+    otherwise (including when the API is unavailable on older IDA builds).
+
+    This validates the heuristic vtable discovery (consecutive code-pointer
+    scan) against IDA's RTTI/type database — giving agents confidence that
+    "vtable_validated: true" means the type system backs the finding.
+    """
+    try:
+        ordinal = ida_typeinf.get_vftable_ordinal(vtable_ea)
+        return ordinal != 0
+    except Exception:
+        return False
+
+
+@tool
+@idasync
+def find_vtable_callers(
+    func_addr: Annotated[str, "Function address or name to find vtable callers for"],
+    max_vtables: Annotated[int, "Cap on vtables to explore (default 8)."] = 8,
+    max_callers_per_vtable: Annotated[int, "Cap on caller hits per vtable (default 25)."] = 25,
+) -> VTableCallersResult:
+    """Discover callers of a virtual function through vtable dispatch.
+
+    Composite workflow that bridges the gap ``get_function_callers`` cannot
+    cross: when a function is invoked ONLY through ``call [reg+disp]``
+    vtable dispatch, IDA's code-xref database has no link from the call
+    site to the function — this tool reconstructs it via the vtable:
+
+      1. Enumerate data refs to ``func_addr`` (the vtables it lives in).
+      2. For each vtable, run `find_vtable_loaders` to find functions
+         that load the vtable base into a register.
+      3. For each loader function, run `find_indirect_calls` to enumerate
+         ``call [reg+disp]`` sites.
+      4. Match each call site's displacement to the slot index of
+         ``func_addr`` within its vtable (so only true dispatches to this
+         specific function are reported).
+
+    Returns: per-caller hit — caller function, loader instruction address,
+    the destination register loaded, the call site address, the vtable
+    displacement, and the slot index of ``func_addr`` in its vtable.
+
+    Use this tool when `get_function_callers` returns an empty list for
+    a function you know is hot — that's the signature of a virtual
+    function whose callers all dispatch through a vtable.
+
+    Limitations:
+      - Only detects vtables whose pointers form contiguous runs (so
+        single-slot function-pointer tables are skipped — see
+        ``_find_vtable_run_start``).
+      - When the loader function uses ``call reg`` (no displacement),
+        the call could be dispatching to ANY function in the vtable;
+        the result marks ``call_addr_type='reg'`` and ``slot_index=-1``
+        so the agent knows they need `identify_vtable_call` to confirm.
+      - Cross-binary overlays (multiple vtables installed into the same
+        object lifetime) are not modeled; each vtable is analysed in
+        isolation.
+
+    See also: find_vtable_loaders (step 2 above — who installs/loads one
+    vtable), find_indirect_calls (step 3 — list dispatch sites in a
+    loader function), get_function_callers (direct callers; emits
+    ``potential_vtable_references`` on empty result as a hint).
+    """
+    try:
+        func_ea = parse_address(func_addr)
+    except (IDAError, Exception) as e:
+        return _annotate({**tool_error(e, f"resolve function {func_addr!r}"), "func": func_addr})
+
+    func = ida_funcs.get_func(func_ea)
+    if not func:
+        return _annotate({"ok": False, "func": hex(func_ea), "error": f"no function at {hex(func_ea)}"})
+
+    try:
+        ptr_size = 8 if compat.inf_is_64bit() else 4
+        get_ptr = ida_bytes.get_qword if ptr_size == 8 else ida_bytes.get_dword
+        _xref_type_names = {
+            ida_xref.dr_O: "offset",
+            ida_xref.dr_R: "data_read",
+            ida_xref.dr_W: "data_write",
+        }
+
+        # Step 1: enumerate data xrefs to func_addr (i.e. the vtables it lives in).
+        candidate_vtable_slot_eas: list[int] = []
+        for xref in idautils.XrefsTo(func_ea, 0):
+            if xref.iscode:
+                continue
+            candidate_vtable_slot_eas.append(xref.frm)
+            if len(candidate_vtable_slot_eas) >= max_vtables:
+                break
+
+        vtables_discovered: list[dict] = []
+        all_hits: list[VTableCallerHit] = []
+
+        for slot_ea in candidate_vtable_slot_eas:
+            # Step 2a: find the start of the vtable run containing slot_ea.
+            vtable_start = _find_vtable_run_start(slot_ea, ptr_size)
+            if vtable_start is None:
+                vtables_discovered.append({
+                    "slot_ea": hex(slot_ea),
+                    "vtable_start": None,
+                    "slot_index": -1,
+                    "note": "slot is not part of a multi-pointer vtable run; skipped",
+                })
+                continue
+
+            slot_index = (slot_ea - vtable_start) // ptr_size
+            vtable_disp = slot_index * ptr_size
+
+            # Step 2b: find loader instructions for this vtable.
+            loaders: list[VTableLoaderSite] = []
+            xb = ida_xref.xrefblk_t()
+            ok = xb.first_to(vtable_start, ida_xref.XREF_ALL)
+            while ok and len(loaders) < max_callers_per_vtable:
+                if not xb.iscode and xb.type in (ida_xref.dr_R, ida_xref.dr_O):
+                    from_ea = xb.frm
+                    insn = _decoded_or_none(from_ea)
+                    _mnem, dst_reg = _classify_loader_insn(insn) if insn else ("", "")
+                    func_at_ref = ida_funcs.get_func(from_ea)
+                    loaders.append(VTableLoaderSite(
+                        ref_ea=hex(from_ea),
+                        ref_type=_xref_type_names.get(xb.type, "data"),
+                        insn_mnem=insn.get_canon_mnem().lower() if insn and hasattr(insn, "get_canon_mnem") else "",
+                        disasm=_safe_disasm(from_ea),
+                        dst_reg=dst_reg,
+                        in_func=(hex(func_at_ref.start_ea) if func_at_ref else ""),
+                        in_func_name=(ida_funcs.get_func_name(func_at_ref.start_ea) if func_at_ref else ""),
+                    ))
+                ok = xb.next_to()
+
+            vtables_discovered.append({
+                "vtable_start": hex(vtable_start),
+                "slot_ea": hex(slot_ea),
+                "slot_index": slot_index,
+                "vtable_disp": vtable_disp,
+                "vtable_disp_hex": hex(vtable_disp),
+                "vtable_validated": _check_vftable_ordinal(vtable_start),
+                "loader_count": len(loaders),
+            })
+
+            # Step 3 + 4: for each loader function, find indirect call sites
+            # whose displacement matches the slot.
+            for loader in loaders:
+                loader_func_ea_str = loader.get("in_func", "")
+                if not loader_func_ea_str:
+                    continue
+                try:
+                    loader_func_ea = int(loader_func_ea_str, 16)
+                except ValueError:
+                    continue
+                loader_func = ida_funcs.get_func(loader_func_ea)
+                if not loader_func:
+                    continue
+
+                # Walk instructions in the loader function for indirect calls.
+                cur = loader_func.start_ea
+                while cur < loader_func.end_ea and len(all_hits) < max_callers_per_vtable:
+                    l_insn = _decoded_or_none(cur)
+                    if l_insn is None:
+                        cur = idc.next_head(cur, loader_func.end_ea)
+                        if cur == idaapi.BADADDR or cur <= 0:
+                            break
+                        continue
+                    if _is_indirect_call(l_insn):
+                        op = l_insn.ops[0]
+                        addr_type = _OP_TYPE_NAMES.get(op.type, "")
+                        if not addr_type:
+                            cur += l_insn.size if l_insn.size else 1
+                            continue
+
+                        call_disp = 0
+                        if addr_type == "displ":
+                            call_disp = int(op.addr) if op.addr else 0
+                        elif addr_type == "mem":
+                            call_disp = int(op.addr) if op.addr else 0
+
+                        # Match: a dispatch site qualifies if the displacement
+                        # equals the slot's offset within the vtable. For
+                        # `call reg` (addr_type='reg') we can't tell which slot
+                        # is being dispatched — report all such sites with
+                        # slot_index=-1 and let the agent confirm via
+                        # identify_vtable_call.
+                        qualifies = (
+                            addr_type == "reg"
+                            or call_disp == vtable_disp
+                        )
+                        if qualifies:
+                            caller_func_name = (
+                                ida_funcs.get_func_name(loader_func.start_ea)
+                                or f"sub_{loader_func.start_ea:X}"
+                            )
+                            all_hits.append(VTableCallerHit(
+                                caller_func=hex(loader_func.start_ea),
+                                caller_func_name=caller_func_name,
+                                loader_ea=loader["ref_ea"],
+                                loader_dst_reg=loader.get("dst_reg", ""),
+                                call_ea=hex(cur),
+                                call_addr_type=addr_type,
+                                vtable_disp=call_disp,
+                                vtable_disp_hex=hex(call_disp),
+                                slot_index=(-1 if addr_type == "reg" else slot_index),
+                                disasm=_safe_disasm(cur),
+                            ))
+
+                    cur += l_insn.size if l_insn.size else 1
+
+        hint = None
+        if all_hits:
+            hint = (
+                f"Found {len(all_hits)} vtable caller(s). For each hit where "
+                f"call_addr_type='reg', call identify_vtable_call(call_addr=...) "
+                f"to confirm which vtable slot is actually dispatched."
+            )
+        elif not candidate_vtable_slot_eas:
+            hint = (
+                "No data references to this function found — it is likely "
+                "called only via direct `call` (try `get_function_callers`) "
+                "or it is the program entry point."
+            )
+
+        return _annotate({
+            "ok": True,
+            "func": hex(func_ea),
+            "func_name": (ida_funcs.get_func_name(func_ea) or f"sub_{func_ea:X}"),
+            "vtables": vtables_discovered,
+            "callers": all_hits,
+            "caller_count": len(all_hits),
+            **({"hint": hint} if hint else {}),
+        })
+    except Exception as e:
+        return _annotate({
+            **tool_error(e, f"find vtable callers for {hex(func_ea)}"),
+            "func": hex(func_ea),
         })
 
 
